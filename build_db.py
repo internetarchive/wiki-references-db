@@ -66,7 +66,7 @@ def get_latest_revision(domain, page_id):
     return None, None
 
 def process_urls(urls: List[str]):
-    conn = psycopg2.connect(host="192.168.7.36", database=DB, user=DBUSER,
+    conn = psycopg2.connect(host=HOST, port=PORT, database=DB, user=DBUSER,
                             password=DBPASS)
     cur = conn.cursor()
 
