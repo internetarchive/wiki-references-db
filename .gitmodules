@@ -1,0 +1,3 @@
+[submodule "iari"]
+	path = iari
+	url = https://github.com/internetarchive/iari
