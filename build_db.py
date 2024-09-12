@@ -5,6 +5,7 @@ from typing import List
 from urllib.parse import urlparse
 from syntax import normalize_wikitext, get_md5
 from wikis import get_family
+from refs_extractor.article import extract_references_from_page, get_current_timestamp
 from credentials import *
 
 def wikipedia_articles():
@@ -65,14 +66,15 @@ def get_latest_revision(domain, page_id):
                 return rev['revid'], rev['timestamp']
     return None, None
 
-def process_urls(urls: List[str]):
+def process_pages(titles: List[str], domain="en.wikipedia.org"):
     conn = psycopg2.connect(host=HOST, port=PORT, database=DB, user=DBUSER,
                             password=DBPASS)
     cur = conn.cursor()
 
-    for url in urls:
-        print(url)
-        domain = urlparse(url).netloc
+    start_time = get_current_timestamp()
+
+    for title in titles:
+        print(title)
         cur.execute("SELECT id FROM wikis WHERE domain = %s", (domain,))
         wiki_id = cur.fetchone()
         if not wiki_id:
@@ -83,30 +85,16 @@ def process_urls(urls: List[str]):
         else:
             wiki_id = wiki_id[0]
 
-        params = {
-            "url": url,
-            "regex": "test",
-            "refresh": "true"
-        }
-
-        request_url = "https://archive.org/services/context/iari/v2/statistics/all"
-        request = requests.get(request_url, params=params)
-        try:
-            iari_resp = request.json()
-            page_id = iari_resp["page_id"]
-            reference_details = iari_resp.get("reference_details", [])
-        except:
-            continue
-
-        for detail in reference_details:
-            wikitext = detail.get("wikitext", "").replace("\\\"", "\"")
-            type_ = detail.get("type")
-            reference_role = {
-                "general": 0,
-                "named": 1,
-                "footnote": 2,
-                "content": 3
-            }.get(type_, 0)
+        page_id, reference_details = extract_references_from_page(title, as_of=start_time)
+        for wikitext in reference_details:
+            #type_ = detail.get("type")
+            #reference_role = {
+            #    "general": 0,
+            #    "named": 1,
+            #    "footnote": 2,
+            #    "content": 3
+            #}.get(type_, 0)
+            reference_role = 0  # Temporarily doing away with reference_role
 
             reference_normalized = normalize_wikitext(wikitext)
             record_md5 = get_md5(domain, page_id, reference_normalized)
@@ -134,7 +122,5 @@ def process_urls(urls: List[str]):
 
 
 if __name__ == '__main__':
-
     for article in wikipedia_articles():
-        article = f"https://en.wikipedia.org/wiki/{article.replace(' ', '_')}"
-        process_urls([article])
+        process_pages([article])

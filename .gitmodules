@@ -1,3 +1,9 @@
 [submodule "iari"]
 	path = iari
 	url = https://github.com/internetarchive/iari
+[submodule "wiki-references-extractor"]
+	path = wiki-references-extractor
+	url = https://github.com/internetarchive/wiki-references-extractor
+[submodule "refs_extractor"]
+	path = refs_extractor
+	url = https://github.com/internetarchive/wiki-references-extractor
