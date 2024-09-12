@@ -86,6 +86,10 @@ def process_pages(titles: List[str], domain="en.wikipedia.org"):
             wiki_id = wiki_id[0]
 
         page_id, reference_details = extract_references_from_page(title, as_of=start_time)
+        latest_revision, revision_timestamp = get_latest_revision(domain, page_id)
+        revision_timestamp = revision_timestamp.\
+                                 replace("T", " ").\
+                                 replace("Z", "")
         for wikitext in reference_details:
             #type_ = detail.get("type")
             #reference_role = {
@@ -99,12 +103,6 @@ def process_pages(titles: List[str], domain="en.wikipedia.org"):
             reference_normalized = normalize_wikitext(wikitext)
             record_md5 = get_md5(domain, page_id, reference_normalized)
             reference_md5 = get_md5(reference_normalized)
-
-
-            latest_revision, revision_timestamp = get_latest_revision(domain, page_id)
-            revision_timestamp = revision_timestamp.\
-                                     replace("T", " ").\
-                                     replace("Z", "")
 
             cur.execute("INSERT INTO history (record_md5, revision_id, revision_timestamp) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
                         (record_md5, latest_revision, revision_timestamp))
