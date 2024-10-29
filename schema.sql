@@ -24,8 +24,9 @@ CREATE TABLE history (
 CREATE TABLE wikireferences (
     wiki INT,
     page_id INT,
-    reference_role INT,
+    reference_raw TEXT,
     reference_normalized TEXT,
+    reference_raw_md5 CHAR(32),
     reference_md5 CHAR(32),
     record_md5 CHAR(32) PRIMARY KEY,
     latest_revision INT,
