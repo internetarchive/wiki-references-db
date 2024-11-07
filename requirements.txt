@@ -2,3 +2,4 @@ mwparserfromhell
 psycopg2-binary
 requests
 typing
+sqlalchemy
