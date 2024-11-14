@@ -2,17 +2,22 @@ import mwparserfromhell
 import hashlib
 import sys
 
-def get_md5(*args) -> str:
-    m = hashlib.md5()
+def get_sha1(*args) -> str:
+    sha1 = hashlib.sha1()
     for arg in args:
-        m.update(str(arg).encode())
-    return m.hexdigest()
+        sha1.update(str(arg).encode('utf-8'))
+    return sha1.hexdigest()
 
 def normalize_ref_tag(tag):
-    new_tag = mwparserfromhell.nodes.Tag(tag.tag, tag.contents)
+    # Remove any leading or trailing newlines from the contents of the tag
+    stripped_content = tag.contents.strip()
+    # Create a new tag with the stripped content
+    new_tag = mwparserfromhell.nodes.Tag(tag.tag, stripped_content)
+    # Preserve attributes other than "name"
     for attribute in tag.attributes:
         if attribute.name != "name":
             new_tag.attributes.append(attribute)
+    # Preserve the self-closing and padding properties
     new_tag.self_closing = tag.self_closing
     if tag.self_closing:
         new_tag.padding = ' '
@@ -86,9 +91,15 @@ def normalize_wikitext(wikitext: str) -> str:
     # Pre-process list items
     lines = wikitext.splitlines()
     for i, line in enumerate(lines):
-        if line.startswith((':', '*', '#')):
-            if len(line) > 1 and line[1] != ' ':
-                lines[i] = line[0] + ' ' + line[1:]
+        # Identify leading list markers
+        leading_markers = ''
+        j = 0
+        while j < len(line) and line[j] in (':', '*', '#'):
+            leading_markers += line[j]
+            j += 1
+        # Only add a space if there's content immediately following the markers
+        if leading_markers and j < len(line) and line[j] != ' ':
+            lines[i] = leading_markers + ' ' + line[j:]
     adjusted_wikitext = "\n".join(lines)
 
     # Proceed with normalization
@@ -132,22 +143,34 @@ This is a crazy guy citation.
 *Maraniss (2012), pp. 264–269.</ref>
 """,
 "<ref name=john></ref>",
-"<ref name=john/>"
+"<ref name=john/>",
+"***Hello world",
+"##test2",
+"""
+<ref>
+Multi-line ref
+Second line
+</ref>
+"""
 ]
 
     testanswers = [
-    "{{Cite web|unnamed1|unnamed2|bar=value2|bigpara=Okay so here's the deal guys. This is a crazy guy citation.|foo=value|paz=value 3}}",
-    "[https://example.com {{Flag|USA}}]",
-    "<ref>{{Cite news|archive-date=February 7, 2017|archive-url=https://web.archive.org/web/20170207112933/http://gbppr.dyndns.org/~gbpprorg/obama/barack.mother.txt|author=Jones, Tim|date=March 27, 2007|newspaper=[[Chicago Tribune]]|page=1 (Tempo)|title=Barack Obama: Mother not just a girl from Kansas; Stanley Ann Dunham shaped a future senator|url-status=dead|url=http://gbppr.dyndns.org/~gbpprorg/obama/barack.mother.txt}}</ref>",
-    "{{Cite web|access-date={{CURRENTYEAR}}-{{CURRENTMONTH}}-{{CURRENTDAY}}|title=Example|url=http://example.com}}",
-    "[http://example.com {{Cite web|access-date=2023-05-19|title=Example|url=http://example.com}}]",
-    "<ref>{{Cite web|access-date=2023-05-19|title=Example|url=http://example.com}}<nowiki>{{Not a template}}</nowiki></ref>",
-    "{{Cite web|access-date=2023-05-19|title={{Random}}|url=http://example.com}}",
-    "{{Example|unnamed|2=second unnamed|foo=bar|name=value}}",
-    "{{Cite web|access-date=2023-05-19|title=Example Title|url=[http://example.com Example]}}",
-    "<ref>{{Cite news|access-date=March 20, 2008|author=Serafin, Peter|date=March 21, 2004|newspaper=[[Honolulu Star-Bulletin]]|title=Punahou grad stirs up Illinois politics|url=http://archives.starbulletin.com/2004/03/21/news/story4.html}}\n* {{Cite news|access-date=November 18, 2011|archive-date=March 14, 2008|archive-url=https://web.archive.org/web/20080314042735/http://www.nytimes.com/2008/03/14/us/politics/14obama.html|author=Scott, Janny|date=March 14, 2008|page=A1|title=A free-spirited wanderer who set Obama's path|url-access=limited|url-status=live|url=https://www.nytimes.com/2008/03/14/us/politics/14obama.html|work=The New York Times}}\n* Obama (1995, 2004), Chapters 3 and 4.\n* Scott (2012), pp. 131–134.\n* Maraniss (2012), pp. 264–269.</ref>",
-    "<ref></ref>",
-    "<ref />"
+"{{Cite web|unnamed1|unnamed2|bar=value2|bigpara=Okay so here's the deal guys. This is a crazy guy citation.|foo=value|paz=value 3}}",
+"[https://example.com {{Flag|USA}}]",
+"<ref>{{Cite news|archive-date=February 7, 2017|archive-url=https://web.archive.org/web/20170207112933/http://gbppr.dyndns.org/~gbpprorg/obama/barack.mother.txt|author=Jones, Tim|date=March 27, 2007|newspaper=[[Chicago Tribune]]|page=1 (Tempo)|title=Barack Obama: Mother not just a girl from Kansas; Stanley Ann Dunham shaped a future senator|url-status=dead|url=http://gbppr.dyndns.org/~gbpprorg/obama/barack.mother.txt}}</ref>",
+"{{Cite web|access-date={{CURRENTYEAR}}-{{CURRENTMONTH}}-{{CURRENTDAY}}|title=Example|url=http://example.com}}",
+"[http://example.com {{Cite web|access-date=2023-05-19|title=Example|url=http://example.com}}]",
+"<ref>{{Cite web|access-date=2023-05-19|title=Example|url=http://example.com}}<nowiki>{{Not a template}}</nowiki></ref>",
+"{{Cite web|access-date=2023-05-19|title={{Random}}|url=http://example.com}}",
+"{{Example|unnamed|2=second unnamed|foo=bar|name=value}}",
+"{{Cite web|access-date=2023-05-19|title=Example Title|url=[http://example.com Example]}}",
+"<ref>{{Cite news|access-date=March 20, 2008|author=Serafin, Peter|date=March 21, 2004|newspaper=[[Honolulu Star-Bulletin]]|title=Punahou grad stirs up Illinois politics|url=http://archives.starbulletin.com/2004/03/21/news/story4.html}}\n* {{Cite news|access-date=November 18, 2011|archive-date=March 14, 2008|archive-url=https://web.archive.org/web/20080314042735/http://www.nytimes.com/2008/03/14/us/politics/14obama.html|author=Scott, Janny|date=March 14, 2008|page=A1|title=A free-spirited wanderer who set Obama's path|url-access=limited|url-status=live|url=https://www.nytimes.com/2008/03/14/us/politics/14obama.html|work=The New York Times}}\n* Obama (1995, 2004), Chapters 3 and 4.\n* Scott (2012), pp. 131–134.\n* Maraniss (2012), pp. 264–269.</ref>",
+"<ref></ref>",
+"<ref />",
+"*** Hello world",
+"## test2",
+"""<ref>Multi-line ref
+Second line</ref>"""
     ]
 
 
