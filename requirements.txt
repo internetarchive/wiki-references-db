@@ -1,6 +1,6 @@
-mwparserfromhell
-psycopg2-binary
-requests
-typing
-sqlalchemy
-asyncpg
+mwparserfromhell>=0.6.4
+psycopg2-binary>=2.9.9
+requests>=2.31.0
+typing-extensions>=4.5.0
+sqlalchemy>=2.0.25
+asyncpg>=0.29.0

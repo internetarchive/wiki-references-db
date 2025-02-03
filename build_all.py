@@ -4,8 +4,8 @@ import subprocess
 import queue
 import time
 
-directory = "./sources/"
-max_processes = 30
+directory = "/home/jh/enwiki/enwiki/"
+max_processes = 150
 
 def sort_key(file_name):
     match = re.search(r"history(\d+).*?p(\d+)", file_name)
