@@ -8,14 +8,13 @@ app = Flask(__name__)
 HTML_FORM = """
 <!doctype html>
 <title>Reference Lookup</title>
-<h2>Wikipedia Reference Lookup</h2>
+<h2>Wikipedia Citations Now!</h2>
 <form method="get">
   <label for="url">Wikipedia Article URL:</label><br />
   <input type="text" id="url" name="url" size="60" value="https://en.wikipedia.org/wiki/Siemens_scandal"><br><br>
   <label for="asof">As of (optional):</label><br />
-  <input type="text" id="asof" name="asof" placeholder="YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ">
-  <input type="checkbox" id="raw" name="raw" value="true">
-  <label for="raw">Show raw references</label><br><br>
+  <input type="text" id="asof" name="asof" placeholder="YYYY-MM-DDTHH:MM:SSZ">
+  <br><br>
   <label for="output">Output format:</label>
   <select id="output" name="output">
     <option value="html">HTML Table</option>
@@ -52,7 +51,7 @@ def _normalize_asof(asof: str | None) -> str | None:
 @app.route("/", methods=["GET"])
 def reference_lookup():
     url = request.args.get("url")
-    raw = request.args.get("raw", "false").lower() == "true"
+    raw = True
     output = request.args.get("output", "html")
     asof = _normalize_asof(request.args.get("asof"))
 
