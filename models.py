@@ -1,4 +1,5 @@
 from sqlalchemy import Column, Integer, String, ForeignKey, Text, UniqueConstraint, PrimaryKeyConstraint, select
+from sqlalchemy.types import SmallInteger
 from sqlalchemy.orm import relationship, Session
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.dialects.postgresql import insert
@@ -17,7 +18,6 @@ class Concept(Base):
     wikidata_id                =  Column(Integer, unique=True)
     librarybase_id             =  Column(Integer, unique=True)
     internet_domains_id        =  Column(Integer, unique=True)
-    open_misc_id               =  Column(Integer, unique=True)
 
     @staticmethod
     def upsert(session: Session, **kwargs):
@@ -32,6 +32,21 @@ class Concept(Base):
         session.commit()
         return result.inserted_primary_key[0] if result.inserted_primary_key else kwargs.get('id')
 
+    @staticmethod
+    def get_id_by_label(session: Session, label: str):
+        if label is None:
+            return None
+        return session.execute(
+            select(Concept.id).where(Concept.label == label)
+        ).scalar_one_or_none()
+
+    @staticmethod
+    def get_or_create_by_label(session: Session, label: str) -> int:
+        existing = Concept.get_id_by_label(session, label)
+        if existing is not None:
+            return existing
+        return Concept.upsert(session, label=label)
+
 # "Documents" are the basic publication type. It is roughly analogous to a FRBR "edition".
 # An individual Wikipedia article is a Document. The sources it cites are Documents.
 # A Document can be made available online as one or more Web Resources. For example, an
@@ -44,9 +59,11 @@ class Document(Base):
     __tablename__               =  'documents'
     id                          =  Column(Integer, ForeignKey('concepts.id'), primary_key=True, nullable=False)
     numeric_page_id             =  Column(Integer)
+    numeric_namespace_id        =  Column(Integer)
     language_code               =  Column(String)
     has_container               =  Column(Integer, ForeignKey('concepts.id'))
     part_of_larger_work         =  Column(Integer, ForeignKey('concepts.id'))
+    title                       =  Column(String)
     document_concept            =  relationship("Concept", foreign_keys=[id])
     container_concept           =  relationship("Concept", foreign_keys=[has_container])
     part_of_concept             =  relationship("Concept", foreign_keys=[part_of_larger_work])
@@ -110,8 +127,10 @@ class Domain(Base):
     top_level_domain           =  Column(String)
     parent_domain              =  Column(Integer, ForeignKey('concepts.id'))
     for_container              =  Column(Integer, ForeignKey('concepts.id'))
+    # `id` is the Concept representing the domain entity itself (label usually like "{domain} (domain)")
     domain_concept             =  relationship("Concept", foreign_keys=[id])
-    container_concept          =  relationship("Concept", foreign_keys=[id], overlaps="domain_concept")
+    # `for_container` points to the Concept used as a container (label "{domain}")
+    container_concept          =  relationship("Concept", foreign_keys=[for_container])
 
     @staticmethod
     def upsert(session: Session, **kwargs):
@@ -152,14 +171,17 @@ class Container(Base):
         session.commit()
 
 # "Citations" appear on Wikipedia articles and other documents. Citations can have one or more
-# Referenced Documents. This table stores the "raw" reference, which is the text of the reference
-# exactly as it appears in wikitext. It also tracks the earliest and latest revisions the citation
+# Referenced Documents. This table tracks the earliest and latest revisions the citation
 # appears in, while each individual revision containing the reference is stored as Citation History.
+# Instead of storing the raw text, we store the start and end offsets of the reference in the wikitext.
 class Citation(Base):
     __tablename__ = 'citations'
     record_sha1 = Column(String, nullable=False)
     reference_raw_sha1 = Column(String, nullable=False)
-    reference_raw = Column(Text, nullable=False)
+    offset_start = Column(Integer, nullable=True)
+    offset_end = Column(Integer, nullable=True)
+    # reference_type is an application-level small int enum: 0=other, 1=inline, 2=endnote (extensible)
+    reference_type = Column(SmallInteger, nullable=False, server_default='0')
     reference_normalized_sha1 = Column(String, nullable=False)
     reference_name = Column(String)
     wiki_article_id = Column(Integer, nullable=False)
@@ -175,7 +197,9 @@ class Citation(Base):
         stmt = stmt.on_conflict_do_update(
             index_elements=['record_sha1', 'reference_raw_sha1'],
             set_={
-                'reference_raw': kwargs.get('reference_raw', Citation.reference_raw),
+                'offset_start': kwargs.get('offset_start', Citation.offset_start),
+                'offset_end': kwargs.get('offset_end', Citation.offset_end),
+                'reference_type': kwargs.get('reference_type', Citation.reference_type),
                 'reference_normalized_sha1': kwargs.get('reference_normalized_sha1', Citation.reference_normalized_sha1),
                 'reference_name': kwargs.get('reference_name', Citation.reference_name),
                 'wiki_article_id': kwargs.get('wiki_article_id', Citation.wiki_article_id),
@@ -191,7 +215,6 @@ class CitationHistory(Base):
     revision_id = Column(Integer, nullable=False, primary_key=True)
     reference_normalized_sha1 = Column(String, nullable=False)
     reference_raw_sha1 = Column(String, nullable=False)
-    revision_timestamp = Column(String, nullable=False)
 
     __table_args__ = (UniqueConstraint('record_sha1', 'revision_id', name='uix_record_revision'),)
 
@@ -201,6 +224,57 @@ class CitationHistory(Base):
         set_values = {k: v for k, v in kwargs.items() if v is not None}
         stmt = stmt.on_conflict_do_update(
             index_elements=['record_sha1', 'revision_id'],
+            set_=set_values
+        )
+        session.execute(stmt)
+        session.commit()
+
+# "RevisionBundle" represents a compressed file containing the contents of a Revision.
+# Each bundle has an incrementing ID and a file_path to its location on disk.
+class RevisionBundle(Base):
+    __tablename__ = 'revision_bundles'
+    id = Column(Integer, primary_key=True, nullable=False)
+    file_path = Column(String, nullable=False, unique=True)
+
+    __table_args__ = (
+        UniqueConstraint('file_path', name='uix_revision_bundle_file_path'),
+    )
+
+    @staticmethod
+    def upsert(session: Session, **kwargs):
+        stmt = insert(RevisionBundle).values(**kwargs)
+        set_values = {k: v for k, v in kwargs.items() if v is not None}
+        stmt = stmt.on_conflict_do_update(
+            index_elements=['file_path'],
+            set_=set_values
+        )
+        result = session.execute(stmt)
+        session.commit()
+        return result.inserted_primary_key[0] if result.inserted_primary_key else kwargs.get('id')
+
+# "Revisions" table maps revision IDs to page IDs and timestamps.
+class Revision(Base):
+    __tablename__ = 'revisions'
+    revision_id = Column(Integer, primary_key=True)
+    page_id = Column(Integer, nullable=False)
+    parent_revision_id = Column(Integer)
+    revision_timestamp = Column(String, nullable=False)
+    found_in_bundle = Column(Integer, ForeignKey('revision_bundles.id'))
+    offset_begin = Column(Integer)
+    offset_end = Column(Integer)
+
+    bundle = relationship("RevisionBundle", foreign_keys=[found_in_bundle])
+
+    __table_args__ = (
+        UniqueConstraint('revision_id', name='uix_revision_id'),
+    )
+
+    @staticmethod
+    def upsert(session: Session, **kwargs):
+        stmt = insert(Revision).values(**kwargs)
+        set_values = {k: v for k, v in kwargs.items() if v is not None}
+        stmt = stmt.on_conflict_do_update(
+            index_elements=['revision_id'],
             set_=set_values
         )
         session.execute(stmt)
@@ -233,26 +307,107 @@ class NormalizedCitation(Base):
         session.execute(stmt)
         session.commit()
 
-# "Referenced Documents" match up an individual Sub-Reference Citations have one or more Sub-References,
-# a Sub-Reference being an individual cited document. Since citations can be to multiple documents, we need
-# to separately identify individual documents within a broader reference.
-class ReferencedDocument(Base):
-    __tablename__                 =  'referenced_documents'
-    record_sha1                   =  Column(Integer, nullable=False, primary_key=True)
-    subreference_normalized_sha1  =  Column(String, primary_key=True)
-    reference_normalized_sha1     =  Column(String, nullable=False)
-    subreference_normalized       =  Column(Text, nullable=False)
-    referenced_document           =  Column(Integer, ForeignKey('concepts.id'))
-    document_concept              =  relationship("Concept", foreign_keys=[referenced_document])
+# "NormalizedCitationWebResource" maps which WebResources appear in which NormalizedCitations.
+# A WebResource is identified by web_resources.id (also a Concept ID). A NormalizedCitation is
+# identified by its reference_normalized_sha1. This table de-duplicates URL appearances across
+# identical normalized citations.
+class NormalizedCitationWebResource(Base):
+    __tablename__ = 'normalized_citation_web_resources'
+    reference_normalized_sha1 = Column(String, nullable=False)
+    web_resource_id = Column(Integer, ForeignKey('web_resources.id'), nullable=False)
 
-    __table_args__ = (UniqueConstraint('record_sha1', 'subreference_normalized', name='uix_record_subreference'),)
+    resource = relationship("WebResource", foreign_keys=[web_resource_id])
+
+    __table_args__ = (
+        UniqueConstraint('reference_normalized_sha1', 'web_resource_id', name='uix_normcit_webresource'),
+        PrimaryKeyConstraint('reference_normalized_sha1', 'web_resource_id', name='pk_normcit_webresource'),
+    )
 
     @staticmethod
     def upsert(session: Session, **kwargs):
-        stmt = insert(ReferencedDocument).values(**kwargs)
+        stmt = insert(NormalizedCitationWebResource).values(**kwargs)
         set_values = {k: v for k, v in kwargs.items() if v is not None}
         stmt = stmt.on_conflict_do_update(
-            index_elements=['record_sha1', 'subreference_normalized'],
+            index_elements=['reference_normalized_sha1', 'web_resource_id'],
+            set_=set_values
+        )
+        session.execute(stmt)
+        session.commit()
+
+# "WikiTemplate" tracks wiki template names per domain (e.g., en.wikipedia.org) and ties
+# them back to a Concept ID. Template names are stored in normalized form: first letter
+# capitalized, with spaces instead of underscores.
+class WikiTemplate(Base):
+    __tablename__ = 'wiki_templates'
+    id = Column(Integer, ForeignKey('concepts.id'), primary_key=True, nullable=False)
+    domain = Column(Integer, ForeignKey('concepts.id'), nullable=False)
+    name = Column(String, nullable=False)  # normalized template name
+
+    template_concept = relationship("Concept", foreign_keys=[id])
+    domain_concept = relationship("Concept", foreign_keys=[domain])
+
+    __table_args__ = (
+        UniqueConstraint('domain', 'name', name='uix_template_domain_name'),
+    )
+
+    @staticmethod
+    def normalize_name(raw: str) -> str:
+        if not raw:
+            return raw
+        norm = raw.replace('_', ' ').strip()
+        if len(norm) == 0:
+            return norm
+        return norm[0].upper() + norm[1:]
+
+    @staticmethod
+    def upsert(session: Session, **kwargs):
+        # Ensure normalized storage of the name
+        if 'name' in kwargs and kwargs['name']:
+            kwargs['name'] = WikiTemplate.normalize_name(kwargs['name'])
+        if 'id' not in kwargs:
+            kwargs['id'] = Concept.upsert(session)
+        stmt = insert(WikiTemplate).values(**kwargs)
+        set_values = {k: v for k, v in kwargs.items() if v is not None}
+        stmt = stmt.on_conflict_do_update(
+            index_elements=['domain', 'name'],
+            set_=set_values
+        )
+        session.execute(stmt)
+        session.commit()
+        # return the id for the inserted/updated row
+        result = session.execute(
+            select(WikiTemplate.id).where(
+                WikiTemplate.domain == kwargs['domain'],
+                WikiTemplate.name == kwargs['name']
+            )
+        ).scalar_one()
+        return result
+
+# "TemplateData" stores key/value parameters for each template invocation found within a
+# normalized citation. Each row is per-parameter, disambiguated by the template concept ID,
+# the normalized citation hash, the template's starting offset within the normalized citation,
+# and the parameter key.
+class TemplateData(Base):
+    __tablename__ = 'template_data'
+    wiki_template_id = Column(Integer, ForeignKey('wiki_templates.id'), nullable=False)
+    reference_normalized_sha1 = Column(String, nullable=False)
+    offset_start = Column(Integer, nullable=False)
+    parameter_key = Column(String, nullable=False)
+    parameter_value = Column(Text, nullable=True)
+
+    template = relationship("WikiTemplate", foreign_keys=[wiki_template_id])
+
+    __table_args__ = (
+        UniqueConstraint('wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key', name='uix_template_param'),
+        PrimaryKeyConstraint('wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key', name='pk_template_param'),
+    )
+
+    @staticmethod
+    def upsert(session: Session, **kwargs):
+        stmt = insert(TemplateData).values(**kwargs)
+        set_values = {k: v for k, v in kwargs.items() if v is not None}
+        stmt = stmt.on_conflict_do_update(
+            index_elements=['wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key'],
             set_=set_values
         )
         session.execute(stmt)

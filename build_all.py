@@ -3,20 +3,34 @@ import re
 import subprocess
 import queue
 import time
+import argparse
 
-directory = "/home/jh/enwiki/enwiki/"
 max_processes = 150
 
 def sort_key(file_name):
-    match = re.search(r"history(\d+).*?p(\d+)", file_name)
+    # For .mwrev.zst files, try to extract numeric hints if present; else by name
+    match = re.search(r"(\d+)", file_name)
     if match:
-        history_num = int(match.group(1))
-        p_num = int(match.group(2))
-        return (history_num, p_num)
-    return (float('inf'), float('inf'))  # Fallback
+        return int(match.group(1))
+    return float('inf')  # Fallback
 
 def main():
-    files = [os.path.join(directory, f) for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
+    parser = argparse.ArgumentParser(description="Spawn build_db.py for each .mwrev.zst file in a directory.")
+    parser.add_argument("-d", "--directory", required=True, help="Directory containing .mwrev.zst files")
+    parser.add_argument("-p", "--processes", type=int, default=max_processes, help="Max concurrent processes (default: 150)")
+    args = parser.parse_args()
+
+    directory = args.directory
+    if not os.path.isdir(directory):
+        raise SystemExit(f"Provided path is not a directory: {directory}")
+
+    global max_processes
+    max_processes = args.processes
+    files = [
+        os.path.join(directory, f)
+        for f in os.listdir(directory)
+        if os.path.isfile(os.path.join(directory, f)) and f.endswith('.mwrev.zst')
+    ]
     files.sort(key=lambda f: sort_key(os.path.basename(f)))
     #files.reverse()
     process_queue = queue.Queue(maxsize=max_processes)

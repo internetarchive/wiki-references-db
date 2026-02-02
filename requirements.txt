@@ -7,3 +7,4 @@ asyncpg>=0.29.0
 Flask
 Jinja2
 python-dotenv
+zstandard>=0.22.0
