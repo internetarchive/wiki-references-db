@@ -33,6 +33,10 @@
           <td class="{{ 'timestamp' if 'timestamp' in headers[loop.index0] else '' }}" style="word-break: break-word;">
             {% if loop.index0 == ref_column_index %}
               <pre style="margin: 0; white-space: pre-wrap; word-wrap: break-word;">{{ cell | trim('left') }}</pre>
+            {% elif earliest_ts_idx is not none and latest_ts_idx is not none and earliest_id_idx is not none and latest_id_idx is not none and loop.index0 == earliest_ts_idx %}
+              <a href="{{ url }}?oldid={{ row[earliest_id_idx] }}" target="_blank" rel="noopener">{{ cell | trim('left') }}</a>
+            {% elif earliest_ts_idx is not none and latest_ts_idx is not none and earliest_id_idx is not none and latest_id_idx is not none and loop.index0 == latest_ts_idx %}
+              <a href="{{ url }}?oldid={{ row[latest_id_idx] }}" target="_blank" rel="noopener">{{ cell | trim('left') }}</a>
             {% else %}
               {{ cell | trim('left') }}
             {% endif %}
