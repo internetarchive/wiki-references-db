@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, Text, UniqueConstraint, PrimaryKeyConstraint, select
+from sqlalchemy import Column, Integer, BigInteger, String, ForeignKey, Text, UniqueConstraint, PrimaryKeyConstraint, select
 from sqlalchemy.types import SmallInteger
 from sqlalchemy.orm import relationship, Session
 from sqlalchemy.ext.declarative import declarative_base
@@ -212,7 +212,7 @@ class Citation(Base):
 class CitationHistory(Base):
     __tablename__ = 'citation_history'
     record_sha1 = Column(String, nullable=False, primary_key=True)
-    revision_id = Column(Integer, nullable=False, primary_key=True)
+    revision_id = Column(BigInteger, nullable=False, primary_key=True)
     reference_normalized_sha1 = Column(String, nullable=False)
     reference_raw_sha1 = Column(String, nullable=False)
 
@@ -255,9 +255,9 @@ class RevisionBundle(Base):
 # "Revisions" table maps revision IDs to page IDs and timestamps.
 class Revision(Base):
     __tablename__ = 'revisions'
-    revision_id = Column(Integer, primary_key=True)
+    revision_id = Column(BigInteger, primary_key=True)
     page_id = Column(Integer, nullable=False)
-    parent_revision_id = Column(Integer)
+    parent_revision_id = Column(BigInteger)
     revision_timestamp = Column(String, nullable=False)
     found_in_bundle = Column(Integer, ForeignKey('revision_bundles.id'))
     offset_begin = Column(Integer)
