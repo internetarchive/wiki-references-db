@@ -8,7 +8,7 @@ import multiprocessing
 from functools import lru_cache
 from xml.etree import ElementTree
 import zstandard as zstd
-from sqlalchemy import create_engine, insert, select as sa_select, update
+from sqlalchemy import create_engine, insert, select as sa_select
 from sqlalchemy.orm import sessionmaker
 from models import *
 from refs_extractor.article import extract_references
@@ -20,7 +20,14 @@ DB = (
     f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASS')}@"
     f"{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
 )
-Engine = create_engine(DB, pool_size=10, max_overflow=20)
+Engine = create_engine(
+    DB,
+    pool_size=10,
+    max_overflow=20,
+    executemany_mode='values',
+    executemany_batch_page_size=1000,
+    executemany_values_page_size=10000,
+)
 CreateSession = sessionmaker(bind=Engine)
 
 # Wrapper class for weak references
@@ -103,17 +110,10 @@ def get_revisions_from_mwrev_zst(filename):
                 yield current
 
 @lru_cache(maxsize=1000)
-def get_or_create_container_id_by_domain_label(domain: str) -> int:
-    s = CreateSession()
-    try:
-        # If a container row already exists for this label, return its id
-        result = s.execute(sa_select(Container.id).where(Container.label == domain)).scalar_one_or_none()
-        if result is not None:
-            return result
-        inserted_id = Container.upsert(s, label=domain)
-        return inserted_id
-    finally:
-        s.close()
+def get_container_id_cached(session, domain_label: str) -> int:
+    # Upsert once and fetch id; no commit here, caller manages transaction
+    Container.upsert(session, label=domain_label)
+    return session.execute(sa_select(Container.id).where(Container.label == domain_label)).scalar_one()
 
 def process_revisions(revisions, domain="en.wikipedia.org"):
     session = CreateSession()
@@ -122,8 +122,20 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
     seen_revision_ids = set()
     seen_citations, seen_normalized = set(), set()
 
+    # Resolve container and main domain ids once per batch
+    container_id = get_container_id_cached(session, domain)
+
+    domains_needed = set([domain])
+    # Accumulators for later bulk upserts
+    cur_urls_info = []  # dicts with url, page_id, namespace_id, document_id, domain_label
+    external_url_items = []  # (url, netloc)
+    all_urls = set()
+    ncwr_pairs = []  # (reference_normalized_sha1, url)
+    templates_needed = set()  # (domain_label, normalized_name)
+    templ_params_pending = []  # (domain_label, normalized_name, reference_normalized_sha1, offset_start, key, value)
+
     for data in revisions:
-        
+
         language_code = domain.split('.')[0]
         page_id = data["page_id"]
         namespace_id = data.get("namespace_id")
@@ -131,43 +143,21 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
         revision_timestamp = data["revision_timestamp"].replace("T", " ").replace("Z", "")
 
         if page_id not in seen_pages:
-            container_id = get_or_create_container_id_by_domain_label(domain)
-            domain_id = Domain.upsert(session, value=domain, for_container=container_id)
-
-            # Ensure the primary WebResource for this page exists (curid URL) and has numeric identifiers
+            # Create a Document for this page
+            document_id = Document.upsert(session, language_code=language_code, has_container=container_id)
+            # Defer creating curid WebResource until domains are resolved; record needed info
             cur_url = f"https://{domain}/index.php?curid={page_id}"
-            WebResource.upsert(
-                session,
-                url=cur_url,
-                domain_id=domain_id,
-                numeric_page_id=page_id,
-                numeric_namespace_id=namespace_id,
-            )
-            wr_row = session.execute(
-                sa_select(WebResource.id, WebResource.instance_of_document).where(WebResource.url == cur_url)
-            ).first()
-            if wr_row is None:
-                # Extremely unlikely due to upsert
-                document_id = Document.upsert(session, language_code=language_code, has_container=container_id)
-                WebResource.upsert(session, url=cur_url, domain_id=domain_id, instance_of_document=document_id, numeric_page_id=page_id, numeric_namespace_id=namespace_id)
-            else:
-                wr_id, instance_doc_id = wr_row
-                if instance_doc_id is None:
-                    document_id = Document.upsert(session, language_code=language_code, has_container=container_id)
-                    # Attach the new document to the web resource
-                    session.execute(
-                        update(WebResource)
-                        .where(WebResource.id == wr_id)
-                        .values(instance_of_document=document_id)
-                    )
-                    session.commit()
-                else:
-                    document_id = instance_doc_id
-
-            seen_pages[page_id] = PageMetadata(container_id, domain_id, document_id)
+            cur_urls_info.append({
+                'url': cur_url,
+                'numeric_page_id': page_id,
+                'numeric_namespace_id': namespace_id,
+                'instance_of_document': document_id,
+                'domain_label': domain,
+            })
+            seen_pages[page_id] = PageMetadata(container_id, None, document_id)
         else:
             page_metadata = seen_pages[page_id]
-            container_id, domain_id, document_id = page_metadata.container_id, page_metadata.domain_id, page_metadata.document_id
+            document_id = page_metadata.document_id
 
         references = extract_references(data["revision_text"], include_offsets=True)
 
@@ -234,16 +224,11 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
                     netloc = urlparse(url).netloc
                 except Exception:
                     netloc = None
-                url_domain_id = None
                 if netloc:
-                    url_domain_id = Domain.upsert(session, value=netloc, for_container=container_id)
-                WebResource.upsert(session, url=url, domain_id=url_domain_id)
-                wr_id = session.execute(sa_select(WebResource.id).where(WebResource.url == url)).scalar_one()
-                NormalizedCitationWebResource.upsert(
-                    session,
-                    reference_normalized_sha1=reference_normalized_sha1,
-                    web_resource_id=wr_id
-                )
+                    domains_needed.add(netloc)
+                external_url_items.append((url, netloc))
+                all_urls.add(url)
+                ncwr_pairs.append((reference_normalized_sha1, url))
 
             templates = ref.get('templates') or []
             if templates:
@@ -264,7 +249,7 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
                         continue
 
                     normalized_tpl_name = WikiTemplate.normalize_name(tpl_name_raw)
-                    wiki_template_id = WikiTemplate.upsert(session, domain=domain_id, name=normalized_tpl_name)
+                    templates_needed.add((domain, normalized_tpl_name))
 
                     # Compute offset of the template in the normalized citation text.
                     # Prefer searching by beginning marker with normalized name, as the full_text
@@ -278,20 +263,99 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
                         if tpl_offset < 0:
                             tpl_offset = offset_start if isinstance(offset_start, int) else 0
 
-                    # Upsert one TemplateData per parameter
+                    # Collect one TemplateData per parameter (defer id resolution)
                     for p in params:
                         key = (p or {}).get('key')
                         val = (p or {}).get('value')
                         if not key:
                             continue
-                        TemplateData.upsert(
-                            session,
-                            wiki_template_id=wiki_template_id,
-                            reference_normalized_sha1=reference_normalized_sha1,
-                            offset_start=tpl_offset,
-                            parameter_key=key,
-                            parameter_value=val
-                        )
+                        templ_params_pending.append((domain, normalized_tpl_name, reference_normalized_sha1, tpl_offset, key, val))
+
+    # Domains: bulk upsert all needed and map ids
+    if domains_needed:
+        Domain.bulk_upsert(session, [{'value': d, 'for_container': container_id} for d in domains_needed])
+        rows = session.execute(sa_select(Domain.value, Domain.id).where(Domain.value.in_(list(domains_needed)))).all()
+        domain_id_by_value = {v: i for v, i in rows}
+    else:
+        domain_id_by_value = {}
+
+    # Build WebResources rows (curid + external URLs) and bulk upsert
+    wr_rows = []
+    for info in cur_urls_info:
+        wr_rows.append({
+            'url': info['url'],
+            'domain_id': domain_id_by_value.get(info['domain_label']),
+            'numeric_page_id': info['numeric_page_id'],
+            'numeric_namespace_id': info['numeric_namespace_id'],
+            'instance_of_document': info['instance_of_document'],
+        })
+        all_urls.add(info['url'])
+
+    for url, netloc in external_url_items:
+        wr_rows.append({
+            'url': url,
+            'domain_id': domain_id_by_value.get(netloc),
+        })
+
+    if wr_rows:
+        WebResource.bulk_upsert(session, wr_rows)
+
+    # Map URL -> web_resource_id in one query
+    url_to_id = {}
+    if all_urls:
+        rows = session.execute(sa_select(WebResource.url, WebResource.id).where(WebResource.url.in_(list(all_urls)))).all()
+        url_to_id = {u: i for u, i in rows}
+
+    # Build NCWR rows in bulk
+    ncwr_rows = []
+    for rsha1, url in ncwr_pairs:
+        wr_id = url_to_id.get(url)
+        if wr_id is not None:
+            ncwr_rows.append({'reference_normalized_sha1': rsha1, 'web_resource_id': wr_id})
+
+    if ncwr_rows:
+        NormalizedCitationWebResource.bulk_upsert(session, ncwr_rows)
+
+    # Templates: bulk upsert and then bulk upsert params
+    wiki_template_rows = []
+    for dom_label, name in templates_needed:
+        dom_id = domain_id_by_value.get(dom_label)
+        if dom_id is not None:
+            wiki_template_rows.append({'domain': dom_id, 'name': name})
+
+    if wiki_template_rows:
+        WikiTemplate.bulk_upsert(session, wiki_template_rows)
+
+    # Map (domain_id, name) -> wiki_template_id
+    template_key_to_id = {}
+    if wiki_template_rows:
+        from sqlalchemy import tuple_
+        keys = [(row['domain'], row['name']) for row in wiki_template_rows]
+        rows = session.execute(
+            sa_select(WikiTemplate.domain, WikiTemplate.name, WikiTemplate.id)
+            .where(tuple_(WikiTemplate.domain, WikiTemplate.name).in_(keys))
+        ).all()
+        template_key_to_id = { (d, n): i for d, n, i in rows }
+
+    # Build TemplateData rows
+    template_data_rows = []
+    for dom_label, name, rsha1, off, key, val in templ_params_pending:
+        dom_id = domain_id_by_value.get(dom_label)
+        if dom_id is None:
+            continue
+        tpl_id = template_key_to_id.get((dom_id, name))
+        if tpl_id is None:
+            continue
+        template_data_rows.append({
+            'wiki_template_id': tpl_id,
+            'reference_normalized_sha1': rsha1,
+            'offset_start': off,
+            'parameter_key': key,
+            'parameter_value': val,
+        })
+
+    if template_data_rows:
+        TemplateData.bulk_upsert(session, template_data_rows)
 
     if citations:
         stmt_citations = insert(Citation).values(citations).on_conflict_do_update(

@@ -30,9 +30,9 @@ class Document(Base):
     @staticmethod
     def upsert(session: Session, **kwargs):
         # Create a new Document and return its id. Deduplication should be handled by callers.
+        # Do not commit here; caller manages transaction.
         stmt = insert(Document).values(**kwargs).returning(Document.id)
         result = session.execute(stmt).scalar_one()
-        session.commit()
         return result
 
 # "Web Resources" are individual web pages. Ideally, a Web Resource corresponds to a Document,
@@ -61,7 +61,26 @@ class WebResource(Base):
             set_=set_values
         )
         session.execute(stmt)
-        session.commit()
+
+    @staticmethod
+    def bulk_upsert(session: Session, rows):
+        if not rows:
+            return
+        cleaned = []
+        for r in rows:
+            cleaned.append({k: v for k, v in r.items() if k != 'id'})
+        stmt = insert(WebResource).values(cleaned).on_conflict_do_update(
+            index_elements=['url'],
+            set_={
+                'instance_of_document': insert(WebResource).excluded.instance_of_document,
+                'availability_status': insert(WebResource).excluded.availability_status,
+                'is_archive_of': insert(WebResource).excluded.is_archive_of,
+                'domain_id': insert(WebResource).excluded.domain_id,
+                'numeric_page_id': insert(WebResource).excluded.numeric_page_id,
+                'numeric_namespace_id': insert(WebResource).excluded.numeric_namespace_id,
+            }
+        )
+        session.execute(stmt)
 
 # "Domains" are domain names, like example.com, archive.org, or fremont.k12.ca.us. Web Resources
 # have exactly one Domain.
@@ -86,11 +105,25 @@ class Domain(Base):
                 set_=set_values
             )
         session.execute(stmt)
-        session.commit()
-        result = session.execute(
-            select(Domain.id).where(Domain.value == values['value'])
-        ).scalar_one()
-        return result
+
+    @staticmethod
+    def bulk_upsert(session: Session, rows):
+        if not rows:
+            return
+        cleaned = []
+        for r in rows:
+            cleaned.append({k: v for k, v in r.items() if k != 'id'})
+        stmt = insert(Domain).values(cleaned)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=['value'],
+            set_={
+                'top_level_domain': insert(Domain).excluded.top_level_domain,
+                'parent_domain': insert(Domain).excluded.parent_domain,
+                'for_container': insert(Domain).excluded.for_container,
+                'internet_domains_id': insert(Domain).excluded.internet_domains_id,
+            }
+        )
+        session.execute(stmt)
 
 # "Containers" are periodicals, journals, etc. Containers contain multiple Documents.
 class Container(Base):
@@ -109,9 +142,20 @@ class Container(Base):
             index_elements=['label'],
             set_=set_values
         )
-        result = session.execute(stmt)
-        session.commit()
-        return result.inserted_primary_key[0] if result.inserted_primary_key else session.execute(select(Container.id).where(Container.label == values.get('label'))).scalar_one_or_none()
+        session.execute(stmt)
+
+    @staticmethod
+    def bulk_upsert(session: Session, rows):
+        if not rows:
+            return
+        stmt = insert(Container).values(rows).on_conflict_do_update(
+            index_elements=['label'],
+            set_={
+                'wikidata_id': insert(Container).excluded.wikidata_id,
+                'librarybase_id': insert(Container).excluded.librarybase_id,
+            }
+        )
+        session.execute(stmt)
 
 # "Citations" appear on Wikipedia articles and other documents. Citations can have one or more
 # Referenced Documents. This table tracks the earliest and latest revisions the citation
@@ -149,7 +193,6 @@ class Citation(Base):
             }
         )
         session.execute(stmt)
-        session.commit()
 
 # "Citation History" tracks the individual article revisions in which a given Citation appears.
 class CitationHistory(Base):
@@ -170,7 +213,6 @@ class CitationHistory(Base):
             set_=set_values
         )
         session.execute(stmt)
-        session.commit()
 
 # "RevisionBundle" represents a compressed file containing the contents of a Revision.
 # Each bundle has an incrementing ID and a file_path to its location on disk.
@@ -191,9 +233,7 @@ class RevisionBundle(Base):
             index_elements=['file_path'],
             set_=set_values
         )
-        result = session.execute(stmt)
-        session.commit()
-        return result.inserted_primary_key[0] if result.inserted_primary_key else kwargs.get('id')
+        session.execute(stmt)
 
 # "Revisions" table maps revision IDs to page IDs and timestamps.
 class Revision(Base):
@@ -221,7 +261,6 @@ class Revision(Base):
             set_=set_values
         )
         session.execute(stmt)
-        session.commit()
 
 # "Normalized Citations" are Citations that have been run through a normalization function. This
 # alphabetizes template parameters, makes newlines and whitespace consistent, removes ref names, etc.
@@ -248,7 +287,6 @@ class NormalizedCitation(Base):
             set_=set_values
         )
         session.execute(stmt)
-        session.commit()
 
 # "NormalizedCitationWebResource" maps which WebResources appear in which NormalizedCitations.
 # A WebResource is identified by its own auto-incrementing web_resources.id. A NormalizedCitation is
@@ -275,7 +313,13 @@ class NormalizedCitationWebResource(Base):
             set_=set_values
         )
         session.execute(stmt)
-        session.commit()
+
+    @staticmethod
+    def bulk_upsert(session: Session, rows):
+        if not rows:
+            return
+        stmt = insert(NormalizedCitationWebResource).values(rows).on_conflict_do_nothing()
+        session.execute(stmt)
 
 # "WikiTemplate" tracks wiki template names per domain_id (e.g., en.wikipedia.org) and ties
 # them back to a Concept ID. Template names are stored in normalized form: first letter
@@ -315,15 +359,25 @@ class WikiTemplate(Base):
             set_=set_values
         )
         session.execute(stmt)
-        session.commit()
-        # return the id for the inserted/updated row
-        result = session.execute(
-            select(WikiTemplate.id).where(
-                WikiTemplate.domain == kwargs['domain'],
-                WikiTemplate.name == kwargs['name']
-            )
-        ).scalar_one()
-        return result
+
+    @staticmethod
+    def bulk_upsert(session: Session, rows):
+        if not rows:
+            return
+        cleaned = []
+        for r in rows:
+            r2 = dict(r)
+            if 'name' in r2 and r2['name']:
+                r2['name'] = WikiTemplate.normalize_name(r2['name'])
+            cleaned.append(r2)
+        stmt = insert(WikiTemplate).values(cleaned).on_conflict_do_update(
+            index_elements=['domain', 'name'],
+            set_={
+                'wikidata_id': insert(WikiTemplate).excluded.wikidata_id,
+                'librarybase_id': insert(WikiTemplate).excluded.librarybase_id,
+            }
+        )
+        session.execute(stmt)
 
 # "TemplateData" stores key/value parameters for each template invocation found within a
 # normalized citation. Each row is per-parameter, disambiguated by the template concept ID,
@@ -353,4 +407,13 @@ class TemplateData(Base):
             set_=set_values
         )
         session.execute(stmt)
-        session.commit()
+
+    @staticmethod
+    def bulk_upsert(session: Session, rows):
+        if not rows:
+            return
+        stmt = insert(TemplateData).values(rows).on_conflict_do_update(
+            index_elements=['wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key'],
+            set_={'parameter_value': insert(TemplateData).excluded.parameter_value}
+        )
+        session.execute(stmt)
