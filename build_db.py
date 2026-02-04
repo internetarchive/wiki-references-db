@@ -103,13 +103,17 @@ def get_revisions_from_mwrev_zst(filename):
                 yield current
 
 @lru_cache(maxsize=1000)
-def get_or_create_container_id_by_domain(session, domain):
-    # If a container row already exists for this label, return its id
-    result = session.execute(select(Container.id).where(Container.label == domain)).scalar_one_or_none()
-    if result:
-        return result
-    inserted_id = Container.upsert(session, label=domain)
-    return inserted_id
+def get_or_create_container_id_by_domain_label(domain: str) -> int:
+    s = CreateSession()
+    try:
+        # If a container row already exists for this label, return its id
+        result = s.execute(sa_select(Container.id).where(Container.label == domain)).scalar_one_or_none()
+        if result is not None:
+            return result
+        inserted_id = Container.upsert(s, label=domain)
+        return inserted_id
+    finally:
+        s.close()
 
 def process_revisions(revisions, domain="en.wikipedia.org"):
     session = CreateSession()
@@ -127,7 +131,7 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
         revision_timestamp = data["revision_timestamp"].replace("T", " ").replace("Z", "")
 
         if page_id not in seen_pages:
-            container_id = get_or_create_container_id_by_domain(session, domain)
+            container_id = get_or_create_container_id_by_domain_label(domain)
             domain_id = Domain.upsert(session, value=domain, for_container=container_id)
 
             # Ensure the primary WebResource for this page exists (curid URL) and has numeric identifiers
@@ -234,7 +238,7 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
                 if netloc:
                     url_domain_id = Domain.upsert(session, value=netloc, for_container=container_id)
                 WebResource.upsert(session, url=url, domain_id=url_domain_id)
-                wr_id = session.execute(select(WebResource.id).where(WebResource.url == url)).scalar_one()
+                wr_id = session.execute(sa_select(WebResource.id).where(WebResource.url == url)).scalar_one()
                 NormalizedCitationWebResource.upsert(
                     session,
                     reference_normalized_sha1=reference_normalized_sha1,
@@ -319,7 +323,11 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
     if normalized_citations:
         stmt_normalized = insert(NormalizedCitation).values(normalized_citations).on_conflict_do_update(
             index_elements=["record_sha1"],
-            set_={"reference_normalized": insert(NormalizedCitation).excluded.reference_normalized}
+            set_={
+                "reference_normalized": insert(NormalizedCitation).excluded.reference_normalized,
+                "reference_normalized_sha1": insert(NormalizedCitation).excluded.reference_normalized_sha1,
+                "appears_on_article": insert(NormalizedCitation).excluded.appears_on_article,
+            }
         )
         session.execute(stmt_normalized)
 
