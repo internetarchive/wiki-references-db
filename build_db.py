@@ -8,7 +8,7 @@ import multiprocessing
 from functools import lru_cache
 from xml.etree import ElementTree
 import zstandard as zstd
-from sqlalchemy import create_engine, insert
+from sqlalchemy import create_engine, insert, select as sa_select, update
 from sqlalchemy.orm import sessionmaker
 from models import *
 from refs_extractor.article import extract_references
@@ -76,6 +76,8 @@ def get_revisions_from_mwrev_zst(filename):
                         meta[k.strip()] = v.strip() if v is not None else ''
 
                     page_id = int(meta.get('page_id')) if meta.get('page_id') else None
+                    # namespace id (ns) may be missing on some lines; store as None when absent
+                    namespace_id = int(meta.get('ns')) if meta.get('ns') else None
                     rev_id = int(meta.get('rev_id')) if meta.get('rev_id') else None
                     parent_rev_id = meta.get('parent_rev_id')
                     parent_rev_id = int(parent_rev_id) if parent_rev_id else None
@@ -83,6 +85,7 @@ def get_revisions_from_mwrev_zst(filename):
 
                     current = {
                         'page_id': page_id,
+                        'namespace_id': namespace_id,
                         'revision_id': rev_id,
                         'parent_revision_id': parent_rev_id,
                         'revision_timestamp': timestamp,
@@ -90,7 +93,6 @@ def get_revisions_from_mwrev_zst(filename):
                     }
                     text_lines = []
                 elif raw_line.startswith(' '):
-                    # Strip the leading space character per format
                     text_lines.append(raw_line[1:].rstrip('\n'))
                 else:
                     # Ignore any other lines (shouldn't normally occur)
@@ -106,12 +108,8 @@ def get_or_create_container_id_by_domain(session, domain):
     result = session.execute(select(Container.id).where(Container.label == domain)).scalar_one_or_none()
     if result:
         return result
-
-    # Reuse existing Concept with this label if present; otherwise create it
-    concept_id = Concept.get_or_create_by_label(session, domain)
-    # Ensure a Container row exists with this concept id
-    Container.upsert(session, id=concept_id, label=domain)
-    return concept_id
+    inserted_id = Container.upsert(session, label=domain)
+    return inserted_id
 
 def process_revisions(revisions, domain="en.wikipedia.org"):
     session = CreateSession()
@@ -124,25 +122,44 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
         
         language_code = domain.split('.')[0]
         page_id = data["page_id"]
+        namespace_id = data.get("namespace_id")
         revision_id = data["revision_id"]
         revision_timestamp = data["revision_timestamp"].replace("T", " ").replace("Z", "")
 
         if page_id not in seen_pages:
-            # Container concept and row for the wiki domain (Concept.label = "{domain}")
             container_id = get_or_create_container_id_by_domain(session, domain)
+            domain_id = Domain.upsert(session, value=domain, for_container=container_id)
 
-            # Domain row: `id` concept labeled "{domain} (domain)", `for_container` references Concept(label={domain})
-            domain_container_concept_id = Concept.get_or_create_by_label(session, domain)
-            domain_domain_concept_id = Concept.get_or_create_by_label(session, f"{domain} (domain)")
-            domain_id = Domain.upsert(session, id=domain_domain_concept_id, value=domain, for_container=domain_container_concept_id)
+            # Ensure the primary WebResource for this page exists (curid URL) and has numeric identifiers
+            cur_url = f"https://{domain}/index.php?curid={page_id}"
+            WebResource.upsert(
+                session,
+                url=cur_url,
+                domain_id=domain_id,
+                numeric_page_id=page_id,
+                numeric_namespace_id=namespace_id,
+            )
+            wr_row = session.execute(
+                sa_select(WebResource.id, WebResource.instance_of_document).where(WebResource.url == cur_url)
+            ).first()
+            if wr_row is None:
+                # Extremely unlikely due to upsert
+                document_id = Document.upsert(session, language_code=language_code, has_container=container_id)
+                WebResource.upsert(session, url=cur_url, domain_id=domain_id, instance_of_document=document_id, numeric_page_id=page_id, numeric_namespace_id=namespace_id)
+            else:
+                wr_id, instance_doc_id = wr_row
+                if instance_doc_id is None:
+                    document_id = Document.upsert(session, language_code=language_code, has_container=container_id)
+                    # Attach the new document to the web resource
+                    session.execute(
+                        update(WebResource)
+                        .where(WebResource.id == wr_id)
+                        .values(instance_of_document=document_id)
+                    )
+                    session.commit()
+                else:
+                    document_id = instance_doc_id
 
-            # Document concept: Concept.label = "{domain}:{page_id}"
-            document_concept_id = Concept.get_or_create_by_label(session, f"{domain}:{page_id}")
-            document_id = Document.upsert(session, id=document_concept_id, numeric_page_id=page_id, language_code=language_code, has_container=container_id)
-
-            # WebResource concept for the article’s on-web manifestation: Concept.label = "{domain}:{page_id} (on web)"
-            web_concept_id = Concept.get_or_create_by_label(session, f"{domain}:{page_id} (on web)")
-            WebResource.upsert(session, id=web_concept_id, url=f"https://{domain}/index.php?curid={page_id}", domain=domain_id, instance_of_document=document_id)
             seen_pages[page_id] = PageMetadata(container_id, domain_id, document_id)
         else:
             page_metadata = seen_pages[page_id]
@@ -151,7 +168,6 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
         references = extract_references(data["revision_text"], include_offsets=True)
 
         for ref in references:
-            # Consume new extractor schema directly (no legacy fallback)
             reference_raw = ref.get('raw_reference')
             offset_start = ref.get('offset_start')
             offset_end = ref.get('offset_end')
@@ -205,12 +221,10 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
                     "revision_timestamp": revision_timestamp
                 })
 
-            # --- New: ingest cited URLs as WebResources and link to the normalized citation ---
             urls = ref.get('urls') or []
             for url in urls:
                 if not url:
                     continue
-                # Determine/ensure the domain Concept for the URL itself (not the wiki domain)
                 try:
                     from urllib.parse import urlparse
                     netloc = urlparse(url).netloc
@@ -218,14 +232,8 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
                     netloc = None
                 url_domain_id = None
                 if netloc:
-                    # Ensure Domain for the cited URL's netloc follows the same concept rules
-                    url_container_cid = Concept.get_or_create_by_label(session, netloc)
-                    url_domain_cid = Concept.get_or_create_by_label(session, f"{netloc} (domain)")
-                    url_domain_id = Domain.upsert(session, id=url_domain_cid, value=netloc, for_container=url_container_cid)
-
-                # Upsert the WebResource with a per-URL Concept (label = "{url} (on web)")
-                wr_concept_id = Concept.get_or_create_by_label(session, f"{url} (on web)")
-                WebResource.upsert(session, id=wr_concept_id, url=url, domain=url_domain_id)
+                    url_domain_id = Domain.upsert(session, value=netloc, for_container=container_id)
+                WebResource.upsert(session, url=url, domain_id=url_domain_id)
                 wr_id = session.execute(select(WebResource.id).where(WebResource.url == url)).scalar_one()
                 NormalizedCitationWebResource.upsert(
                     session,
@@ -233,10 +241,8 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
                     web_resource_id=wr_id
                 )
 
-            # --- New: ingest templates and their parameters as TemplateData ---
             templates = ref.get('templates') or []
             if templates:
-                # Helper to find the Nth occurrence of a substring
                 def find_nth(haystack: str, needle: str, n: int) -> int:
                     start = -1
                     for _ in range(n):
@@ -253,7 +259,6 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
                     if not tpl_name_raw:
                         continue
 
-                    # Upsert the WikiTemplate for the wiki domain (domain_id from the page)
                     normalized_tpl_name = WikiTemplate.normalize_name(tpl_name_raw)
                     wiki_template_id = WikiTemplate.upsert(session, domain=domain_id, name=normalized_tpl_name)
 
@@ -284,7 +289,6 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
                             parameter_value=val
                         )
 
-    # Perform bulk inserts with ON CONFLICT DO UPDATE
     if citations:
         stmt_citations = insert(Citation).values(citations).on_conflict_do_update(
             index_elements=['record_sha1', 'reference_raw_sha1'],
@@ -324,7 +328,6 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
 
 def process_file(filename):
     if not filename.endswith('.mwrev.zst'):
-        # Ignore non-mwrev files
         return
     batch = []
     for revision in get_revisions_from_mwrev_zst(filename):

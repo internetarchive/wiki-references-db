@@ -45,7 +45,7 @@ def reference_lookup():
         # Correlated subquery: latest revision_id for this page
         latest_page_rev_id_sq = (
             select(func.max(Revision.revision_id))
-            .where(Revision.page_id == Document.numeric_page_id)
+            .where(Revision.page_id == WebResource.numeric_page_id)
             .scalar_subquery()
         )
 
@@ -69,7 +69,7 @@ def reference_lookup():
                 )
                 .select_from(WebResource)
                 .join(Document, WebResource.instance_of_document == Document.id)
-                .join(Citation, Citation.wiki_article_id == Document.numeric_page_id)
+                .join(Citation, Citation.wiki_article_id == WebResource.numeric_page_id)
                 .join(CitationHistory, and_(
                     Citation.record_sha1 == CitationHistory.record_sha1,
                     Citation.reference_raw_sha1 == CitationHistory.reference_raw_sha1
@@ -120,7 +120,7 @@ def reference_lookup():
                 )
                 .select_from(WebResource)
                 .join(Document, WebResource.instance_of_document == Document.id)
-                .join(Citation, Citation.wiki_article_id == Document.numeric_page_id)
+                .join(Citation, Citation.wiki_article_id == WebResource.numeric_page_id)
                 .join(CitationHistory, and_(
                     Citation.record_sha1 == CitationHistory.record_sha1,
                     Citation.reference_raw_sha1 == CitationHistory.reference_raw_sha1
