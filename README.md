@@ -55,16 +55,45 @@ Build database entries from a single compressed revision bundle file (`.mwrev.zs
 python3 build_db.py /path/to/file.mwrev.zst
 ```
 
-Batch-process a directory of `.mwrev.zst` files:
+Batch-process a directory of `.mwrev.zst` files with concurrent jobs:
 
 ```
-python3 build_all.py -d /path/to/wiki/dumps
+python3 build_all.py -d /path/to/wiki/dumps --jobs 4
 ```
 
-Optional: limit concurrency (default 150):
+### CLI flags
+
+- build_all.py (launcher)
+  - `-d, --directory` (required): Directory containing `.mwrev.zst` files to process.
+  - `-j, --jobs` (default: 8): Number of concurrent jobs/files to run in parallel. Each job launches one `build_db.py` process.
+  - Environment variables forwarded to each `build_db.py` job (override the worker flags below):
+    - `PARSE_PROCS` (default: 4): Parser processes per job.
+    - `WRITE_PROCS` (default: 1): Writer processes per job (keep small to protect Postgres).
+    - `BATCH_SIZE` (default: 1000): Revisions per parsed batch.
+    - `QUEUE_MAX` (default: 32): Max queued batches between parser and writer (backpressure).
+    - `METRICS_INTERVAL` (default: 5): Seconds between periodic metrics prints.
+    - `TUNE_DB` (default: 0): Set to `1` or `true` to enable per-transaction DB tuning in writers.
+
+- build_db.py (worker)
+  - `path` (positional; default: `./sources/`): File or directory of `.mwrev.zst` input.
+  - `--domain` (default: `en.wikipedia.org`): Wiki domain for `curid` URLs.
+  - `--batch-size` (default: 1000): Revisions per parsed batch.
+  - `--parse-procs` (default: CPU count - 1): Number of parser processes.
+  - `--write-procs` (default: 1): Number of writer processes (DB-bound; keep small).
+  - `--queue-max` (default: 32): Max number of parsed batches buffered between stages.
+  - `--metrics-interval` (default: 5): Seconds between periodic metrics prints.
+  - `--tune-db` (flag): Enable per-transaction DB load-time tuning for bulk ingest.
+
+Examples:
 
 ```
-python3 build_all.py -d /path/to/wiki/dumps -p 50
+# Single file with tuned inner scaling
+python3 build_db.py /path/to/file.mwrev.zst \
+  --parse-procs 6 --write-procs 1 --batch-size 2000 --queue-max 64 --tune-db --metrics-interval 3
+
+# Directory with 4 concurrent jobs; inner scaling via env vars
+PARSE_PROCS=6 WRITE_PROCS=1 BATCH_SIZE=2000 QUEUE_MAX=64 METRICS_INTERVAL=5 TUNE_DB=1 \
+  python3 build_all.py -d /path/to/wiki/dumps --jobs 4
 ```
 
 ### Revision Bundles

@@ -2,13 +2,18 @@ import io
 import bz2
 import os
 import sys
+import time
+import signal
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 import weakref
 import multiprocessing
+from multiprocessing import Queue, Event, Process
 from functools import lru_cache
 from xml.etree import ElementTree
 import zstandard as zstd
-from sqlalchemy import create_engine, insert, select as sa_select
+from sqlalchemy import create_engine, insert, select as sa_select, text
 from sqlalchemy.orm import sessionmaker
 from models import *
 from refs_extractor.article import extract_references
@@ -22,8 +27,10 @@ DB = (
 )
 Engine = create_engine(
     DB,
-    pool_size=10,
-    max_overflow=20,
+    # Constrain each worker to a single connection to avoid connection storms
+    pool_size=1,
+    max_overflow=0,
+    pool_pre_ping=True,
     executemany_mode='values',
     executemany_batch_page_size=1000,
     executemany_values_page_size=10000,
@@ -41,9 +48,29 @@ class PageMetadata:
 # Weak reference dictionary for seen page IDs
 seen_pages = weakref.WeakValueDictionary()
 
-# Constants
-BATCH_SIZE = 1000  # Number of revisions processed before committing
-N_PROCESSES = max(2, multiprocessing.cpu_count() - 1)
+# Defaults (overridable via CLI)
+BATCH_SIZE = 1000           # revisions per batch from parsers
+PARSE_PROCS = max(1, multiprocessing.cpu_count() - 1)
+WRITE_PROCS = 1             # writers should be small to protect DB
+QUEUE_MAX_BATCHES = 32      # backpressure capacity (batches)
+METRICS_INTERVAL = 5.0      # seconds
+TUNE_DB = False             # enable per-transaction load-time tuning
+
+
+@dataclass
+class Metrics:
+    # producer side
+    revisions_read: int = 0
+    batches_enqueued: int = 0
+    # consumer side
+    batches_dequeued: int = 0
+    revisions_committed: int = 0
+    per_table_rows: Dict[str, int] = field(default_factory=dict)
+    # housekeeping
+    start_ts: float = field(default_factory=time.time)
+    last_print_ts: float = field(default_factory=time.time)
+    last_revisions_read: int = 0
+    last_revisions_committed: int = 0
 
 def get_filenames(relative_path):
     absolute_path = os.path.abspath(relative_path)
@@ -115,7 +142,7 @@ def get_container_id_cached(session, domain_label: str) -> int:
     Container.upsert(session, label=domain_label)
     return session.execute(sa_select(Container.id).where(Container.label == domain_label)).scalar_one()
 
-def process_revisions(revisions, domain="en.wikipedia.org"):
+def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = False):
     session = CreateSession()
     citations, citation_histories, normalized_citations = [], [], []
     revisions_rows = []
@@ -357,6 +384,14 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
     if template_data_rows:
         TemplateData.bulk_upsert(session, template_data_rows)
 
+    if tune_db:
+        # Per-transaction DB tuning to improve bulk ingest latency
+        # Safe knobs for bulk load workers; they apply only within this transaction
+        session.execute(text("SET LOCAL synchronous_commit=off"))
+        session.execute(text("SET LOCAL lock_timeout='5s'"))
+        session.execute(text("SET LOCAL statement_timeout='0'"))
+        session.execute(text("SET LOCAL application_name='wikirefs-writer'"))
+
     if citations:
         stmt_citations = insert(Citation).values(citations).on_conflict_do_update(
             index_elements=['record_sha1', 'reference_raw_sha1'],
@@ -395,27 +430,197 @@ def process_revisions(revisions, domain="en.wikipedia.org"):
         )
         session.execute(stmt_normalized)
 
+    # Commit transaction
     session.commit()
     session.close()
 
-def process_file(filename):
-    if not filename.endswith('.mwrev.zst'):
-        return
-    batch = []
-    for revision in get_revisions_from_mwrev_zst(filename):
-        batch.append(revision)
-        if len(batch) >= BATCH_SIZE:
-            process_revisions(batch)
-            batch.clear()
+    # Return metrics for monitoring
+    return {
+        'revisions_committed': len(revisions_rows),
+        'per_table_rows': {
+            'citations': len(citations),
+            'normalized_citations': len(normalized_citations),
+            'citation_histories': len(citation_histories),
+            'revisions': len(revisions_rows),
+            'web_resources': len(wr_rows) if 'wr_rows' in locals() else 0,
+            'ncwr': len(ncwr_rows) if 'ncwr_rows' in locals() else 0,
+            'wiki_templates': len(wiki_template_rows) if 'wiki_template_rows' in locals() else 0,
+            'template_data': len(template_data_rows) if 'template_data_rows' in locals() else 0,
+            'domains': len(domains_needed) if 'domains_needed' in locals() else 0,
+        }
+    }
 
-    if batch:
-        process_revisions(batch)
+def parser_worker(filelist: List[str], batch_size: int, out_q: Queue, stop_event: Event, metrics_q: Queue):
+    m = {'revisions_read': 0, 'batches_enqueued': 0}
+    try:
+        for filename in filelist:
+            if stop_event.is_set():
+                break
+            if not filename.endswith('.mwrev.zst'):
+                continue
+            batch = []
+            for revision in get_revisions_from_mwrev_zst(filename):
+                if stop_event.is_set():
+                    break
+                batch.append(revision)
+                m['revisions_read'] += 1
+                if len(batch) >= batch_size:
+                    out_q.put(batch)
+                    m['batches_enqueued'] += 1
+                    batch = []
+            if batch:
+                out_q.put(batch)
+                m['batches_enqueued'] += 1
+    finally:
+        # signal completion for this parser
+        metrics_q.put(('parser_done', m))
+
+
+def writer_worker(domain: str, in_q: Queue, stop_event: Event, tune_db: bool, metrics_q: Queue):
+    # Consume until stop_event and queue drained with sentinel handling
+    while True:
+        if stop_event.is_set() and in_q.empty():
+            break
+        try:
+            batch = in_q.get(timeout=0.5)
+        except Exception:
+            continue
+        result = process_revisions(batch, domain=domain, tune_db=tune_db)
+        metrics_q.put(('writer_batch', result))
+
+
+def chunk(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+
+def run_pipeline(files: List[str], domain: str, parse_procs: int, write_procs: int, batch_size: int, queue_max: int, tune_db: bool, metrics_interval: float):
+    # Bounded queue enforces backpressure from writers to parsers
+    q: Queue = multiprocessing.Queue(maxsize=queue_max)
+    metrics_q: Queue = multiprocessing.Queue()
+    stop_event = multiprocessing.Event()
+
+    # Assign files to parsers (simple round-robin chunks)
+    files_per_parser = max(1, (len(files) + parse_procs - 1) // parse_procs)
+    parser_files = list(chunk(files, files_per_parser))
+
+    parsers: List[Process] = []
+    for pf in parser_files[:parse_procs]:
+        p = multiprocessing.Process(target=parser_worker, args=(pf, batch_size, q, stop_event, metrics_q), daemon=True)
+        p.start()
+        parsers.append(p)
+
+    writers: List[Process] = []
+    for _ in range(write_procs):
+        w = multiprocessing.Process(target=writer_worker, args=(domain, q, stop_event, tune_db, metrics_q), daemon=True)
+        w.start()
+        writers.append(w)
+
+    # Metrics aggregator/loop
+    total_parsers = len(parsers)
+    parsers_done = 0
+    agg = Metrics()
+
+    def print_metrics(prefix: str = "[metrics]"):
+        now = time.time()
+        elapsed = now - agg.start_ts
+        dt = max(1e-6, now - agg.last_print_ts)
+        read_rate = (agg.revisions_read - agg.last_revisions_read) / dt
+        write_rate = (agg.revisions_committed - agg.last_revisions_committed) / dt
+        agg.last_revisions_read = agg.revisions_read
+        agg.last_revisions_committed = agg.revisions_committed
+        try:
+            qsize = q.qsize()
+        except NotImplementedError:
+            qsize = -1
+        per_table = ", ".join(f"{k}={v}" for k, v in sorted(agg.per_table_rows.items()))
+        print(
+            f"{prefix} elapsed={elapsed:,.1f}s | queue={qsize}/{queue_max} | "
+            f"read={agg.revisions_read} ({read_rate:,.0f}/s) | "
+            f"written={agg.revisions_committed} ({write_rate:,.0f}/s) | "
+            f"parsers_done={parsers_done}/{total_parsers} | tables: {per_table}",
+            flush=True,
+        )
+        agg.last_print_ts = now
+
+    try:
+        last_print = time.time()
+        while True:
+            # Drain metrics queue with a small timeout
+            try:
+                kind, payload = metrics_q.get(timeout=0.5)
+            except Exception:
+                kind = None
+                payload = None
+
+            if kind == 'parser_done':
+                parsers_done += 1
+                agg.revisions_read += payload.get('revisions_read', 0)
+                agg.batches_enqueued += payload.get('batches_enqueued', 0)
+            elif kind == 'writer_batch':
+                agg.batches_dequeued += 1
+                agg.revisions_committed += int(payload.get('revisions_committed') or 0)
+                for k, v in (payload.get('per_table_rows') or {}).items():
+                    agg.per_table_rows[k] = agg.per_table_rows.get(k, 0) + int(v or 0)
+
+            # Periodic printing
+            now = time.time()
+            if now - last_print >= metrics_interval:
+                print_metrics()
+                last_print = now
+
+            # Exit condition: all parsers finished AND queue drained
+            if parsers_done >= total_parsers:
+                try:
+                    empty = q.empty()
+                except NotImplementedError:
+                    # On some platforms q.empty is unreliable; rely on writers idle time after stop
+                    empty = False
+                if empty:
+                    break
+
+        # Signal writers to finish after queue drain
+        stop_event.set()
+
+    finally:
+        # Join all children
+        for p in parsers:
+            p.join(timeout=5)
+        for w in writers:
+            w.join(timeout=10)
+        print_metrics(prefix='[final]')
+
+def parse_args(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description='Parse and ingest wiki references with staged pipeline')
+    ap.add_argument('path', nargs='?', default='./sources/', help='File or directory containing .mwrev.zst')
+    ap.add_argument('--domain', default='en.wikipedia.org', help='Wiki domain for curid URLs (default: en.wikipedia.org)')
+    ap.add_argument('--batch-size', type=int, default=BATCH_SIZE, help=f'Revisions per parsed batch (default: {BATCH_SIZE})')
+    ap.add_argument('--parse-procs', type=int, default=PARSE_PROCS, help=f'Parser processes (default: {PARSE_PROCS})')
+    ap.add_argument('--write-procs', type=int, default=WRITE_PROCS, help=f'Writer processes (default: {WRITE_PROCS})')
+    ap.add_argument('--queue-max', type=int, default=QUEUE_MAX_BATCHES, help=f'Max queued batches (default: {QUEUE_MAX_BATCHES})')
+    ap.add_argument('--metrics-interval', type=float, default=METRICS_INTERVAL, help=f'Seconds between metrics prints (default: {METRICS_INTERVAL})')
+    ap.add_argument('--tune-db', action='store_true', default=False, help='Enable per-transaction DB load-time tuning')
+    return ap.parse_args(argv)
+
 
 if __name__ == '__main__':
-    if len(sys.argv) > 1:
-        filenames = [sys.argv[1]]
+    args = parse_args()
+    # Build file list
+    if os.path.isdir(args.path):
+        filenames = [os.path.join(args.path, f) for f in os.listdir(args.path) if f.endswith('.mwrev.zst')]
+        filenames.sort()
     else:
-        filenames = list(get_filenames("./sources/"))
+        filenames = [args.path]
 
-    with multiprocessing.Pool(processes=N_PROCESSES) as pool:
-        pool.map(process_file, filenames)
+    # Important: keep writer count small to protect Postgres. Prefer scaling parsers.
+    run_pipeline(
+        files=filenames,
+        domain=args.domain,
+        parse_procs=max(1, int(args.parse_procs)),
+        write_procs=max(1, int(args.write_procs)),
+        batch_size=max(1, int(args.batch_size)),
+        queue_max=max(1, int(args.queue_max)),
+        tune_db=bool(args.tune_db),
+        metrics_interval=float(args.metrics_interval),
+    )
