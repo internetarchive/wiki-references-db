@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 import weakref
 import multiprocessing
 from multiprocessing import Queue, Event, Process
-from functools import lru_cache
+from collections import OrderedDict
 from xml.etree import ElementTree
 import zstandard as zstd
 from sqlalchemy import create_engine, insert, select as sa_select, text
@@ -29,6 +29,72 @@ DB = (
 _POOL_RECYCLE_S = int(os.getenv('DB_POOL_RECYCLE', '1800'))
 _RETRY_ATTEMPTS = int(os.getenv('DB_RETRY_ATTEMPTS', '5'))
 _RETRY_BASE_DELAY_S = float(os.getenv('DB_RETRY_BASE_DELAY', '0.5'))
+
+
+class LRUSet:
+    """A bounded, process-local LRU set.
+
+    Used to avoid re-sending known-duplicate unique keys to the database across batches.
+    Eviction is safe because inserts use ON CONFLICT semantics.
+    """
+
+    def __init__(self, maxsize: int):
+        self.maxsize = max(0, int(maxsize))
+        self._d = OrderedDict()
+
+    def add(self, key) -> bool:
+        """Return True if `key` was already present, else add it and return False."""
+        if self.maxsize <= 0:
+            return False
+        if key in self._d:
+            self._d.move_to_end(key)
+            return True
+        self._d[key] = None
+        if len(self._d) > self.maxsize:
+            self._d.popitem(last=False)
+        return False
+
+
+class LRUMap:
+    """A bounded, process-local LRU map.
+
+    Similar to :class:`LRUSet`, but stores values.
+    """
+
+    def __init__(self, maxsize: int):
+        self.maxsize = max(0, int(maxsize))
+        self._d = OrderedDict()
+
+    def get(self, key, default=None):
+        if self.maxsize <= 0:
+            return default
+        if key in self._d:
+            self._d.move_to_end(key)
+            return self._d[key]
+        return default
+
+    def set(self, key, value) -> None:
+        if self.maxsize <= 0:
+            return
+        if key in self._d:
+            self._d.move_to_end(key)
+        self._d[key] = value
+        if len(self._d) > self.maxsize:
+            self._d.popitem(last=False)
+
+
+# Cross-batch, per-process LRU de-dupe caches (safe with ON CONFLICT inserts)
+_LRU_KEYS_MAX = int(os.getenv('LRU_KEYS_MAX', '200000'))
+_lru_citation_keys = LRUSet(_LRU_KEYS_MAX)
+_lru_citation_history_keys = LRUSet(_LRU_KEYS_MAX)
+_lru_normalized_citation_keys = LRUSet(_LRU_KEYS_MAX)
+_lru_ncwr_keys = LRUSet(_LRU_KEYS_MAX)
+_lru_wiki_template_keys = LRUSet(_LRU_KEYS_MAX)
+_lru_template_data_keys = LRUSet(_LRU_KEYS_MAX)
+
+# Container label -> id cache (bounded, process-local)
+_LRU_CONTAINER_MAX = int(os.getenv('LRU_CONTAINER_MAX', '1000'))
+_lru_container_id_by_label = LRUMap(_LRU_CONTAINER_MAX)
 
 
 def _is_retryable_db_disconnect(exc: BaseException) -> bool:
@@ -77,7 +143,7 @@ BATCH_SIZE = 1000           # revisions per batch from parsers
 PARSE_PROCS = max(1, multiprocessing.cpu_count() - 1)
 WRITE_PROCS = 1             # writers should be small to protect DB
 QUEUE_MAX_BATCHES = 32      # backpressure capacity (batches)
-METRICS_INTERVAL = 120.0      # seconds
+METRICS_INTERVAL = 120.0    # seconds
 TUNE_DB = False             # enable per-transaction load-time tuning
 
 
@@ -160,11 +226,18 @@ def get_revisions_from_mwrev_zst(filename):
                 current['revision_text'] = "\n".join(text_lines)
                 yield current
 
-@lru_cache(maxsize=1000)
 def get_container_id_cached(session, domain_label: str) -> int:
+    cached = _lru_container_id_by_label.get(domain_label)
+    if cached is not None:
+        return cached
+
     # Upsert once and fetch id; no commit here, caller manages transaction
     Container.upsert(session, label=domain_label)
-    return session.execute(sa_select(Container.id).where(Container.label == domain_label)).scalar_one()
+    container_id = session.execute(
+        sa_select(Container.id).where(Container.label == domain_label)
+    ).scalar_one()
+    _lru_container_id_by_label.set(domain_label, container_id)
+    return container_id
 
 def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = False):
     session = CreateSession()
@@ -229,7 +302,7 @@ def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = Fals
                 reference_name = ref.get('reference_name')
 
                 citation_key = (record_sha1, reference_raw_sha1)
-                if citation_key not in seen_citations:
+                if citation_key not in seen_citations and not _lru_citation_keys.add(citation_key):
                     seen_citations.add(citation_key)
                     citations.append({
                         "record_sha1": record_sha1,
@@ -242,7 +315,7 @@ def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = Fals
                         "wiki_article_id": page_id
                     })
 
-                if record_sha1 not in seen_normalized:
+                if record_sha1 not in seen_normalized and not _lru_normalized_citation_keys.add(record_sha1):
                     seen_normalized.add(record_sha1)
                     normalized_citations.append({
                         "record_sha1": record_sha1,
@@ -251,12 +324,15 @@ def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = Fals
                         "appears_on_article": document_id
                     })
 
-                citation_histories.append({
-                    "record_sha1": record_sha1,
-                    "reference_raw_sha1": reference_raw_sha1,
-                    "reference_normalized_sha1": reference_normalized_sha1,
-                    "revision_id": revision_id,
-                })
+                # CitationHistory unique key is (record_sha1, revision_id)
+                hist_key = (record_sha1, revision_id)
+                if not _lru_citation_history_keys.add(hist_key):
+                    citation_histories.append({
+                        "record_sha1": record_sha1,
+                        "reference_raw_sha1": reference_raw_sha1,
+                        "reference_normalized_sha1": reference_normalized_sha1,
+                        "revision_id": revision_id,
+                    })
 
                 if revision_id not in seen_revision_ids:
                     seen_revision_ids.add(revision_id)
@@ -280,6 +356,8 @@ def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = Fals
                         domains_needed.add(netloc)
                     external_url_items.append((url, netloc))
                     all_urls.add(url)
+                    # NormalizedCitationWebResource unique key becomes (reference_normalized_sha1, web_resource_id)
+                    # but we only know web_resource_id after URL resolution; keep as (sha1, url) for now.
                     ncwr_pairs.append((reference_normalized_sha1, url))
 
                 templates = ref.get('templates') or []
@@ -301,7 +379,9 @@ def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = Fals
                             continue
 
                         normalized_tpl_name = WikiTemplate.normalize_name(tpl_name_raw)
-                        templates_needed.add((domain, normalized_tpl_name))
+                        tpl_key = (domain, normalized_tpl_name)
+                        if not _lru_wiki_template_keys.add(tpl_key):
+                            templates_needed.add(tpl_key)
 
                         # Compute offset of the template in the normalized citation text.
                         # Prefer searching by beginning marker with normalized name, as the full_text
@@ -363,7 +443,9 @@ def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = Fals
         for rsha1, url in ncwr_pairs:
             wr_id = url_to_id.get(url)
             if wr_id is not None:
-                ncwr_rows.append({'reference_normalized_sha1': rsha1, 'web_resource_id': wr_id})
+                ncwr_key = (rsha1, wr_id)
+                if not _lru_ncwr_keys.add(ncwr_key):
+                    ncwr_rows.append({'reference_normalized_sha1': rsha1, 'web_resource_id': wr_id})
 
         if ncwr_rows:
             NormalizedCitationWebResource.bulk_upsert(session, ncwr_rows)
@@ -373,7 +455,10 @@ def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = Fals
         for dom_label, name in templates_needed:
             dom_id = domain_id_by_value.get(dom_label)
             if dom_id is not None:
-                wiki_template_rows.append({'domain': dom_id, 'name': name})
+                # WikiTemplate unique key is (domain_id, name)
+                tpl_key = (dom_id, name)
+                if not _lru_wiki_template_keys.add(tpl_key):
+                    wiki_template_rows.append({'domain': dom_id, 'name': name})
 
         if wiki_template_rows:
             WikiTemplate.bulk_upsert(session, wiki_template_rows)
@@ -398,13 +483,16 @@ def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = Fals
             tpl_id = template_key_to_id.get((dom_id, name))
             if tpl_id is None:
                 continue
-            template_data_rows.append({
-                'wiki_template_id': tpl_id,
-                'reference_normalized_sha1': rsha1,
-                'offset_start': off,
-                'parameter_key': key,
-                'parameter_value': val,
-            })
+            # TemplateData unique key is (wiki_template_id, reference_normalized_sha1, offset_start, parameter_key)
+            td_key = (tpl_id, rsha1, off, key)
+            if not _lru_template_data_keys.add(td_key):
+                template_data_rows.append({
+                    'wiki_template_id': tpl_id,
+                    'reference_normalized_sha1': rsha1,
+                    'offset_start': off,
+                    'parameter_key': key,
+                    'parameter_value': val,
+                })
 
         if template_data_rows:
             TemplateData.bulk_upsert(session, template_data_rows)
