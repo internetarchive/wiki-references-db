@@ -14,7 +14,13 @@ def _db_url() -> str:
 def main() -> None:
     # Load environment variables and create all tables defined in models.Base
     load_dotenv()
-    engine = create_engine(_db_url())
+    engine = create_engine(
+        _db_url(),
+        pool_pre_ping=True,
+        pool_recycle=int(os.getenv('DB_POOL_RECYCLE', '1800')),
+        # Avoid dumping huge bound-parameter payloads in exception text when a statement fails.
+        hide_parameters=True,
+    )
     Base.metadata.create_all(bind=engine)
 
 

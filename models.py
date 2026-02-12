@@ -66,9 +66,48 @@ class WebResource(Base):
     def bulk_upsert(session: Session, rows):
         if not rows:
             return
-        cleaned = []
+        # Deduplicate rows by conflict key (url) within the same command to avoid
+        # PostgreSQL "ON CONFLICT DO UPDATE command cannot affect row a second time".
+        # When duplicates exist in the input, merge them preferring non-None values.
+        # Then, normalize rows for a multi-values INSERT: every row must provide a
+        # Python value (or None) for all potentially present columns. If some
+        # rows omit a key entirely, SQLAlchemy 2.x may attempt to use an
+        # internal BindParameter for that slot which is not allowed in a
+        # multiparams VALUES clause, leading to a CompileError. Ensure uniform
+        # keys across all rows and default missing ones to None.
+        deduped = {}
+        # Columns we may upsert for WebResource in this bulk path
+        expected_keys = {
+            'url',
+            'domain_id',
+            'numeric_page_id',
+            'numeric_namespace_id',
+            'instance_of_document',
+            'is_archive_of',
+            'availability_status',
+        }
         for r in rows:
-            cleaned.append({k: v for k, v in r.items() if k != 'id'})
+            base = {k: v for k, v in r.items() if k != 'id'}
+            key = base.get('url')
+            if key is None:
+                # Skip rows without a URL; they would violate NOT NULL/UNIQUE
+                continue
+            if key in deduped:
+                # Merge, preferring non-None from the newer row
+                current = deduped[key]
+                for k, v in base.items():
+                    if v is not None:
+                        current[k] = v
+            else:
+                deduped[key] = dict(base)
+        # Now normalize keys for INSERT
+        cleaned = []
+        for base in deduped.values():
+            for k in expected_keys:
+                base.setdefault(k, None)
+            cleaned.append(base)
+        if not cleaned:
+            return
         stmt = insert(WebResource).values(cleaned).on_conflict_do_update(
             index_elements=['url'],
             set_={
@@ -110,9 +149,23 @@ class Domain(Base):
     def bulk_upsert(session: Session, rows):
         if not rows:
             return
-        cleaned = []
+        # Deduplicate by unique key 'value' and merge non-None values
+        merged = {}
         for r in rows:
-            cleaned.append({k: v for k, v in r.items() if k != 'id'})
+            base = {k: v for k, v in r.items() if k != 'id'}
+            key = base.get('value')
+            if key is None:
+                continue
+            if key in merged:
+                cur = merged[key]
+                for k, v in base.items():
+                    if v is not None:
+                        cur[k] = v
+            else:
+                merged[key] = dict(base)
+        if not merged:
+            return
+        cleaned = list(merged.values())
         stmt = insert(Domain).values(cleaned)
         stmt = stmt.on_conflict_do_update(
             index_elements=['value'],
@@ -132,6 +185,9 @@ class Container(Base):
     label                      =  Column(String)
     wikidata_id                =  Column(Integer, unique=True)
     librarybase_id             =  Column(Integer, unique=True)
+    __table_args__             =  (
+        UniqueConstraint('label', name='uix_container_label'),
+    )
 
     @staticmethod
     def upsert(session: Session, **kwargs):
@@ -148,7 +204,22 @@ class Container(Base):
     def bulk_upsert(session: Session, rows):
         if not rows:
             return
-        stmt = insert(Container).values(rows).on_conflict_do_update(
+        # Deduplicate by unique key 'label' and merge non-None values
+        merged = {}
+        for r in rows:
+            key = r.get('label')
+            if key is None:
+                continue
+            if key in merged:
+                cur = merged[key]
+                for k, v in r.items():
+                    if v is not None:
+                        cur[k] = v
+            else:
+                merged[key] = dict(r)
+        if not merged:
+            return
+        stmt = insert(Container).values(list(merged.values())).on_conflict_do_update(
             index_elements=['label'],
             set_={
                 'wikidata_id': insert(Container).excluded.wikidata_id,
@@ -364,13 +435,25 @@ class WikiTemplate(Base):
     def bulk_upsert(session: Session, rows):
         if not rows:
             return
-        cleaned = []
+        # Normalize names and deduplicate by unique key (domain, name)
+        merged = {}
         for r in rows:
             r2 = dict(r)
             if 'name' in r2 and r2['name']:
                 r2['name'] = WikiTemplate.normalize_name(r2['name'])
-            cleaned.append(r2)
-        stmt = insert(WikiTemplate).values(cleaned).on_conflict_do_update(
+            key = (r2.get('domain'), r2.get('name'))
+            if key[0] is None or key[1] is None:
+                continue
+            if key in merged:
+                cur = merged[key]
+                for k, v in r2.items():
+                    if v is not None:
+                        cur[k] = v
+            else:
+                merged[key] = r2
+        if not merged:
+            return
+        stmt = insert(WikiTemplate).values(list(merged.values())).on_conflict_do_update(
             index_elements=['domain', 'name'],
             set_={
                 'wikidata_id': insert(WikiTemplate).excluded.wikidata_id,
@@ -412,7 +495,23 @@ class TemplateData(Base):
     def bulk_upsert(session: Session, rows):
         if not rows:
             return
-        stmt = insert(TemplateData).values(rows).on_conflict_do_update(
+        # Deduplicate by composite unique key and merge, preferring non-None parameter_value
+        merged = {}
+        for r in rows:
+            key = (r.get('wiki_template_id'), r.get('reference_normalized_sha1'), r.get('offset_start'), r.get('parameter_key'))
+            if None in key:
+                continue
+            if key in merged:
+                cur = merged[key]
+                # Only field that reasonably changes is parameter_value; but merge all non-None
+                for k, v in r.items():
+                    if v is not None:
+                        cur[k] = v
+            else:
+                merged[key] = dict(r)
+        if not merged:
+            return
+        stmt = insert(TemplateData).values(list(merged.values())).on_conflict_do_update(
             index_elements=['wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key'],
             set_={'parameter_value': insert(TemplateData).excluded.parameter_value}
         )

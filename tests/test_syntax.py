@@ -52,7 +52,7 @@ testanswers = [
     "<ref name=\"Jones 2007\">{{Cite news|archive-date=February 7, 2017|archive-url=https://web.archive.org/web/20170207112933/http://gbppr.dyndns.org/~gbpprorg/obama/barack.mother.txt|author=Jones, Tim|date=March 27, 2007|newspaper=[[Chicago Tribune]]|page=1 (Tempo)|title=Barack Obama: Mother not just a girl from Kansas; Stanley Ann Dunham shaped a future senator|url-status=dead|url=http://gbppr.dyndns.org/~gbpprorg/obama/barack.mother.txt}}</ref>",
     "{{Cite web|access-date={{CURRENTYEAR}}-{{CURRENTMONTH}}-{{CURRENTDAY}}|title=Example|url=http://example.com}}",
     "[http://example.com {{Cite web|access-date=2023-05-19|title=Example|url=http://example.com}}]",
-    "<ref>{{Cite web|access-date=2023-05-19|title=Example|url=http://example.com}}<nowiki>{{Not a template}}</nowiki></ref>",
+    "<ref name=\"test\">{{Cite web|access-date=2023-05-19|title=Example|url=http://example.com}}<nowiki>{{Not a template}}</nowiki></ref>",
     "{{Cite web|access-date=2023-05-19|title={{Random}}|url=http://example.com}}",
     "{{Example|unnamed|2=second unnamed|foo=bar|name=value}}",
     "{{Cite web|access-date=2023-05-19|title=Example Title|url=[http://example.com Example]}}",
