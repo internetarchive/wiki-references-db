@@ -271,7 +271,7 @@ def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = Fals
                 # Create a Document for this page
                 document_id = Document.upsert(session, language_code=language_code, has_container=container_id)
                 # Defer creating curid WebResource until domains are resolved; record needed info
-                cur_url = f"https://{domain}/index.php?curid={page_id}"
+                cur_url = f"https://{domain}/w/index.php?curid={page_id}"
                 cur_urls_info.append({
                     'url': cur_url,
                     'numeric_page_id': page_id,
@@ -404,8 +404,18 @@ def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = Fals
                             templ_params_pending.append((domain, normalized_tpl_name, reference_normalized_sha1, tpl_offset, key, val))
 
         # Domains: bulk upsert all needed and map ids
+        # Only the primary wiki domain should be tied to this container; external domains default to NULL.
         if domains_needed:
-            Domain.bulk_upsert(session, [{'value': d, 'for_container': container_id} for d in domains_needed])
+            Domain.bulk_upsert(
+                session,
+                [
+                    {
+                        'value': d,
+                        'for_container': (container_id if d == domain else None),
+                    }
+                    for d in domains_needed
+                ]
+            )
             rows = session.execute(sa_select(Domain.value, Domain.id).where(Domain.value.in_(list(domains_needed)))).all()
             domain_id_by_value = {v: i for v, i in rows}
         else:
