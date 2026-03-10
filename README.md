@@ -98,6 +98,6 @@ PARSE_PROCS=6 WRITE_PROCS=1 BATCH_SIZE=2000 QUEUE_MAX=64 METRICS_INTERVAL=5 TUNE
 
 ### Revision Bundles
 
-This project loads `.mwrev.zst` files which are compressed bundles of MediaWiki revisions. These files are produced by RevisionChest. Each bundle is tracked in the database with an auto-incrementing `id` and its `file_path`. Individual `revisions` rows may point to the bundle they were found in (`found_in_bundle`) and record byte offsets (`offset_begin`/`offset_end`) for fast extraction.
+This project loads `.mwrev.zst` files which are compressed bundles of MediaWiki revisions. These files are produced by RevisionChest. Each bundle is tracked in the database with an auto-incrementing `id` and its `file_path`. Individual `revisions` rows may point to the bundle they were found in (`found_in_bundle`) and record byte offset (`offset_begin`) and `length` for fast extraction.
 
 Set `REVISION_BUNDLES_DIR` in your `.env` to the directory where these bundle files are stored.
