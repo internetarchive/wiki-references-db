@@ -231,13 +231,13 @@ class Container(Base):
 # "Citations" appear on Wikipedia articles and other documents. Citations can have one or more
 # Referenced Documents. This table tracks the earliest and latest revisions the citation
 # appears in, while each individual revision containing the reference is stored as Citation History.
-# Instead of storing the raw text, we store the start and end offsets of the reference in the wikitext.
+# Instead of storing the raw text, we store the start offset and length of the reference in the wikitext.
 class Citation(Base):
     __tablename__ = 'citations'
     record_sha1 = Column(String, nullable=False)
     reference_raw_sha1 = Column(String, nullable=False)
     offset_start = Column(Integer, nullable=True)
-    offset_end = Column(Integer, nullable=True)
+    length = Column(Integer, nullable=True)
     # reference_type is an application-level small int enum: 0=other, 1=inline, 2=endnote (extensible)
     reference_type = Column(SmallInteger, nullable=False, server_default='0')
     reference_normalized_sha1 = Column(String, nullable=False)
@@ -256,7 +256,7 @@ class Citation(Base):
             index_elements=['record_sha1', 'reference_raw_sha1'],
             set_={
                 'offset_start': kwargs.get('offset_start', Citation.offset_start),
-                'offset_end': kwargs.get('offset_end', Citation.offset_end),
+                'length': kwargs.get('length', Citation.length),
                 'reference_type': kwargs.get('reference_type', Citation.reference_type),
                 'reference_normalized_sha1': kwargs.get('reference_normalized_sha1', Citation.reference_normalized_sha1),
                 'reference_name': kwargs.get('reference_name', Citation.reference_name),
@@ -315,7 +315,7 @@ class Revision(Base):
     revision_timestamp = Column(String, nullable=False)
     found_in_bundle = Column(Integer, ForeignKey('revision_bundles.id'))
     offset_begin = Column(Integer)
-    offset_end = Column(Integer)
+    length = Column(Integer)
 
     bundle = relationship("RevisionBundle", foreign_keys=[found_in_bundle])
 

@@ -86,7 +86,6 @@ class LRUMap:
 # Cross-batch, per-process LRU de-dupe caches (safe with ON CONFLICT inserts)
 _LRU_KEYS_MAX = int(os.getenv('LRU_KEYS_MAX', '200000'))
 _lru_citation_keys = LRUSet(_LRU_KEYS_MAX)
-_lru_citation_history_keys = LRUSet(_LRU_KEYS_MAX)
 _lru_normalized_citation_keys = LRUSet(_LRU_KEYS_MAX)
 _lru_ncwr_keys = LRUSet(_LRU_KEYS_MAX)
 _lru_wiki_template_keys = LRUSet(_LRU_KEYS_MAX)
@@ -289,7 +288,7 @@ def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = Fals
             for ref in references:
                 reference_raw = ref.get('raw_reference')
                 offset_start = ref.get('offset_start')
-                offset_end = ref.get('offset_end')
+                length = ref.get('length')
                 reference_type = ref.get('reference_type', 0)
                 if not reference_raw or not reference_raw.strip():
                     continue
@@ -308,7 +307,7 @@ def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = Fals
                         "record_sha1": record_sha1,
                         "reference_raw_sha1": reference_raw_sha1,
                         "offset_start": offset_start,
-                        "offset_end": offset_end,
+                        "length": length,
                         "reference_type": reference_type,
                         "reference_normalized_sha1": reference_normalized_sha1,
                         "reference_name": reference_name,
@@ -324,15 +323,12 @@ def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = Fals
                         "appears_on_article": document_id
                     })
 
-                # CitationHistory unique key is (record_sha1, revision_id)
-                hist_key = (record_sha1, revision_id)
-                if not _lru_citation_history_keys.add(hist_key):
-                    citation_histories.append({
-                        "record_sha1": record_sha1,
-                        "reference_raw_sha1": reference_raw_sha1,
-                        "reference_normalized_sha1": reference_normalized_sha1,
-                        "revision_id": revision_id,
-                    })
+                citation_histories.append({
+                    "record_sha1": record_sha1,
+                    "reference_raw_sha1": reference_raw_sha1,
+                    "reference_normalized_sha1": reference_normalized_sha1,
+                    "revision_id": revision_id,
+                })
 
                 if revision_id not in seen_revision_ids:
                     seen_revision_ids.add(revision_id)
@@ -520,7 +516,7 @@ def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = Fals
                 index_elements=['record_sha1', 'reference_raw_sha1'],
                 set_={
                     "offset_start": insert(Citation).excluded.offset_start,
-                    "offset_end": insert(Citation).excluded.offset_end,
+                    "length": insert(Citation).excluded.length,
                     "reference_type": insert(Citation).excluded.reference_type,
                     "reference_name": insert(Citation).excluded.reference_name
                 }

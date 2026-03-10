@@ -58,7 +58,7 @@ def reference_lookup():
             stmt = (
                 select(
                     Citation.offset_start,
-                    Citation.offset_end,
+                    Citation.length,
                     Citation.reference_type,
                     Citation.reference_name,
                     Citation.wiki_article_id,
@@ -83,7 +83,7 @@ def reference_lookup():
                 .where(WebResource.url == url)
                 .group_by(
                     Citation.offset_start,
-                    Citation.offset_end,
+                    Citation.length,
                     Citation.reference_type,
                     Citation.reference_name,
                     Citation.wiki_article_id,
@@ -95,7 +95,7 @@ def reference_lookup():
             rows = session.execute(stmt).all()
             headers = [
                 "offset_start",
-                "offset_end",
+                "length",
                 "reference_type",
                 "reference_name",
                 "wiki_article_id",
@@ -177,7 +177,7 @@ def reference_lookup():
         headers[ref_type_idx] = "reference_type_label"
 
     if output == "html":
-        ref_column_names = {"offset_start", "offset_end", "reference_normalized"}
+        ref_column_names = {"offset_start", "length", "reference_normalized"}
         ref_column_index = next((i for i, h in enumerate(headers) if h in ref_column_names), None)
 
         tooltips = {
@@ -186,7 +186,7 @@ def reference_lookup():
             "reference_normalized_sha1": "SHA1 hash of the normalized reference wikitext.",
             "currently_visible": "True if the citation is still present in the latest revision of the article.",
             "offset_start": "Start byte/char offset of the raw reference in the wikitext (inclusive). May be None.",
-            "offset_end": "End byte/char offset of the raw reference in the wikitext (exclusive). May be None.",
+            "length": "Length (in bytes/chars) of the raw reference in the wikitext. May be None.",
             "reference_type_label": "Human-readable reference type label (e.g., other, inline, endnote).",
             "reference_name": "If the citation uses a named <ref name=...>, the provided name (may be null).",
             "wiki_article_id": "Numeric page ID of the Wikipedia article where this citation appears.",
