@@ -1,0 +1,57 @@
+{% extends "explorer_base.html" %}
+{% block title %}Citation Explorer: {{ url }}{% endblock %}
+
+{% block content %}
+<hgroup>
+  <h2>Citation Explorer</h2>
+  <p><a href="{{ url }}" target="_blank">{{ url }}</a> &mdash; {{ revisions|length }} tracked revision{{ 's' if revisions|length != 1 }}</p>
+</hgroup>
+
+{% if revisions|length == 0 %}
+<article>
+  <p>No revisions found for this article.</p>
+</article>
+{% else %}
+<div>
+  <label for="revSlider"><strong>Revision timeline</strong></label>
+  <input type="range" id="revSlider" name="revision_index" min="0" max="{{ revisions|length - 1 }}" value="{{ revisions|length - 1 }}">
+  <div class="slider-label" id="tsLabel">{{ revisions[-1].revision_timestamp }}</div>
+</div>
+
+<div id="citations-area">
+  <p aria-busy="true">Loading citations…</p>
+</div>
+
+<template id="revisions-data">{{ revisions_json }}</template>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if revisions|length > 0 %}
+<script>
+  const revisions = JSON.parse(document.getElementById('revisions-data').innerHTML);
+  const pageId = {{ page_id }};
+  const slider = document.getElementById('revSlider');
+  const label = document.getElementById('tsLabel');
+  const area = document.getElementById('citations-area');
+
+  function loadCitations(revisionId) {
+    area.innerHTML = '<p aria-busy="true">Loading citations…</p>';
+    htmx.ajax('GET', '/explorer/partials/citations?page_id=' + pageId + '&revision_id=' + revisionId, {target: '#citations-area', swap: 'innerHTML'});
+  }
+
+  let debounceTimer;
+  slider.addEventListener('input', function() {
+    const idx = parseInt(this.value);
+    label.textContent = revisions[idx].revision_timestamp;
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(function() {
+      loadCitations(revisions[idx].revision_id);
+    }, 250);
+  });
+
+  // Load latest on page load
+  loadCitations(revisions[revisions.length - 1].revision_id);
+</script>
+{% endif %}
+{% endblock %}

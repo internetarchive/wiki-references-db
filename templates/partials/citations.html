@@ -1,0 +1,76 @@
+<p><strong>{{ citation_count }}</strong> citation{{ 's' if citation_count != 1 }} at revision <code>{{ revision_id }}</code> ({{ revision_timestamp }})</p>
+
+{% if citations|length == 0 %}
+<article>
+  <p>No citations found at this revision.</p>
+</article>
+{% endif %}
+
+{% for c in citations %}
+<div class="citation-card {{ 'removed' if c.removed_at }}">
+  <div>
+    <span class="badge badge-type">{{ c.reference_type }}</span>
+    {% if c.currently_visible %}
+    <span class="badge badge-visible">visible</span>
+    {% endif %}
+    {% if c.removed_at %}
+    <span class="badge badge-removed">removed</span>
+    {% endif %}
+    {% if c.reference_names %}
+    {% for name in c.reference_names %}
+    <code>&lt;ref name="{{ name }}"&gt;</code>
+    {% endfor %}
+    {% endif %}
+  </div>
+
+  <div class="ref-text">{{ c.reference_normalized }}</div>
+
+  <div class="meta">
+    Added: {{ c.first_seen.revision_timestamp }}
+    · Last seen: {{ c.last_seen.revision_timestamp }}
+    {% if c.removed_at %}
+    · <strong>Removed at:</strong> {{ c.removed_at.revision_timestamp }}
+    {% endif %}
+    · Appeared in {{ c.appearance_count }} revision{{ 's' if c.appearance_count != 1 }}
+    {% if c.other_articles|length > 0 %}
+    · Also on {{ c.other_articles|length }} other article{{ 's' if c.other_articles|length != 1 }}
+    {% endif %}
+  </div>
+
+  {% if c.extracted_links or c.templates %}
+  <details>
+    <summary>Details</summary>
+
+    {% if c.extracted_links %}
+    <p><strong>Extracted links:</strong></p>
+    <ul>
+      {% for link in c.extracted_links %}
+      <li><a href="{{ link.url }}" target="_blank" rel="noopener">{{ link.url }}</a></li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if c.templates %}
+    <p><strong>Templates:</strong></p>
+    {% for tmpl in c.templates %}
+    <div class="template-params">
+      <strong>{{ tmpl.template_name }}</strong>
+      <table role="grid">
+        <thead><tr><th>Parameter</th><th>Value</th><th></th></tr></thead>
+        <tbody>
+        {% for key, value in tmpl.parameters.items() %}
+        <tr>
+          <td><code>{{ key }}</code></td>
+          <td>{{ value }}</td>
+          <td><a href="/explorer/template/{{ tmpl.wiki_template_id }}/report?parameter_key={{ key|urlencode }}&parameter_value={{ value|urlencode }}" target="_blank" title="Find other citations with this parameter">🔍</a></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endfor %}
+    {% endif %}
+  </details>
+  {% endif %}
+</div>
+{% endfor %}

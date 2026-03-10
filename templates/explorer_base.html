@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Citation Explorer{% endblock %}</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <style>
+    .citation-card {
+      border: 1px solid var(--pico-muted-border-color);
+      border-radius: var(--pico-border-radius);
+      padding: 1rem;
+      margin-bottom: 0.75rem;
+    }
+    .citation-card.removed {
+      border-left: 4px solid var(--pico-del-color);
+      background: color-mix(in srgb, var(--pico-del-color) 5%, transparent);
+    }
+    .citation-card .ref-text {
+      font-family: monospace;
+      font-size: 0.85em;
+      word-break: break-all;
+      white-space: pre-wrap;
+      background: var(--pico-code-background-color);
+      padding: 0.5rem;
+      border-radius: var(--pico-border-radius);
+      margin: 0.5rem 0;
+      max-height: 8em;
+      overflow-y: auto;
+    }
+    .citation-card .meta {
+      font-size: 0.85em;
+      color: var(--pico-muted-color);
+    }
+    .citation-card details {
+      margin-top: 0.5rem;
+      font-size: 0.9em;
+    }
+    .badge {
+      display: inline-block;
+      padding: 0.15em 0.5em;
+      border-radius: 1em;
+      font-size: 0.8em;
+      font-weight: 600;
+    }
+    .badge-type {
+      background: var(--pico-primary-background);
+      color: var(--pico-primary-inverse);
+    }
+    .badge-removed {
+      background: var(--pico-del-color);
+      color: white;
+    }
+    .badge-visible {
+      background: var(--pico-ins-color);
+      color: white;
+    }
+    .slider-label {
+      font-weight: 600;
+      font-size: 1.1em;
+      text-align: center;
+      margin-top: 0.25rem;
+    }
+    #citations-area {
+      min-height: 200px;
+    }
+    .htmx-indicator {
+      display: none;
+    }
+    .htmx-request .htmx-indicator {
+      display: inline;
+    }
+    .htmx-request.htmx-indicator {
+      display: inline;
+    }
+    .template-params {
+      margin: 0.25rem 0;
+    }
+    .template-params table {
+      margin: 0;
+      font-size: 0.85em;
+    }
+    .template-params td, .template-params th {
+      padding: 0.25rem 0.5rem;
+    }
+  </style>
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <main class="container">
+    <nav>
+      <ul><li><a href="/explorer"><strong>Citation Explorer</strong></a></li></ul>
+      <ul><li><a href="/">Legacy Lookup</a></li></ul>
+    </nav>
+    {% block content %}{% endblock %}
+  </main>
+  {% block scripts %}{% endblock %}
+</body>
+</html>
