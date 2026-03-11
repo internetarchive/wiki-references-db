@@ -16,6 +16,7 @@ import zstandard as zstd
 from sqlalchemy import create_engine, insert, select as sa_select, text
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 from models import *
 from refs_extractor.article import extract_references
 from refs_extractor.syntax import normalize_wikitext, get_sha1
@@ -108,6 +109,7 @@ def _is_retryable_db_disconnect(exc: BaseException) -> bool:
             'server closed the connection unexpectedly',
             'connection not open',
             'terminating connection due to administrator command',
+            'remaining connection slots are reserved',
         )
         return any(s in msg for s in retryable_substrings)
     return False
@@ -115,11 +117,10 @@ def _is_retryable_db_disconnect(exc: BaseException) -> bool:
 
 Engine = create_engine(
     DB,
-    # Constrain each worker to a single connection to avoid connection storms
-    pool_size=1,
-    max_overflow=0,
-    pool_pre_ping=True,
-    pool_recycle=_POOL_RECYCLE_S,
+    # Use NullPool: each session opens a fresh connection and closes it when done.
+    # This prevents connection leaks across multiprocessing fork boundaries and
+    # avoids exhausting PostgreSQL's connection limit when many workers run concurrently.
+    poolclass=NullPool,
     # Prevent SQLAlchemy from printing huge bound-parameter payloads when a statement fails.
     # (Bulk inserts can include very large parameter lists.)
     hide_parameters=True,
