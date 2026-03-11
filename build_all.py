@@ -134,7 +134,14 @@ def main():
 
         log_prefix = f"[{counter+1}/{len(files)}]"
         # Each job gets a subdirectory under the staging dir named after the input file
-        basename = os.path.splitext(os.path.basename(file))[0]
+        # Strip the full .mwrev.zst suffix (not just the last extension)
+        basename = os.path.basename(file)
+        for suffix in ('.mwrev.zst',):
+            if basename.endswith(suffix):
+                basename = basename[:-len(suffix)]
+                break
+        else:
+            basename = os.path.splitext(basename)[0]
         job_staging_dir = os.path.join(args.staging_dir, basename)
         process = subprocess.Popen([
             "python3", "build_db.py", file,
