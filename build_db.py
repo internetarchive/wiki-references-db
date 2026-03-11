@@ -44,6 +44,9 @@ _seen_normalized_keys: set = set()        # record_sha1
 _seen_ncwr_keys: set = set()              # (reference_normalized_sha1, url)
 _seen_wiki_template_keys: set = set()     # (domain_label, normalized_name)
 _seen_template_data_keys: set = set()     # (domain_label, name, ref_sha1, offset, key)
+_seen_domain_values: set = set()          # (netloc, for_container_label)
+_seen_containers: set = set()             # label
+_seen_web_resource_urls: set = set()      # url
 
 # Page tracking (plain dict — no DB ids needed in staging mode)
 _seen_pages: dict = {}  # page_id -> True
@@ -203,8 +206,13 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
     template_data_rows = []
 
     # Track container for this domain
-    containers_rows.append({'label': domain})
-    domains_rows.append({'value': domain, 'for_container_label': domain})
+    if domain not in _seen_containers:
+        _seen_containers.add(domain)
+        containers_rows.append({'label': domain})
+    domain_key = (domain, domain)
+    if domain_key not in _seen_domain_values:
+        _seen_domain_values.add(domain_key)
+        domains_rows.append({'value': domain, 'for_container_label': domain})
 
     for data in revisions:
 
@@ -222,13 +230,15 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
                 'has_container_label': domain,
                 'page_id': page_id,
             })
-            web_resources_rows.append({
-                'url': cur_url,
-                'domain_label': domain,
-                'numeric_page_id': page_id,
-                'numeric_namespace_id': namespace_id,
-                'page_id': page_id,
-            })
+            if cur_url not in _seen_web_resource_urls:
+                _seen_web_resource_urls.add(cur_url)
+                web_resources_rows.append({
+                    'url': cur_url,
+                    'domain_label': domain,
+                    'numeric_page_id': page_id,
+                    'numeric_namespace_id': namespace_id,
+                    'page_id': page_id,
+                })
 
         references = extract_references(data["revision_text"], include_offsets=True)
 
@@ -298,11 +308,16 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
                 except Exception:
                     netloc = None
                 if netloc:
-                    domains_rows.append({'value': netloc, 'for_container_label': None})
-                web_resources_rows.append({
-                    'url': url,
-                    'domain_label': netloc,
-                })
+                    d_key = (netloc, None)
+                    if d_key not in _seen_domain_values:
+                        _seen_domain_values.add(d_key)
+                        domains_rows.append({'value': netloc, 'for_container_label': None})
+                if url not in _seen_web_resource_urls:
+                    _seen_web_resource_urls.add(url)
+                    web_resources_rows.append({
+                        'url': url,
+                        'domain_label': netloc,
+                    })
                 ncwr_key = (reference_normalized_sha1, url)
                 if ncwr_key not in _seen_ncwr_keys:
                     _seen_ncwr_keys.add(ncwr_key)
