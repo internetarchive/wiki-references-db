@@ -108,6 +108,8 @@ class WebResource(Base):
             cleaned.append(base)
         if not cleaned:
             return
+        # Sort by conflict key to ensure consistent lock ordering and prevent deadlocks
+        cleaned.sort(key=lambda r: r.get('url', ''))
         stmt = insert(WebResource).values(cleaned).on_conflict_do_update(
             index_elements=['url'],
             set_={
@@ -165,7 +167,8 @@ class Domain(Base):
                 merged[key] = dict(base)
         if not merged:
             return
-        cleaned = list(merged.values())
+        # Sort by conflict key to ensure consistent lock ordering and prevent deadlocks
+        cleaned = sorted(merged.values(), key=lambda r: r.get('value', ''))
         stmt = insert(Domain).values(cleaned)
         stmt = stmt.on_conflict_do_update(
             index_elements=['value'],
@@ -219,7 +222,8 @@ class Container(Base):
                 merged[key] = dict(r)
         if not merged:
             return
-        stmt = insert(Container).values(list(merged.values())).on_conflict_do_update(
+        # Sort by conflict key to ensure consistent lock ordering and prevent deadlocks
+        stmt = insert(Container).values(sorted(merged.values(), key=lambda r: r.get('label', ''))).on_conflict_do_update(
             index_elements=['label'],
             set_={
                 'wikidata_id': insert(Container).excluded.wikidata_id,
@@ -389,6 +393,8 @@ class NormalizedCitationWebResource(Base):
     def bulk_upsert(session: Session, rows):
         if not rows:
             return
+        # Sort by conflict key to ensure consistent lock ordering and prevent deadlocks
+        rows = sorted(rows, key=lambda r: (r.get('reference_normalized_sha1', ''), r.get('web_resource_id', 0)))
         stmt = insert(NormalizedCitationWebResource).values(rows).on_conflict_do_nothing()
         session.execute(stmt)
 
@@ -453,7 +459,8 @@ class WikiTemplate(Base):
                 merged[key] = r2
         if not merged:
             return
-        stmt = insert(WikiTemplate).values(list(merged.values())).on_conflict_do_update(
+        # Sort by conflict key to ensure consistent lock ordering and prevent deadlocks
+        stmt = insert(WikiTemplate).values(sorted(merged.values(), key=lambda r: (r.get('domain', 0), r.get('name', '')))).on_conflict_do_update(
             index_elements=['domain', 'name'],
             set_={
                 'wikidata_id': insert(WikiTemplate).excluded.wikidata_id,
@@ -511,7 +518,8 @@ class TemplateData(Base):
                 merged[key] = dict(r)
         if not merged:
             return
-        stmt = insert(TemplateData).values(list(merged.values())).on_conflict_do_update(
+        # Sort by conflict key to ensure consistent lock ordering and prevent deadlocks
+        stmt = insert(TemplateData).values(sorted(merged.values(), key=lambda r: (r.get('wiki_template_id', 0), r.get('reference_normalized_sha1', ''), r.get('offset_start', 0), r.get('parameter_key', '')))).on_conflict_do_update(
             index_elements=['wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key'],
             set_={'parameter_value': insert(TemplateData).excluded.parameter_value}
         )
