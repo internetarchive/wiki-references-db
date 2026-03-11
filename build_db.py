@@ -688,8 +688,9 @@ def run_pipeline(files: List[str], domain: str, parse_procs: int, write_procs: i
         except NotImplementedError:
             qsize = -1
         per_table = ", ".join(f"{k}={v}" for k, v in sorted(agg.per_table_rows.items()))
+        ts = time.strftime('%Y-%m-%d %H:%M:%S')
         print(
-            f"{prefix} elapsed={_format_duration(elapsed)} | queue={qsize}/{queue_max} | "
+            f"{ts} {prefix} elapsed={_format_duration(elapsed)} | queue={qsize}/{queue_max} | "
             f"parsers_done={parsers_done}/{total_parsers} | tables: {per_table}",
             flush=True,
         )

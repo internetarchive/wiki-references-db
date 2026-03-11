@@ -51,7 +51,7 @@ def main():
             "--metrics-interval", os.environ.get("METRICS_INTERVAL", "5"),
         ] + (["--tune-db"] if os.environ.get("TUNE_DB", "0") in ("1", "true", "TRUE") else []))
         process_queue.put(process)
-        print(f"[{str(counter+1)}/{str(len(files))}] {file}")
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{str(counter+1)}/{str(len(files))}] {file}")
 
     while not process_queue.empty():
         cleanup_finished_processes(process_queue)
