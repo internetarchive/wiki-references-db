@@ -60,7 +60,7 @@ def read_jsonl_zst(filepath):
 
 def find_staging_files(staging_dir, table_name):
     """Find all .jsonl.zst files for a given table across all subdirectories."""
-    pattern = os.path.join(staging_dir, '**', f'{table_name}.*.jsonl.zst')
+    pattern = os.path.join(staging_dir, '**', f'*-{table_name}.jsonl.zst')
     return sorted(glob.glob(pattern, recursive=True))
 
 

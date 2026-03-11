@@ -52,39 +52,39 @@ _seen_web_resource_urls: set = set()      # url
 _seen_pages: dict = {}  # page_id -> True
 
 # ---------------------------------------------------------------------------
-# StagingWriter — writes JSONL compressed with zstandard to per-process files
+# StagingWriter — writes JSONL compressed with zstandard to per-source files
 # ---------------------------------------------------------------------------
 class StagingWriter:
     """Writes rows as JSONL compressed with zstandard (.jsonl.zst) to a staging directory.
 
-    Each process gets its own set of files (keyed by table name + process pid).
+    Each source file gets its own set of output files (keyed by source stem + table name).
     """
 
     def __init__(self, staging_dir: str):
         self._staging_dir = staging_dir
         os.makedirs(staging_dir, exist_ok=True)
-        self._compressors: Dict[str, Any] = {}  # table_name -> (cctx, fh, writer)
-        self._pid = os.getpid()
+        self._compressors: Dict[str, Any] = {}  # (source_stem, table_name) -> (cctx, fh, writer)
 
-    def _get_writer(self, table_name: str):
-        if table_name not in self._compressors:
-            path = os.path.join(self._staging_dir, f"{table_name}.{self._pid}.jsonl.zst")
+    def _get_writer(self, table_name: str, source_stem: str):
+        key = (source_stem, table_name)
+        if key not in self._compressors:
+            path = os.path.join(self._staging_dir, f"{source_stem}-{table_name}.jsonl.zst")
             cctx = zstd.ZstdCompressor(level=3)
             fh = open(path, 'wb')
             writer = cctx.stream_writer(fh)
-            self._compressors[table_name] = (cctx, fh, writer)
-        return self._compressors[table_name][2]
+            self._compressors[key] = (cctx, fh, writer)
+        return self._compressors[key][2]
 
-    def write_rows(self, table_name: str, rows: list):
+    def write_rows(self, table_name: str, rows: list, source_stem: str = 'unknown'):
         if not rows:
             return
-        w = self._get_writer(table_name)
+        w = self._get_writer(table_name, source_stem)
         for row in rows:
             line = json.dumps(row, default=str) + '\n'
             w.write(line.encode('utf-8'))
 
     def close(self):
-        for table_name, (cctx, fh, writer) in self._compressors.items():
+        for key, (cctx, fh, writer) in self._compressors.items():
             writer.close()
             fh.close()
         self._compressors.clear()
@@ -187,7 +187,7 @@ def _normalize_template_name(raw: str) -> str:
     return norm[0].upper() + norm[1:]
 
 
-def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.org"):
+def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.org", source_stem: str = 'unknown'):
     """Derive rows from revisions and write them to staging JSONL.zst files.
 
     No database connection is used. Deduplication is done via in-memory hash sets.
@@ -378,17 +378,17 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
                             })
 
     # Write all accumulated rows to staging files
-    staging.write_rows('containers', containers_rows)
-    staging.write_rows('domains', domains_rows)
-    staging.write_rows('documents', documents_rows)
-    staging.write_rows('web_resources', web_resources_rows)
-    staging.write_rows('citations', citations)
-    staging.write_rows('normalized_citations', normalized_citations)
-    staging.write_rows('citation_histories', citation_histories)
-    staging.write_rows('revisions', revisions_rows)
-    staging.write_rows('ncwr', ncwr_rows)
-    staging.write_rows('wiki_templates', wiki_template_rows)
-    staging.write_rows('template_data', template_data_rows)
+    staging.write_rows('containers', containers_rows, source_stem=source_stem)
+    staging.write_rows('domains', domains_rows, source_stem=source_stem)
+    staging.write_rows('documents', documents_rows, source_stem=source_stem)
+    staging.write_rows('web_resources', web_resources_rows, source_stem=source_stem)
+    staging.write_rows('citations', citations, source_stem=source_stem)
+    staging.write_rows('normalized_citations', normalized_citations, source_stem=source_stem)
+    staging.write_rows('citation_histories', citation_histories, source_stem=source_stem)
+    staging.write_rows('revisions', revisions_rows, source_stem=source_stem)
+    staging.write_rows('ncwr', ncwr_rows, source_stem=source_stem)
+    staging.write_rows('wiki_templates', wiki_template_rows, source_stem=source_stem)
+    staging.write_rows('template_data', template_data_rows, source_stem=source_stem)
 
     return {
         'revisions_committed': len(revisions_rows),
@@ -413,6 +413,10 @@ def parser_worker(filelist: List[str], batch_size: int, out_q: Queue, stop_event
                 break
             if not filename.endswith('.mwrev.zst'):
                 continue
+            # Derive source stem: strip .mwrev.zst (or any extension) from basename
+            source_stem = os.path.basename(filename)
+            if source_stem.endswith('.mwrev.zst'):
+                source_stem = source_stem[:-len('.mwrev.zst')]
             batch = []
             for revision in get_revisions_from_mwrev_zst(filename):
                 if stop_event.is_set():
@@ -420,11 +424,11 @@ def parser_worker(filelist: List[str], batch_size: int, out_q: Queue, stop_event
                 batch.append(revision)
                 m['revisions_read'] += 1
                 if len(batch) >= batch_size:
-                    out_q.put(batch)
+                    out_q.put((source_stem, batch))
                     m['batches_enqueued'] += 1
                     batch = []
             if batch:
-                out_q.put(batch)
+                out_q.put((source_stem, batch))
                 m['batches_enqueued'] += 1
     finally:
         # signal completion for this parser
@@ -439,10 +443,10 @@ def staging_worker(domain: str, staging_dir: str, in_q: Queue, stop_event: Event
             if stop_event.is_set() and in_q.empty():
                 break
             try:
-                batch = in_q.get(timeout=0.5)
+                source_stem, batch = in_q.get(timeout=0.5)
             except Exception:
                 continue
-            result = process_revisions(batch, staging=staging, domain=domain)
+            result = process_revisions(batch, staging=staging, domain=domain, source_stem=source_stem)
             metrics_q.put(('writer_batch', result))
     finally:
         staging.close()
