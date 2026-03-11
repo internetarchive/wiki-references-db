@@ -100,6 +100,8 @@ def aggregate_and_print(slots, total_files):
 def main():
     parser = argparse.ArgumentParser(description="Spawn build_db.py for each .mwrev.zst file in a directory.")
     parser.add_argument("-d", "--directory", required=True, help="Directory containing .mwrev.zst files")
+    parser.add_argument("-o", "--staging-dir", default=os.environ.get('STAGING_DIR', './staging'),
+                        help="Directory to write staged JSONL.zst files (default: STAGING_DIR env or ./staging)")
     parser.add_argument("-j", "--jobs", type=int, default=max_jobs, help="Number of concurrent jobs/files to process (default: 8)")
     parser.add_argument("--metrics-interval", type=float, default=float(os.environ.get("METRICS_INTERVAL", "10")),
                         help="Seconds between aggregated metrics prints (default: 10 or METRICS_INTERVAL env)")
@@ -131,16 +133,19 @@ def main():
                 last_agg_print = now
 
         log_prefix = f"[{counter+1}/{len(files)}]"
+        # Each job gets a subdirectory under the staging dir named after the input file
+        basename = os.path.splitext(os.path.basename(file))[0]
+        job_staging_dir = os.path.join(args.staging_dir, basename)
         process = subprocess.Popen([
             "python3", "build_db.py", file,
+            "-o", job_staging_dir,
             "--parse-procs", os.environ.get("PARSE_PROCS", "4"),
             "--write-procs", os.environ.get("WRITE_PROCS", "1"),
             "--batch-size", os.environ.get("BATCH_SIZE", "1000"),
             "--queue-max", os.environ.get("QUEUE_MAX", "32"),
             "--metrics-interval", os.environ.get("METRICS_INTERVAL", "5"),
             "--log-prefix", log_prefix,
-        ] + (["--tune-db"] if os.environ.get("TUNE_DB", "0") in ("1", "true", "TRUE") else []),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
         slot = ProcessSlot(process, log_prefix, file)
         all_slots.append(slot)

@@ -1,5 +1,6 @@
 import io
 import bz2
+import json
 import os
 import sys
 import time
@@ -7,94 +8,13 @@ import signal
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
-import weakref
 import multiprocessing
 from multiprocessing import Queue, Event, Process
-from collections import OrderedDict
 from xml.etree import ElementTree
 import zstandard as zstd
-from sqlalchemy import create_engine, insert, select as sa_select, text
 from sqlalchemy.exc import DBAPIError, OperationalError
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import NullPool
-from models import *
 from refs_extractor.article import extract_references
 from refs_extractor.syntax import normalize_wikitext, get_sha1
-
-# Set up database connection pooling
-load_dotenv()
-DB = (
-    f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASS')}@"
-    f"{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
-)
-_POOL_RECYCLE_S = int(os.getenv('DB_POOL_RECYCLE', '1800'))
-_RETRY_ATTEMPTS = int(os.getenv('DB_RETRY_ATTEMPTS', '5'))
-_RETRY_BASE_DELAY_S = float(os.getenv('DB_RETRY_BASE_DELAY', '0.5'))
-
-
-class LRUSet:
-    """A bounded, process-local LRU set.
-
-    Used to avoid re-sending known-duplicate unique keys to the database across batches.
-    Eviction is safe because inserts use ON CONFLICT semantics.
-    """
-
-    def __init__(self, maxsize: int):
-        self.maxsize = max(0, int(maxsize))
-        self._d = OrderedDict()
-
-    def add(self, key) -> bool:
-        """Return True if `key` was already present, else add it and return False."""
-        if self.maxsize <= 0:
-            return False
-        if key in self._d:
-            self._d.move_to_end(key)
-            return True
-        self._d[key] = None
-        if len(self._d) > self.maxsize:
-            self._d.popitem(last=False)
-        return False
-
-
-class LRUMap:
-    """A bounded, process-local LRU map.
-
-    Similar to :class:`LRUSet`, but stores values.
-    """
-
-    def __init__(self, maxsize: int):
-        self.maxsize = max(0, int(maxsize))
-        self._d = OrderedDict()
-
-    def get(self, key, default=None):
-        if self.maxsize <= 0:
-            return default
-        if key in self._d:
-            self._d.move_to_end(key)
-            return self._d[key]
-        return default
-
-    def set(self, key, value) -> None:
-        if self.maxsize <= 0:
-            return
-        if key in self._d:
-            self._d.move_to_end(key)
-        self._d[key] = value
-        if len(self._d) > self.maxsize:
-            self._d.popitem(last=False)
-
-
-# Cross-batch, per-process LRU de-dupe caches (safe with ON CONFLICT inserts)
-_LRU_KEYS_MAX = int(os.getenv('LRU_KEYS_MAX', '200000'))
-_lru_citation_keys = LRUSet(_LRU_KEYS_MAX)
-_lru_normalized_citation_keys = LRUSet(_LRU_KEYS_MAX)
-_lru_ncwr_keys = LRUSet(_LRU_KEYS_MAX)
-_lru_wiki_template_keys = LRUSet(_LRU_KEYS_MAX)
-_lru_template_data_keys = LRUSet(_LRU_KEYS_MAX)
-
-# Container label -> id cache (bounded, process-local)
-_LRU_CONTAINER_MAX = int(os.getenv('LRU_CONTAINER_MAX', '1000'))
-_lru_container_id_by_label = LRUMap(_LRU_CONTAINER_MAX)
 
 
 def _is_retryable_db_disconnect(exc: BaseException) -> bool:
@@ -114,37 +34,65 @@ def _is_retryable_db_disconnect(exc: BaseException) -> bool:
         return any(s in msg for s in retryable_substrings)
     return False
 
+load_dotenv()
 
-Engine = create_engine(
-    DB,
-    # Use NullPool: each session opens a fresh connection and closes it when done.
-    # This prevents connection leaks across multiprocessing fork boundaries and
-    # avoids exhausting PostgreSQL's connection limit when many workers run concurrently.
-    poolclass=NullPool,
-    # Prevent SQLAlchemy from printing huge bound-parameter payloads when a statement fails.
-    # (Bulk inserts can include very large parameter lists.)
-    hide_parameters=True,
-)
-CreateSession = sessionmaker(bind=Engine)
+# ---------------------------------------------------------------------------
+# Hash-set based dedup (replaces LRU caches — lossless, unbounded)
+# ---------------------------------------------------------------------------
+_seen_citation_keys: set = set()          # (record_sha1, reference_raw_sha1)
+_seen_normalized_keys: set = set()        # record_sha1
+_seen_ncwr_keys: set = set()              # (reference_normalized_sha1, url)
+_seen_wiki_template_keys: set = set()     # (domain_label, normalized_name)
+_seen_template_data_keys: set = set()     # (domain_label, name, ref_sha1, offset, key)
 
-# Wrapper class for weak references
-class PageMetadata:
-    """Stores page metadata in a class (allows weak references)."""
-    def __init__(self, container_id, domain_id, document_id):
-        self.container_id = container_id
-        self.domain_id = domain_id
-        self.document_id = document_id
+# Page tracking (plain dict — no DB ids needed in staging mode)
+_seen_pages: dict = {}  # page_id -> True
 
-# Weak reference dictionary for seen page IDs
-seen_pages = weakref.WeakValueDictionary()
+# ---------------------------------------------------------------------------
+# StagingWriter — writes JSONL compressed with zstandard to per-process files
+# ---------------------------------------------------------------------------
+class StagingWriter:
+    """Writes rows as JSONL compressed with zstandard (.jsonl.zst) to a staging directory.
+
+    Each process gets its own set of files (keyed by table name + process pid).
+    """
+
+    def __init__(self, staging_dir: str):
+        self._staging_dir = staging_dir
+        os.makedirs(staging_dir, exist_ok=True)
+        self._compressors: Dict[str, Any] = {}  # table_name -> (cctx, fh, writer)
+        self._pid = os.getpid()
+
+    def _get_writer(self, table_name: str):
+        if table_name not in self._compressors:
+            path = os.path.join(self._staging_dir, f"{table_name}.{self._pid}.jsonl.zst")
+            cctx = zstd.ZstdCompressor(level=3)
+            fh = open(path, 'wb')
+            writer = cctx.stream_writer(fh)
+            self._compressors[table_name] = (cctx, fh, writer)
+        return self._compressors[table_name][2]
+
+    def write_rows(self, table_name: str, rows: list):
+        if not rows:
+            return
+        w = self._get_writer(table_name)
+        for row in rows:
+            line = json.dumps(row, default=str) + '\n'
+            w.write(line.encode('utf-8'))
+
+    def close(self):
+        for table_name, (cctx, fh, writer) in self._compressors.items():
+            writer.close()
+            fh.close()
+        self._compressors.clear()
+
 
 # Defaults (overridable via CLI)
 BATCH_SIZE = 1000           # revisions per batch from parsers
 PARSE_PROCS = max(1, multiprocessing.cpu_count() - 1)
-WRITE_PROCS = 1             # writers should be small to protect DB
+WRITE_PROCS = 1             # staging writers
 QUEUE_MAX_BATCHES = 32      # backpressure capacity (batches)
 METRICS_INTERVAL = 120.0    # seconds
-TUNE_DB = False             # enable per-transaction load-time tuning
 
 
 @dataclass
@@ -226,356 +174,221 @@ def get_revisions_from_mwrev_zst(filename):
                 current['revision_text'] = "\n".join(text_lines)
                 yield current
 
-def get_container_id_cached(session, domain_label: str) -> int:
-    cached = _lru_container_id_by_label.get(domain_label)
-    if cached is not None:
-        return cached
+def _normalize_template_name(raw: str) -> str:
+    """Normalize a wiki template name: underscores to spaces, capitalize first letter."""
+    if not raw:
+        return raw
+    norm = raw.replace('_', ' ').strip()
+    if len(norm) == 0:
+        return norm
+    return norm[0].upper() + norm[1:]
 
-    # Upsert once and fetch id; no commit here, caller manages transaction
-    Container.upsert(session, label=domain_label)
-    container_id = session.execute(
-        sa_select(Container.id).where(Container.label == domain_label)
-    ).scalar_one()
-    _lru_container_id_by_label.set(domain_label, container_id)
-    return container_id
 
-def process_revisions(revisions, domain="en.wikipedia.org", tune_db: bool = False):
-    session = CreateSession()
-    try:
-        citations, citation_histories, normalized_citations = [], [], []
-        revisions_rows = []
-        seen_revision_ids = set()
-        seen_citations, seen_normalized = set(), set()
+def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.org"):
+    """Derive rows from revisions and write them to staging JSONL.zst files.
 
-        # Resolve container and main domain ids once per batch
-        container_id = get_container_id_cached(session, domain)
+    No database connection is used. Deduplication is done via in-memory hash sets.
+    """
+    citations, citation_histories, normalized_citations = [], [], []
+    revisions_rows = []
+    seen_revision_ids = set()
+    seen_citations, seen_normalized = set(), set()
 
-        domains_needed = set([domain])
-        # Accumulators for later bulk upserts
-        cur_urls_info = []  # dicts with url, page_id, namespace_id, document_id, domain_label
-        external_url_items = []  # (url, netloc)
-        all_urls = set()
-        ncwr_pairs = []  # (reference_normalized_sha1, url)
-        templates_needed = set()  # (domain_label, normalized_name)
-        templ_params_pending = []  # (domain_label, normalized_name, reference_normalized_sha1, offset_start, key, value)
+    domains_rows = []  # {'value': ..., 'for_container': ...}
+    containers_rows = []  # {'label': ...}
+    documents_rows = []  # {'language_code': ..., 'has_container_label': ..., 'page_id': ...}
+    web_resources_rows = []
+    ncwr_rows = []  # (reference_normalized_sha1, url)
+    wiki_template_rows = []  # {'domain_label': ..., 'name': ...}
+    template_data_rows = []
 
-        for data in revisions:
+    # Track container for this domain
+    containers_rows.append({'label': domain})
+    domains_rows.append({'value': domain, 'for_container_label': domain})
 
-            language_code = domain.split('.')[0]
-            page_id = data["page_id"]
-            namespace_id = data.get("namespace_id")
-            revision_id = data["revision_id"]
-            revision_timestamp = data["revision_timestamp"].replace("T", " ").replace("Z", "")
+    for data in revisions:
 
-            if page_id not in seen_pages:
-                # Create a Document for this page
-                document_id = Document.upsert(session, language_code=language_code, has_container=container_id)
-                # Defer creating curid WebResource until domains are resolved; record needed info
-                cur_url = f"https://{domain}/w/index.php?curid={page_id}"
-                cur_urls_info.append({
-                    'url': cur_url,
-                    'numeric_page_id': page_id,
-                    'numeric_namespace_id': namespace_id,
-                    'instance_of_document': document_id,
-                    'domain_label': domain,
-                })
-                seen_pages[page_id] = PageMetadata(container_id, None, document_id)
-            else:
-                page_metadata = seen_pages[page_id]
-                document_id = page_metadata.document_id
+        language_code = domain.split('.')[0]
+        page_id = data["page_id"]
+        namespace_id = data.get("namespace_id")
+        revision_id = data["revision_id"]
+        revision_timestamp = data["revision_timestamp"].replace("T", " ").replace("Z", "")
 
-            references = extract_references(data["revision_text"], include_offsets=True)
+        if page_id not in _seen_pages:
+            _seen_pages[page_id] = True
+            cur_url = f"https://{domain}/w/index.php?curid={page_id}"
+            documents_rows.append({
+                'language_code': language_code,
+                'has_container_label': domain,
+                'page_id': page_id,
+            })
+            web_resources_rows.append({
+                'url': cur_url,
+                'domain_label': domain,
+                'numeric_page_id': page_id,
+                'numeric_namespace_id': namespace_id,
+                'page_id': page_id,
+            })
 
-            for ref in references:
-                reference_raw = ref.get('raw_reference')
-                offset_start = ref.get('offset_start')
-                length = ref.get('length')
-                reference_type = ref.get('reference_type', 0)
-                if not reference_raw or not reference_raw.strip():
-                    continue
+        references = extract_references(data["revision_text"], include_offsets=True)
 
-                reference_normalized = normalize_wikitext(reference_raw)
-                record_sha1 = get_sha1(domain, page_id, reference_normalized)
-                reference_normalized_sha1 = get_sha1(reference_normalized)
-                reference_raw_sha1 = get_sha1(reference_raw)
-                # Prefer name provided by the extractor; fallback remains None
-                reference_name = ref.get('reference_name')
+        for ref in references:
+            reference_raw = ref.get('raw_reference')
+            offset_start = ref.get('offset_start')
+            length = ref.get('length')
+            reference_type = ref.get('reference_type', 0)
+            if not reference_raw or not reference_raw.strip():
+                continue
 
-                citation_key = (record_sha1, reference_raw_sha1)
-                if citation_key not in seen_citations and not _lru_citation_keys.add(citation_key):
-                    seen_citations.add(citation_key)
-                    citations.append({
-                        "record_sha1": record_sha1,
-                        "reference_raw_sha1": reference_raw_sha1,
-                        "offset_start": offset_start,
-                        "length": length,
-                        "reference_type": reference_type,
-                        "reference_normalized_sha1": reference_normalized_sha1,
-                        "reference_name": reference_name,
-                        "wiki_article_id": page_id
-                    })
+            reference_normalized = normalize_wikitext(reference_raw)
+            record_sha1 = get_sha1(domain, page_id, reference_normalized)
+            reference_normalized_sha1 = get_sha1(reference_normalized)
+            reference_raw_sha1 = get_sha1(reference_raw)
+            reference_name = ref.get('reference_name')
 
-                if record_sha1 not in seen_normalized and not _lru_normalized_citation_keys.add(record_sha1):
-                    seen_normalized.add(record_sha1)
-                    normalized_citations.append({
-                        "record_sha1": record_sha1,
-                        "reference_normalized_sha1": reference_normalized_sha1,
-                        "reference_normalized": reference_normalized,
-                        "appears_on_article": document_id
-                    })
-
-                citation_histories.append({
+            citation_key = (record_sha1, reference_raw_sha1)
+            if citation_key not in seen_citations and citation_key not in _seen_citation_keys:
+                seen_citations.add(citation_key)
+                _seen_citation_keys.add(citation_key)
+                citations.append({
                     "record_sha1": record_sha1,
                     "reference_raw_sha1": reference_raw_sha1,
+                    "offset_start": offset_start,
+                    "length": length,
+                    "reference_type": reference_type,
                     "reference_normalized_sha1": reference_normalized_sha1,
-                    "revision_id": revision_id,
+                    "reference_name": reference_name,
+                    "wiki_article_id": page_id
                 })
 
-                if revision_id not in seen_revision_ids:
-                    seen_revision_ids.add(revision_id)
-                    revisions_rows.append({
-                        "revision_id": revision_id,
-                        "page_id": page_id,
-                        "parent_revision_id": data.get("parent_revision_id"),
-                        "revision_timestamp": revision_timestamp
+            if record_sha1 not in seen_normalized and record_sha1 not in _seen_normalized_keys:
+                seen_normalized.add(record_sha1)
+                _seen_normalized_keys.add(record_sha1)
+                normalized_citations.append({
+                    "record_sha1": record_sha1,
+                    "reference_normalized_sha1": reference_normalized_sha1,
+                    "reference_normalized": reference_normalized,
+                    "appears_on_page_id": page_id,
+                    "appears_on_domain": domain,
+                })
+
+            citation_histories.append({
+                "record_sha1": record_sha1,
+                "reference_raw_sha1": reference_raw_sha1,
+                "reference_normalized_sha1": reference_normalized_sha1,
+                "revision_id": revision_id,
+            })
+
+            if revision_id not in seen_revision_ids:
+                seen_revision_ids.add(revision_id)
+                revisions_rows.append({
+                    "revision_id": revision_id,
+                    "page_id": page_id,
+                    "parent_revision_id": data.get("parent_revision_id"),
+                    "revision_timestamp": revision_timestamp
+                })
+
+            urls = ref.get('urls') or []
+            for url in urls:
+                if not url:
+                    continue
+                try:
+                    from urllib.parse import urlparse
+                    netloc = urlparse(url).netloc
+                except Exception:
+                    netloc = None
+                if netloc:
+                    domains_rows.append({'value': netloc, 'for_container_label': None})
+                web_resources_rows.append({
+                    'url': url,
+                    'domain_label': netloc,
+                })
+                ncwr_key = (reference_normalized_sha1, url)
+                if ncwr_key not in _seen_ncwr_keys:
+                    _seen_ncwr_keys.add(ncwr_key)
+                    ncwr_rows.append({
+                        'reference_normalized_sha1': reference_normalized_sha1,
+                        'url': url,
                     })
 
-                urls = ref.get('urls') or []
-                for url in urls:
-                    if not url:
+            templates = ref.get('templates') or []
+            if templates:
+                def find_nth(haystack: str, needle: str, n: int) -> int:
+                    start = -1
+                    for _ in range(n):
+                        start = haystack.find(needle, start + 1)
+                        if start == -1:
+                            break
+                    return start
+
+                for idx, tpl in enumerate(templates, start=1):
+                    tpl_name_raw = (tpl or {}).get('template_name') or ''
+                    tpl_full_text = (tpl or {}).get('full_text') or ''
+                    params = (tpl or {}).get('parameters') or []
+
+                    if not tpl_name_raw:
                         continue
-                    try:
-                        from urllib.parse import urlparse
-                        netloc = urlparse(url).netloc
-                    except Exception:
-                        netloc = None
-                    if netloc:
-                        domains_needed.add(netloc)
-                    external_url_items.append((url, netloc))
-                    all_urls.add(url)
-                    # NormalizedCitationWebResource unique key becomes (reference_normalized_sha1, web_resource_id)
-                    # but we only know web_resource_id after URL resolution; keep as (sha1, url) for now.
-                    ncwr_pairs.append((reference_normalized_sha1, url))
 
-                templates = ref.get('templates') or []
-                if templates:
-                    def find_nth(haystack: str, needle: str, n: int) -> int:
-                        start = -1
-                        for _ in range(n):
-                            start = haystack.find(needle, start + 1)
-                            if start == -1:
-                                break
-                        return start
+                    normalized_tpl_name = _normalize_template_name(tpl_name_raw)
+                    tpl_key = (domain, normalized_tpl_name)
+                    if tpl_key not in _seen_wiki_template_keys:
+                        _seen_wiki_template_keys.add(tpl_key)
+                        wiki_template_rows.append({
+                            'domain_label': domain,
+                            'name': normalized_tpl_name,
+                        })
 
-                    for idx, tpl in enumerate(templates, start=1):
-                        tpl_name_raw = (tpl or {}).get('template_name') or ''
-                        tpl_full_text = (tpl or {}).get('full_text') or ''
-                        params = (tpl or {}).get('parameters') or []
+                    marker = "{{" + normalized_tpl_name
+                    tpl_offset = find_nth(reference_normalized, marker, idx)
+                    if tpl_offset is None or tpl_offset < 0:
+                        tpl_offset = reference_normalized.find(tpl_full_text)
+                        if tpl_offset < 0:
+                            tpl_offset = offset_start if isinstance(offset_start, int) else 0
 
-                        if not tpl_name_raw:
+                    for p in params:
+                        key = (p or {}).get('key')
+                        val = (p or {}).get('value')
+                        if not key:
                             continue
+                        td_key = (domain, normalized_tpl_name, reference_normalized_sha1, tpl_offset, key)
+                        if td_key not in _seen_template_data_keys:
+                            _seen_template_data_keys.add(td_key)
+                            template_data_rows.append({
+                                'domain_label': domain,
+                                'template_name': normalized_tpl_name,
+                                'reference_normalized_sha1': reference_normalized_sha1,
+                                'offset_start': tpl_offset,
+                                'parameter_key': key,
+                                'parameter_value': val,
+                            })
 
-                        normalized_tpl_name = WikiTemplate.normalize_name(tpl_name_raw)
-                        tpl_key = (domain, normalized_tpl_name)
-                        if not _lru_wiki_template_keys.add(tpl_key):
-                            templates_needed.add(tpl_key)
+    # Write all accumulated rows to staging files
+    staging.write_rows('containers', containers_rows)
+    staging.write_rows('domains', domains_rows)
+    staging.write_rows('documents', documents_rows)
+    staging.write_rows('web_resources', web_resources_rows)
+    staging.write_rows('citations', citations)
+    staging.write_rows('normalized_citations', normalized_citations)
+    staging.write_rows('citation_histories', citation_histories)
+    staging.write_rows('revisions', revisions_rows)
+    staging.write_rows('ncwr', ncwr_rows)
+    staging.write_rows('wiki_templates', wiki_template_rows)
+    staging.write_rows('template_data', template_data_rows)
 
-                        # Compute offset of the template in the normalized citation text.
-                        # Prefer searching by beginning marker with normalized name, as the full_text
-                        # may not match after normalization (params are reordered, whitespace unified).
-                        marker = "{{" + normalized_tpl_name
-                        # Attempt to match the same occurrence index as in the extractor list order
-                        tpl_offset = find_nth(reference_normalized, marker, idx)
-                        if tpl_offset is None or tpl_offset < 0:
-                            # Fallback: try full_text directly; if not found, fall back to citation offset_start
-                            tpl_offset = reference_normalized.find(tpl_full_text)
-                            if tpl_offset < 0:
-                                tpl_offset = offset_start if isinstance(offset_start, int) else 0
-
-                        # Collect one TemplateData per parameter (defer id resolution)
-                        for p in params:
-                            key = (p or {}).get('key')
-                            val = (p or {}).get('value')
-                            if not key:
-                                continue
-                            templ_params_pending.append((domain, normalized_tpl_name, reference_normalized_sha1, tpl_offset, key, val))
-
-        # Domains: bulk upsert all needed and map ids
-        # Only the primary wiki domain should be tied to this container; external domains default to NULL.
-        if domains_needed:
-            Domain.bulk_upsert(
-                session,
-                [
-                    {
-                        'value': d,
-                        'for_container': (container_id if d == domain else None),
-                    }
-                    for d in domains_needed
-                ]
-            )
-            rows = session.execute(sa_select(Domain.value, Domain.id).where(Domain.value.in_(list(domains_needed)))).all()
-            domain_id_by_value = {v: i for v, i in rows}
-        else:
-            domain_id_by_value = {}
-
-        # Build WebResources rows (curid + external URLs) and bulk upsert
-        wr_rows = []
-        for info in cur_urls_info:
-            wr_rows.append({
-                'url': info['url'],
-                'domain_id': domain_id_by_value.get(info['domain_label']),
-                'numeric_page_id': info['numeric_page_id'],
-                'numeric_namespace_id': info['numeric_namespace_id'],
-                'instance_of_document': info['instance_of_document'],
-            })
-            all_urls.add(info['url'])
-
-        for url, netloc in external_url_items:
-            wr_rows.append({
-                'url': url,
-                'domain_id': domain_id_by_value.get(netloc),
-            })
-
-        if wr_rows:
-            WebResource.bulk_upsert(session, wr_rows)
-
-        # Map URL -> web_resource_id in one query
-        url_to_id = {}
-        if all_urls:
-            rows = session.execute(sa_select(WebResource.url, WebResource.id).where(WebResource.url.in_(list(all_urls)))).all()
-            url_to_id = {u: i for u, i in rows}
-
-        # Build NCWR rows in bulk
-        ncwr_rows = []
-        for rsha1, url in ncwr_pairs:
-            wr_id = url_to_id.get(url)
-            if wr_id is not None:
-                ncwr_key = (rsha1, wr_id)
-                if not _lru_ncwr_keys.add(ncwr_key):
-                    ncwr_rows.append({'reference_normalized_sha1': rsha1, 'web_resource_id': wr_id})
-
-        if ncwr_rows:
-            NormalizedCitationWebResource.bulk_upsert(session, ncwr_rows)
-
-        # Templates: bulk upsert and then bulk upsert params
-        wiki_template_rows = []
-        for dom_label, name in templates_needed:
-            dom_id = domain_id_by_value.get(dom_label)
-            if dom_id is not None:
-                # WikiTemplate unique key is (domain_id, name)
-                tpl_key = (dom_id, name)
-                if not _lru_wiki_template_keys.add(tpl_key):
-                    wiki_template_rows.append({'domain': dom_id, 'name': name})
-
-        if wiki_template_rows:
-            WikiTemplate.bulk_upsert(session, wiki_template_rows)
-
-        # Map (domain_id, name) -> wiki_template_id
-        template_key_to_id = {}
-        if wiki_template_rows:
-            from sqlalchemy import tuple_
-            keys = [(row['domain'], row['name']) for row in wiki_template_rows]
-            rows = session.execute(
-                sa_select(WikiTemplate.domain, WikiTemplate.name, WikiTemplate.id)
-                .where(tuple_(WikiTemplate.domain, WikiTemplate.name).in_(keys))
-            ).all()
-            template_key_to_id = {(d, n): i for d, n, i in rows}
-
-        # Build TemplateData rows
-        template_data_rows = []
-        for dom_label, name, rsha1, off, key, val in templ_params_pending:
-            dom_id = domain_id_by_value.get(dom_label)
-            if dom_id is None:
-                continue
-            tpl_id = template_key_to_id.get((dom_id, name))
-            if tpl_id is None:
-                continue
-            # TemplateData unique key is (wiki_template_id, reference_normalized_sha1, offset_start, parameter_key)
-            td_key = (tpl_id, rsha1, off, key)
-            if not _lru_template_data_keys.add(td_key):
-                template_data_rows.append({
-                    'wiki_template_id': tpl_id,
-                    'reference_normalized_sha1': rsha1,
-                    'offset_start': off,
-                    'parameter_key': key,
-                    'parameter_value': val,
-                })
-
-        if template_data_rows:
-            TemplateData.bulk_upsert(session, template_data_rows)
-
-        if tune_db:
-            # Per-transaction DB tuning to improve bulk ingest latency
-            # Safe knobs for bulk load workers; they apply only within this transaction
-            session.execute(text("SET LOCAL synchronous_commit=off"))
-            session.execute(text("SET LOCAL lock_timeout='5s'"))
-            session.execute(text("SET LOCAL statement_timeout='0'"))
-            session.execute(text("SET LOCAL application_name='wikirefs-writer'"))
-
-        if citations:
-            stmt_citations = insert(Citation).values(citations).on_conflict_do_update(
-                index_elements=['record_sha1', 'reference_raw_sha1'],
-                set_={
-                    "offset_start": insert(Citation).excluded.offset_start,
-                    "length": insert(Citation).excluded.length,
-                    "reference_type": insert(Citation).excluded.reference_type,
-                    "reference_name": insert(Citation).excluded.reference_name
-                }
-            )
-            session.execute(stmt_citations)
-
-        if revisions_rows:
-            stmt_revisions = insert(Revision).values(revisions_rows).on_conflict_do_update(
-                index_elements=['revision_id'],
-                set_={
-                    'page_id': insert(Revision).excluded.page_id,
-                    'parent_revision_id': insert(Revision).excluded.parent_revision_id,
-                    'revision_timestamp': insert(Revision).excluded.revision_timestamp,
-                }
-            )
-            session.execute(stmt_revisions)
-
-        if citation_histories:
-            stmt_histories = insert(CitationHistory).values(citation_histories).on_conflict_do_nothing()
-            session.execute(stmt_histories)
-
-        if normalized_citations:
-            stmt_normalized = insert(NormalizedCitation).values(normalized_citations).on_conflict_do_update(
-                index_elements=["record_sha1"],
-                set_={
-                    "reference_normalized": insert(NormalizedCitation).excluded.reference_normalized,
-                    "reference_normalized_sha1": insert(NormalizedCitation).excluded.reference_normalized_sha1,
-                    "appears_on_article": insert(NormalizedCitation).excluded.appears_on_article,
-                }
-            )
-            session.execute(stmt_normalized)
-
-        # Commit transaction
-        session.commit()
-
-        # Return metrics for monitoring
-        return {
-            'revisions_committed': len(revisions_rows),
-            'per_table_rows': {
-                'citations': len(citations),
-                'normalized_citations': len(normalized_citations),
-                'citation_histories': len(citation_histories),
-                'revisions': len(revisions_rows),
-                'web_resources': len(wr_rows) if 'wr_rows' in locals() else 0,
-                'ncwr': len(ncwr_rows) if 'ncwr_rows' in locals() else 0,
-                'wiki_templates': len(wiki_template_rows) if 'wiki_template_rows' in locals() else 0,
-                'template_data': len(template_data_rows) if 'template_data_rows' in locals() else 0,
-                'domains': len(domains_needed) if 'domains_needed' in locals() else 0,
-            }
+    return {
+        'revisions_committed': len(revisions_rows),
+        'per_table_rows': {
+            'citations': len(citations),
+            'normalized_citations': len(normalized_citations),
+            'citation_histories': len(citation_histories),
+            'revisions': len(revisions_rows),
+            'web_resources': len(web_resources_rows),
+            'ncwr': len(ncwr_rows),
+            'wiki_templates': len(wiki_template_rows),
+            'template_data': len(template_data_rows),
+            'domains': len(domains_rows),
         }
-    except Exception:
-        try:
-            session.rollback()
-        except Exception:
-            pass
-        raise
-    finally:
-        session.close()
+    }
 
 def parser_worker(filelist: List[str], batch_size: int, out_q: Queue, stop_event: Event, metrics_q: Queue):
     m = {'revisions_read': 0, 'batches_enqueued': 0}
@@ -603,31 +416,21 @@ def parser_worker(filelist: List[str], batch_size: int, out_q: Queue, stop_event
         metrics_q.put(('parser_done', m))
 
 
-def writer_worker(domain: str, in_q: Queue, stop_event: Event, tune_db: bool, metrics_q: Queue):
-    # Consume until stop_event and queue drained with sentinel handling
-    while True:
-        if stop_event.is_set() and in_q.empty():
-            break
-        try:
-            batch = in_q.get(timeout=0.5)
-        except Exception:
-            continue
-        attempt = 0
+def staging_worker(domain: str, staging_dir: str, in_q: Queue, stop_event: Event, metrics_q: Queue):
+    """Consume batches from the queue and write derived rows to staging files."""
+    staging = StagingWriter(staging_dir)
+    try:
         while True:
-            attempt += 1
-            try:
-                result = process_revisions(batch, domain=domain, tune_db=tune_db)
-                metrics_q.put(('writer_batch', result))
+            if stop_event.is_set() and in_q.empty():
                 break
-            except Exception as exc:
-                if not _is_retryable_db_disconnect(exc) or attempt >= _RETRY_ATTEMPTS:
-                    raise
-                # Drop any pooled/stale connections before retrying.
-                try:
-                    Engine.dispose()
-                except Exception:
-                    pass
-                time.sleep(_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)))
+            try:
+                batch = in_q.get(timeout=0.5)
+            except Exception:
+                continue
+            result = process_revisions(batch, staging=staging, domain=domain)
+            metrics_q.put(('writer_batch', result))
+    finally:
+        staging.close()
 
 
 def chunk(lst, n):
@@ -635,7 +438,7 @@ def chunk(lst, n):
         yield lst[i:i+n]
 
 
-def run_pipeline(files: List[str], domain: str, parse_procs: int, write_procs: int, batch_size: int, queue_max: int, tune_db: bool, metrics_interval: float, log_prefix: str = ""):
+def run_pipeline(files: List[str], domain: str, parse_procs: int, write_procs: int, batch_size: int, queue_max: int, staging_dir: str, metrics_interval: float, log_prefix: str = ""):
     # Bounded queue enforces backpressure from writers to parsers
     q: Queue = multiprocessing.Queue(maxsize=queue_max)
     metrics_q: Queue = multiprocessing.Queue()
@@ -653,7 +456,7 @@ def run_pipeline(files: List[str], domain: str, parse_procs: int, write_procs: i
 
     writers: List[Process] = []
     for _ in range(write_procs):
-        w = multiprocessing.Process(target=writer_worker, args=(domain, q, stop_event, tune_db, metrics_q), daemon=True)
+        w = multiprocessing.Process(target=staging_worker, args=(domain, staging_dir, q, stop_event, metrics_q), daemon=True)
         w.start()
         writers.append(w)
 
@@ -747,15 +550,16 @@ def run_pipeline(files: List[str], domain: str, parse_procs: int, write_procs: i
 
 def parse_args(argv=None):
     import argparse
-    ap = argparse.ArgumentParser(description='Parse and ingest wiki references with staged pipeline')
+    ap = argparse.ArgumentParser(description='Parse wiki revisions and stage derived rows as JSONL.zst files')
     ap.add_argument('path', nargs='?', default='./sources/', help='File or directory containing .mwrev.zst')
+    ap.add_argument('-o', '--staging-dir', default=os.environ.get('STAGING_DIR', './staging'),
+                    help='Directory to write staged JSONL.zst files (default: STAGING_DIR env or ./staging)')
     ap.add_argument('--domain', default='en.wikipedia.org', help='Wiki domain for curid URLs (default: en.wikipedia.org)')
     ap.add_argument('--batch-size', type=int, default=BATCH_SIZE, help=f'Revisions per parsed batch (default: {BATCH_SIZE})')
     ap.add_argument('--parse-procs', type=int, default=PARSE_PROCS, help=f'Parser processes (default: {PARSE_PROCS})')
-    ap.add_argument('--write-procs', type=int, default=WRITE_PROCS, help=f'Writer processes (default: {WRITE_PROCS})')
+    ap.add_argument('--write-procs', type=int, default=WRITE_PROCS, help=f'Staging writer processes (default: {WRITE_PROCS})')
     ap.add_argument('--queue-max', type=int, default=QUEUE_MAX_BATCHES, help=f'Max queued batches (default: {QUEUE_MAX_BATCHES})')
     ap.add_argument('--metrics-interval', type=float, default=METRICS_INTERVAL, help=f'Seconds between metrics prints (default: {METRICS_INTERVAL})')
-    ap.add_argument('--tune-db', action='store_true', default=False, help='Enable per-transaction DB load-time tuning')
     ap.add_argument('--log-prefix', default='', help='Prefix for log lines (e.g. [1/939])')
     return ap.parse_args(argv)
 
@@ -769,7 +573,6 @@ if __name__ == '__main__':
     else:
         filenames = [args.path]
 
-    # Important: keep writer count small to protect Postgres. Prefer scaling parsers.
     run_pipeline(
         files=filenames,
         domain=args.domain,
@@ -777,7 +580,7 @@ if __name__ == '__main__':
         write_procs=max(1, int(args.write_procs)),
         batch_size=max(1, int(args.batch_size)),
         queue_max=max(1, int(args.queue_max)),
-        tune_db=bool(args.tune_db),
+        staging_dir=args.staging_dir,
         metrics_interval=float(args.metrics_interval),
         log_prefix=args.log_prefix,
     )
