@@ -12,12 +12,12 @@ load_dotenv()
 
 max_jobs = 8
 
-def sort_key(file_name):
-    # For .mwrev.zst files, try to extract numeric hints if present; else by name
-    match = re.search(r"(\d+)", file_name)
-    if match:
-        return int(match.group(1))
-    return float('inf')  # Fallback
+def sort_key(filepath):
+    # Sort by file size, smallest first
+    try:
+        return os.path.getsize(filepath)
+    except OSError:
+        return float('inf')
 
 # Regex to parse a metrics line emitted by build_db.py's print_metrics().
 # Example:
@@ -114,7 +114,7 @@ def main():
         for f in os.listdir(directory)
         if os.path.isfile(os.path.join(directory, f)) and f.endswith('.mwrev.zst')
     ]
-    files.sort(key=lambda f: sort_key(os.path.basename(f)))
+    files.sort(key=sort_key)
 
     all_slots = []
     process_queue = queue.Queue(maxsize=args.jobs)
