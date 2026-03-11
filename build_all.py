@@ -101,8 +101,8 @@ def main():
     parser = argparse.ArgumentParser(description="Spawn build_db.py for each .mwrev.zst file in a directory.")
     parser.add_argument("-d", "--directory", required=True, help="Directory containing .mwrev.zst files")
     parser.add_argument("-j", "--jobs", type=int, default=max_jobs, help="Number of concurrent jobs/files to process (default: 8)")
-    parser.add_argument("--metrics-interval", type=float, default=float(os.environ.get("AGG_METRICS_INTERVAL", "10")),
-                        help="Seconds between aggregated metrics prints (default: 10 or AGG_METRICS_INTERVAL env)")
+    parser.add_argument("--metrics-interval", type=float, default=float(os.environ.get("METRICS_INTERVAL", "10")),
+                        help="Seconds between aggregated metrics prints (default: 10 or METRICS_INTERVAL env)")
     args = parser.parse_args()
 
     directory = args.directory
