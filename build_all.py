@@ -5,6 +5,9 @@ import queue
 import time
 import argparse
 
+from dotenv import load_dotenv
+load_dotenv()
+
 max_jobs = 8
 
 def sort_key(file_name):
