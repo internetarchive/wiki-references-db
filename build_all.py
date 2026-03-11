@@ -24,8 +24,6 @@ def main():
     if not os.path.isdir(directory):
         raise SystemExit(f"Provided path is not a directory: {directory}")
 
-    global max_jobs
-    max_jobs = args.jobs
     files = [
         os.path.join(directory, f)
         for f in os.listdir(directory)
@@ -33,7 +31,7 @@ def main():
     ]
     files.sort(key=lambda f: sort_key(os.path.basename(f)))
     #files.reverse()
-    process_queue = queue.Queue(maxsize=max_jobs)
+    process_queue = queue.Queue(maxsize=args.jobs)
 
     for counter, file in enumerate(files):
         while process_queue.full():
