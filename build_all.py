@@ -42,6 +42,7 @@ def main():
             cleanup_finished_processes(process_queue)
         # Keep DB concurrency bounded inside each job via --write-procs.
         # Use more parser procs inside the job to leverage CPU while protecting Postgres.
+        log_prefix = f"[{counter+1}/{len(files)}]"
         process = subprocess.Popen([
             "python3", "build_db.py", file,
             "--parse-procs", os.environ.get("PARSE_PROCS", "4"),
@@ -49,9 +50,10 @@ def main():
             "--batch-size", os.environ.get("BATCH_SIZE", "1000"),
             "--queue-max", os.environ.get("QUEUE_MAX", "32"),
             "--metrics-interval", os.environ.get("METRICS_INTERVAL", "5"),
+            "--log-prefix", log_prefix,
         ] + (["--tune-db"] if os.environ.get("TUNE_DB", "0") in ("1", "true", "TRUE") else []))
         process_queue.put(process)
-        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{str(counter+1)}/{str(len(files))}] {file}")
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {log_prefix} [start] {file}")
 
     while not process_queue.empty():
         cleanup_finished_processes(process_queue)

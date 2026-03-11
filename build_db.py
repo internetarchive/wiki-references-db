@@ -634,7 +634,7 @@ def chunk(lst, n):
         yield lst[i:i+n]
 
 
-def run_pipeline(files: List[str], domain: str, parse_procs: int, write_procs: int, batch_size: int, queue_max: int, tune_db: bool, metrics_interval: float):
+def run_pipeline(files: List[str], domain: str, parse_procs: int, write_procs: int, batch_size: int, queue_max: int, tune_db: bool, metrics_interval: float, log_prefix: str = ""):
     # Bounded queue enforces backpressure from writers to parsers
     q: Queue = multiprocessing.Queue(maxsize=queue_max)
     metrics_q: Queue = multiprocessing.Queue()
@@ -689,8 +689,9 @@ def run_pipeline(files: List[str], domain: str, parse_procs: int, write_procs: i
             qsize = -1
         per_table = ", ".join(f"{k}={v}" for k, v in sorted(agg.per_table_rows.items()))
         ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        lp = f"{log_prefix} " if log_prefix else ""
         print(
-            f"{ts} {prefix} elapsed={_format_duration(elapsed)} | queue={qsize}/{queue_max} | "
+            f"{ts} {lp}{prefix} elapsed={_format_duration(elapsed)} | queue={qsize}/{queue_max} | "
             f"parsers_done={parsers_done}/{total_parsers} | tables: {per_table}",
             flush=True,
         )
@@ -754,6 +755,7 @@ def parse_args(argv=None):
     ap.add_argument('--queue-max', type=int, default=QUEUE_MAX_BATCHES, help=f'Max queued batches (default: {QUEUE_MAX_BATCHES})')
     ap.add_argument('--metrics-interval', type=float, default=METRICS_INTERVAL, help=f'Seconds between metrics prints (default: {METRICS_INTERVAL})')
     ap.add_argument('--tune-db', action='store_true', default=False, help='Enable per-transaction DB load-time tuning')
+    ap.add_argument('--log-prefix', default='', help='Prefix for log lines (e.g. [1/939])')
     return ap.parse_args(argv)
 
 
@@ -776,4 +778,5 @@ if __name__ == '__main__':
         queue_max=max(1, int(args.queue_max)),
         tune_db=bool(args.tune_db),
         metrics_interval=float(args.metrics_interval),
+        log_prefix=args.log_prefix,
     )
