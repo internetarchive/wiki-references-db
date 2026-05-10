@@ -49,46 +49,32 @@ def parse_tables(tables_str):
 
 
 class ProcessSlot:
-    """Tracks a subprocess and its latest parsed metrics."""
+    """Tracks a subprocess."""
     def __init__(self, process, log_prefix, filepath):
         self.process = process
         self.log_prefix = log_prefix
         self.filepath = filepath
-        self.latest_tables = {}
-        self.latest_elapsed = ""
-        self.latest_queue = ""
-        self.latest_parsers = ""
         self.finished = False
 
 
 def reader_thread(slot):
-    """Read stdout from a subprocess line-by-line, updating slot metrics."""
+    """Read stdout from a subprocess line-by-line, silencing metrics."""
     for raw in slot.process.stdout:
         line = raw.strip()
         if not line:
             continue
-        m = _METRICS_RE.search(line)
-        if m:
-            slot.latest_tables = parse_tables(m.group("tables"))
-            slot.latest_elapsed = m.group("elapsed")
-            slot.latest_queue = m.group("queue")
-            slot.latest_parsers = m.group("parsers")
-        else:
-            # Non-metrics output: print through with timestamp
-            print(line, flush=True)
+        if _METRICS_RE.search(line):
+            continue
+        # Non-metrics output: print through with timestamp
+        print(line, flush=True)
 
 
-def aggregate_and_print(slots, finished_totals, finished_count, total_files):
-    """Aggregate per-table rows across all slots and print one line."""
-    agg_tables = dict(finished_totals)
-    for s in slots:
-        for k, v in s.latest_tables.items():
-            agg_tables[k] = agg_tables.get(k, 0) + v
+def aggregate_and_print(slots, finished_count, total_files):
+    """Print simplified status focusing on shards done and in progress."""
     active = len(slots)
-    per_table = ", ".join(f"{k}={v}" for k, v in sorted(agg_tables.items()))
     ts = time.strftime('%Y-%m-%d %H:%M:%S')
     print(
-        f"{ts} [aggregate] jobs={active} active, {finished_count}/{total_files} done | tables: {per_table}",
+        f"{ts} [build_all] {finished_count}/{total_files} shards done ({active} in progress)",
         flush=True,
     )
 
@@ -115,7 +101,6 @@ def main():
     files.sort(key=sort_key)
 
     all_slots = []
-    finished_totals = {}
     finished_count = 0
     process_queue = queue.Queue(maxsize=args.jobs)
     metrics_interval = args.metrics_interval
@@ -124,12 +109,12 @@ def main():
     for counter, file in enumerate(files):
         while process_queue.full():
             time.sleep(0.1)
-            newly_done = cleanup_finished_processes(process_queue, all_slots, finished_totals)
+            newly_done = cleanup_finished_processes(process_queue, all_slots)
             finished_count += newly_done
             all_slots[:] = [s for s in all_slots if not s.finished]
             now = time.time()
             if now - last_agg_print >= metrics_interval:
-                aggregate_and_print(all_slots, finished_totals, finished_count, len(files))
+                aggregate_and_print(all_slots, finished_count, len(files))
                 last_agg_print = now
 
         log_prefix = f"[{counter+1}/{len(files)}]"
@@ -171,20 +156,20 @@ def main():
         print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {log_prefix} [start] {file}", flush=True)
 
     while not process_queue.empty():
-        newly_done = cleanup_finished_processes(process_queue, all_slots, finished_totals)
+        newly_done = cleanup_finished_processes(process_queue, all_slots)
         finished_count += newly_done
         all_slots[:] = [s for s in all_slots if not s.finished]
         now = time.time()
         if now - last_agg_print >= metrics_interval:
-            aggregate_and_print(all_slots, finished_totals, finished_count, len(files))
+            aggregate_and_print(all_slots, finished_count, len(files))
             last_agg_print = now
         time.sleep(0.1)
 
     # Final aggregate
-    aggregate_and_print(all_slots, finished_totals, finished_count, len(files))
+    aggregate_and_print(all_slots, finished_count, len(files))
 
 
-def cleanup_finished_processes(process_queue, all_slots, finished_totals):
+def cleanup_finished_processes(process_queue, all_slots):
     newly_done = 0
     for _ in range(process_queue.qsize()):
         slot = process_queue.get()
@@ -198,9 +183,6 @@ def cleanup_finished_processes(process_queue, all_slots, finished_totals):
                 os.makedirs(slot.job_staging_dir, exist_ok=True)
                 with open(os.path.join(slot.job_staging_dir, 'DONE.txt'), 'w') as f:
                     f.write(datetime.now(timezone.utc).isoformat() + '\n')
-            # Accumulate metrics into finished_totals
-            for k, v in slot.latest_tables.items():
-                finished_totals[k] = finished_totals.get(k, 0) + v
             # Release subprocess resources
             slot.process.stdout.close()
             slot.process.wait()

@@ -34,23 +34,6 @@ def _is_retryable_db_disconnect(exc: BaseException) -> bool:
         return any(s in msg for s in retryable_substrings)
     return False
 
-load_dotenv()
-
-# ---------------------------------------------------------------------------
-# Hash-set based dedup (replaces LRU caches — lossless, unbounded)
-# ---------------------------------------------------------------------------
-_seen_citation_keys: set = set()          # (record_sha1, reference_raw_sha1)
-_seen_normalized_keys: set = set()        # record_sha1
-_seen_ncwr_keys: set = set()              # (reference_normalized_sha1, url)
-_seen_wiki_template_keys: set = set()     # (domain_label, normalized_name)
-_seen_template_data_keys: set = set()     # (domain_label, name, ref_sha1, offset, key)
-_seen_domain_values: set = set()          # (netloc, for_container_label)
-_seen_containers: set = set()             # label
-_seen_web_resource_urls: set = set()      # url
-
-# Page tracking (plain dict — no DB ids needed in staging mode)
-_seen_pages: dict = {}  # page_id -> True
-
 # ---------------------------------------------------------------------------
 # StagingWriter — writes JSONL compressed with zstandard to per-source files
 # ---------------------------------------------------------------------------
@@ -89,6 +72,8 @@ class StagingWriter:
             fh.close()
         self._compressors.clear()
 
+
+load_dotenv()
 
 # Defaults (overridable via CLI)
 BATCH_SIZE = 1000           # revisions per batch from parsers
@@ -190,12 +175,10 @@ def _normalize_template_name(raw: str) -> str:
 def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.org", source_stem: str = 'unknown'):
     """Derive rows from revisions and write them to staging JSONL.zst files.
 
-    No database connection is used. Deduplication is done via in-memory hash sets.
+    No database connection is used. No in-memory deduplication is performed.
     """
     citations, citation_histories, normalized_citations = [], [], []
     revisions_rows = []
-    seen_revision_ids = set()
-    seen_citations, seen_normalized = set(), set()
 
     domains_rows = []  # {'value': ..., 'for_container': ...}
     containers_rows = []  # {'label': ...}
@@ -205,14 +188,9 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
     wiki_template_rows = []  # {'domain_label': ..., 'name': ...}
     template_data_rows = []
 
-    # Track container for this domain
-    if domain not in _seen_containers:
-        _seen_containers.add(domain)
-        containers_rows.append({'label': domain})
-    domain_key = (domain, domain)
-    if domain_key not in _seen_domain_values:
-        _seen_domain_values.add(domain_key)
-        domains_rows.append({'value': domain, 'for_container_label': domain})
+    # Emit container for this domain
+    containers_rows.append({'label': domain})
+    domains_rows.append({'value': domain, 'for_container_label': domain})
 
     for data in revisions:
 
@@ -222,23 +200,19 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
         revision_id = data["revision_id"]
         revision_timestamp = data["revision_timestamp"].replace("T", " ").replace("Z", "")
 
-        if page_id not in _seen_pages:
-            _seen_pages[page_id] = True
-            cur_url = f"https://{domain}/w/index.php?curid={page_id}"
-            documents_rows.append({
-                'language_code': language_code,
-                'has_container_label': domain,
-                'page_id': page_id,
-            })
-            if cur_url not in _seen_web_resource_urls:
-                _seen_web_resource_urls.add(cur_url)
-                web_resources_rows.append({
-                    'url': cur_url,
-                    'domain_label': domain,
-                    'numeric_page_id': page_id,
-                    'numeric_namespace_id': namespace_id,
-                    'page_id': page_id,
-                })
+        cur_url = f"https://{domain}/w/index.php?curid={page_id}"
+        documents_rows.append({
+            'language_code': language_code,
+            'has_container_label': domain,
+            'page_id': page_id,
+        })
+        web_resources_rows.append({
+            'url': cur_url,
+            'domain_label': domain,
+            'numeric_page_id': page_id,
+            'numeric_namespace_id': namespace_id,
+            'page_id': page_id,
+        })
 
         references = extract_references(data["revision_text"], include_offsets=True)
 
@@ -256,31 +230,24 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
             reference_raw_sha1 = get_sha1(reference_raw)
             reference_name = ref.get('reference_name')
 
-            citation_key = (record_sha1, reference_raw_sha1)
-            if citation_key not in seen_citations and citation_key not in _seen_citation_keys:
-                seen_citations.add(citation_key)
-                _seen_citation_keys.add(citation_key)
-                citations.append({
-                    "record_sha1": record_sha1,
-                    "reference_raw_sha1": reference_raw_sha1,
-                    "offset_start": offset_start,
-                    "length": length,
-                    "reference_type": reference_type,
-                    "reference_normalized_sha1": reference_normalized_sha1,
-                    "reference_name": reference_name,
-                    "wiki_article_id": page_id
-                })
+            citations.append({
+                "record_sha1": record_sha1,
+                "reference_raw_sha1": reference_raw_sha1,
+                "offset_start": offset_start,
+                "length": length,
+                "reference_type": reference_type,
+                "reference_normalized_sha1": reference_normalized_sha1,
+                "reference_name": reference_name,
+                "wiki_article_id": page_id
+            })
 
-            if record_sha1 not in seen_normalized and record_sha1 not in _seen_normalized_keys:
-                seen_normalized.add(record_sha1)
-                _seen_normalized_keys.add(record_sha1)
-                normalized_citations.append({
-                    "record_sha1": record_sha1,
-                    "reference_normalized_sha1": reference_normalized_sha1,
-                    "reference_normalized": reference_normalized,
-                    "appears_on_page_id": page_id,
-                    "appears_on_domain": domain,
-                })
+            normalized_citations.append({
+                "record_sha1": record_sha1,
+                "reference_normalized_sha1": reference_normalized_sha1,
+                "reference_normalized": reference_normalized,
+                "appears_on_page_id": page_id,
+                "appears_on_domain": domain,
+            })
 
             citation_histories.append({
                 "record_sha1": record_sha1,
@@ -289,14 +256,12 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
                 "revision_id": revision_id,
             })
 
-            if revision_id not in seen_revision_ids:
-                seen_revision_ids.add(revision_id)
-                revisions_rows.append({
-                    "revision_id": revision_id,
-                    "page_id": page_id,
-                    "parent_revision_id": data.get("parent_revision_id"),
-                    "revision_timestamp": revision_timestamp
-                })
+            revisions_rows.append({
+                "revision_id": revision_id,
+                "page_id": page_id,
+                "parent_revision_id": data.get("parent_revision_id"),
+                "revision_timestamp": revision_timestamp
+            })
 
             urls = ref.get('urls') or []
             for url in urls:
@@ -308,23 +273,15 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
                 except Exception:
                     netloc = None
                 if netloc:
-                    d_key = (netloc, None)
-                    if d_key not in _seen_domain_values:
-                        _seen_domain_values.add(d_key)
-                        domains_rows.append({'value': netloc, 'for_container_label': None})
-                if url not in _seen_web_resource_urls:
-                    _seen_web_resource_urls.add(url)
-                    web_resources_rows.append({
-                        'url': url,
-                        'domain_label': netloc,
-                    })
-                ncwr_key = (reference_normalized_sha1, url)
-                if ncwr_key not in _seen_ncwr_keys:
-                    _seen_ncwr_keys.add(ncwr_key)
-                    ncwr_rows.append({
-                        'reference_normalized_sha1': reference_normalized_sha1,
-                        'url': url,
-                    })
+                    domains_rows.append({'value': netloc, 'for_container_label': None})
+                web_resources_rows.append({
+                    'url': url,
+                    'domain_label': netloc,
+                })
+                ncwr_rows.append({
+                    'reference_normalized_sha1': reference_normalized_sha1,
+                    'url': url,
+                })
 
             templates = ref.get('templates') or []
             if templates:
@@ -335,23 +292,17 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
                         if start == -1:
                             break
                     return start
-
                 for idx, tpl in enumerate(templates, start=1):
                     tpl_name_raw = (tpl or {}).get('template_name') or ''
                     tpl_full_text = (tpl or {}).get('full_text') or ''
                     params = (tpl or {}).get('parameters') or []
-
                     if not tpl_name_raw:
                         continue
-
                     normalized_tpl_name = _normalize_template_name(tpl_name_raw)
-                    tpl_key = (domain, normalized_tpl_name)
-                    if tpl_key not in _seen_wiki_template_keys:
-                        _seen_wiki_template_keys.add(tpl_key)
-                        wiki_template_rows.append({
-                            'domain_label': domain,
-                            'name': normalized_tpl_name,
-                        })
+                    wiki_template_rows.append({
+                        'domain_label': domain,
+                        'name': normalized_tpl_name,
+                    })
 
                     marker = "{{" + normalized_tpl_name
                     tpl_offset = find_nth(reference_normalized, marker, idx)
@@ -365,17 +316,14 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
                         val = (p or {}).get('value')
                         if not key:
                             continue
-                        td_key = (domain, normalized_tpl_name, reference_normalized_sha1, tpl_offset, key)
-                        if td_key not in _seen_template_data_keys:
-                            _seen_template_data_keys.add(td_key)
-                            template_data_rows.append({
-                                'domain_label': domain,
-                                'template_name': normalized_tpl_name,
-                                'reference_normalized_sha1': reference_normalized_sha1,
-                                'offset_start': tpl_offset,
-                                'parameter_key': key,
-                                'parameter_value': val,
-                            })
+                        template_data_rows.append({
+                            'domain_label': domain,
+                            'template_name': normalized_tpl_name,
+                            'reference_normalized_sha1': reference_normalized_sha1,
+                            'offset_start': tpl_offset,
+                            'parameter_key': key,
+                            'parameter_value': val,
+                        })
 
     # Write all accumulated rows to staging files
     staging.write_rows('containers', containers_rows, source_stem=source_stem)
