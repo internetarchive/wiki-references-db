@@ -6,6 +6,7 @@ import time
 import argparse
 import threading
 import sys
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -77,22 +78,17 @@ def reader_thread(slot):
             print(line, flush=True)
 
 
-def aggregate_and_print(slots, total_files):
+def aggregate_and_print(slots, finished_totals, finished_count, total_files):
     """Aggregate per-table rows across all slots and print one line."""
-    agg_tables = {}
-    active = 0
-    finished = 0
+    agg_tables = dict(finished_totals)
     for s in slots:
         for k, v in s.latest_tables.items():
             agg_tables[k] = agg_tables.get(k, 0) + v
-        if s.finished:
-            finished += 1
-        else:
-            active += 1
+    active = len(slots)
     per_table = ", ".join(f"{k}={v}" for k, v in sorted(agg_tables.items()))
     ts = time.strftime('%Y-%m-%d %H:%M:%S')
     print(
-        f"{ts} [aggregate] jobs={active} active, {finished}/{total_files} done | tables: {per_table}",
+        f"{ts} [aggregate] jobs={active} active, {finished_count}/{total_files} done | tables: {per_table}",
         flush=True,
     )
 
@@ -119,6 +115,8 @@ def main():
     files.sort(key=sort_key)
 
     all_slots = []
+    finished_totals = {}
+    finished_count = 0
     process_queue = queue.Queue(maxsize=args.jobs)
     metrics_interval = args.metrics_interval
     last_agg_print = time.time()
@@ -126,10 +124,12 @@ def main():
     for counter, file in enumerate(files):
         while process_queue.full():
             time.sleep(0.1)
-            cleanup_finished_processes(process_queue, all_slots)
+            newly_done = cleanup_finished_processes(process_queue, all_slots, finished_totals)
+            finished_count += newly_done
+            all_slots[:] = [s for s in all_slots if not s.finished]
             now = time.time()
             if now - last_agg_print >= metrics_interval:
-                aggregate_and_print(all_slots, len(files))
+                aggregate_and_print(all_slots, finished_totals, finished_count, len(files))
                 last_agg_print = now
 
         log_prefix = f"[{counter+1}/{len(files)}]"
@@ -155,6 +155,7 @@ def main():
         ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
         slot = ProcessSlot(process, log_prefix, file)
+        slot.job_staging_dir = job_staging_dir
         all_slots.append(slot)
         process_queue.put(slot)
 
@@ -162,27 +163,49 @@ def main():
         t = threading.Thread(target=reader_thread, args=(slot,), daemon=True)
         t.start()
 
+        # Write STARTED.txt with current timestamp
+        os.makedirs(job_staging_dir, exist_ok=True)
+        with open(os.path.join(job_staging_dir, 'STARTED.txt'), 'w') as f:
+            f.write(datetime.now(timezone.utc).isoformat() + '\n')
+
         print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {log_prefix} [start] {file}", flush=True)
 
     while not process_queue.empty():
-        cleanup_finished_processes(process_queue, all_slots)
+        newly_done = cleanup_finished_processes(process_queue, all_slots, finished_totals)
+        finished_count += newly_done
+        all_slots[:] = [s for s in all_slots if not s.finished]
         now = time.time()
         if now - last_agg_print >= metrics_interval:
-            aggregate_and_print(all_slots, len(files))
+            aggregate_and_print(all_slots, finished_totals, finished_count, len(files))
             last_agg_print = now
         time.sleep(0.1)
 
     # Final aggregate
-    aggregate_and_print(all_slots, len(files))
+    aggregate_and_print(all_slots, finished_totals, finished_count, len(files))
 
 
-def cleanup_finished_processes(process_queue, all_slots):
+def cleanup_finished_processes(process_queue, all_slots, finished_totals):
+    newly_done = 0
     for _ in range(process_queue.qsize()):
         slot = process_queue.get()
         if slot.process.poll() is None:
             process_queue.put(slot)
         else:
             slot.finished = True
+            newly_done += 1
+            # Write DONE.txt with current timestamp
+            if hasattr(slot, 'job_staging_dir') and slot.job_staging_dir:
+                os.makedirs(slot.job_staging_dir, exist_ok=True)
+                with open(os.path.join(slot.job_staging_dir, 'DONE.txt'), 'w') as f:
+                    f.write(datetime.now(timezone.utc).isoformat() + '\n')
+            # Accumulate metrics into finished_totals
+            for k, v in slot.latest_tables.items():
+                finished_totals[k] = finished_totals.get(k, 0) + v
+            # Release subprocess resources
+            slot.process.stdout.close()
+            slot.process.wait()
+            slot.process = None
+    return newly_done
 
 if __name__ == "__main__":
     main()
