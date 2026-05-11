@@ -1,8 +1,11 @@
-"""Load staged JSONL.zst files into PostgreSQL.
+"""Load pre-deduplicated staged JSONL.zst files into PostgreSQL.
 
-Reads the staging directory produced by build_all.py / build_db.py,
-deduplicates rows across per-process files, and bulk-inserts into
-Postgres using temporary staging tables for conflict resolution.
+Reads the deduped/ subdirectory produced by dedup_staged.py and
+bulk-inserts into Postgres.  ON CONFLICT upserts are kept as a
+safety net for residual duplicates or re-runs.
+
+Pipeline:
+    build_all.py  →  dedup_staged.py  →  load_all.py
 
 Usage:
     python3 load_all.py -d ./staging
@@ -10,6 +13,7 @@ Usage:
 """
 
 import io
+import itertools
 import json
 import os
 import sys
@@ -59,31 +63,20 @@ def read_jsonl_zst(filepath):
 
 
 def find_staging_files(staging_dir, table_name):
-    """Find all .jsonl.zst files for a given table across all subdirectories."""
-    pattern = os.path.join(staging_dir, '**', f'*-{table_name}.jsonl.zst')
-    return sorted(glob.glob(pattern, recursive=True))
+    """Find all .jsonl.zst files for a given table in the deduped/ subdirectory."""
+    deduped_dir = os.path.join(staging_dir, 'deduped')
+    pattern = os.path.join(deduped_dir, f'{table_name}-*.jsonl.zst')
+    return sorted(glob.glob(pattern))
 
 
-def dedup_rows(filepaths, key_func):
-    """Yield rows from multiple JSONL.zst files, deduplicating by key_func using a local set.
-
-    To avoid runaway memory use, this function uses a generator and a set for seen keys.
-    If the number of seen keys exceeds a threshold, it could switch to a more
-    aggressive memory-saving strategy, but for now, we rely on the fact that
-    loading one table at a time is much better than keeping everything in build_db.
-    """
-    seen = set()
+def stream_rows(filepaths):
+    """Yield rows from multiple JSONL.zst files."""
     for fp in filepaths:
-        for row in read_jsonl_zst(fp):
-            k = key_func(row)
-            if k not in seen:
-                seen.add(k)
-                yield row
+        yield from read_jsonl_zst(fp)
 
 
 def chunked_iterable(iterable, n):
     """Yield successive n-sized chunks from an iterable."""
-    import itertools
     it = iter(iterable)
     while True:
         chunk = list(itertools.islice(it, n))
@@ -107,7 +100,7 @@ def load_containers(session, staging_dir):
         return
     log(f"containers: processing from {len(files)} files")
     count = 0
-    for batch in chunked_iterable(dedup_rows(files, lambda r: r['label']), BATCH_SIZE):
+    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
         Container.bulk_upsert(session, batch)
         count += len(batch)
     log(f"containers: {count} unique rows loaded")
@@ -123,7 +116,7 @@ def load_domains(session, staging_dir):
     # We still need to resolve containers, but we can do it in batches if needed.
     # For now, let's keep it simple but stream the rows.
     count = 0
-    for batch in chunked_iterable(dedup_rows(files, lambda r: r['value']), BATCH_SIZE):
+    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
         # Resolve container labels to ids for this batch
         labels = set(r.get('for_container_label') for r in batch if r.get('for_container_label'))
         label_to_id = {}
@@ -160,7 +153,7 @@ def load_documents(session, staging_dir):
     page_to_doc_id = {}
     
     count = 0
-    for batch in chunked_iterable(dedup_rows(files, lambda r: (r.get('has_container_label', ''), r['page_id'])), BATCH_SIZE):
+    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
         # Resolve container labels
         labels = set(r.get('has_container_label') for r in batch if r.get('has_container_label'))
         label_to_id = {}
@@ -193,7 +186,7 @@ def load_web_resources(session, staging_dir, page_to_doc_id):
     log(f"web_resources: processing from {len(files)} files")
 
     count = 0
-    for batch in chunked_iterable(dedup_rows(files, lambda r: r['url']), BATCH_SIZE):
+    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
         # Resolve domain labels to ids
         domain_labels = set(r.get('domain_label') for r in batch if r.get('domain_label'))
         domain_to_id = {}
@@ -236,7 +229,7 @@ def load_wiki_templates(session, staging_dir):
     log(f"wiki_templates: processing from {len(files)} files")
 
     count = 0
-    for batch in chunked_iterable(dedup_rows(files, lambda r: (r['domain_label'], r['name'])), BATCH_SIZE):
+    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
         # Resolve domain labels
         domain_labels = set(r['domain_label'] for r in batch)
         domain_to_id = {}
@@ -265,7 +258,7 @@ def load_normalized_citations(session, staging_dir, page_to_doc_id):
     log(f"normalized_citations: processing from {len(files)} files")
 
     count = 0
-    for batch in chunked_iterable(dedup_rows(files, lambda r: r['record_sha1']), BATCH_SIZE):
+    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
         cleaned = []
         for r in batch:
             domain = r.get('appears_on_domain', '')
@@ -302,7 +295,7 @@ def load_citations(session, staging_dir):
     log(f"citations: processing from {len(files)} files")
 
     count = 0
-    for batch in chunked_iterable(dedup_rows(files, lambda r: (r['record_sha1'], r['reference_raw_sha1'])), BATCH_SIZE):
+    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
         stmt = insert(Citation).values(batch).on_conflict_do_update(
             index_elements=['record_sha1', 'reference_raw_sha1'],
             set_={
@@ -325,7 +318,7 @@ def load_revisions(session, staging_dir):
     log(f"revisions: processing from {len(files)} files")
 
     count = 0
-    for batch in chunked_iterable(dedup_rows(files, lambda r: r['revision_id']), BATCH_SIZE):
+    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
         stmt = insert(Revision).values(batch).on_conflict_do_update(
             index_elements=['revision_id'],
             set_={
@@ -347,7 +340,7 @@ def load_citation_histories(session, staging_dir):
     log(f"citation_histories: processing from {len(files)} files")
 
     count = 0
-    for batch in chunked_iterable(dedup_rows(files, lambda r: (r['record_sha1'], r['revision_id'])), BATCH_SIZE):
+    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
         stmt = insert(CitationHistory).values(batch).on_conflict_do_nothing()
         session.execute(stmt)
         count += len(batch)
@@ -362,7 +355,7 @@ def load_ncwr(session, staging_dir):
     log(f"ncwr: processing from {len(files)} files")
 
     count = 0
-    for batch in chunked_iterable(dedup_rows(files, lambda r: (r['reference_normalized_sha1'], r['url'])), BATCH_SIZE):
+    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
         # Resolve URLs to web_resource_ids
         urls = list(set(r['url'] for r in batch))
         url_to_id = {}
@@ -393,11 +386,7 @@ def load_template_data(session, staging_dir):
     log(f"template_data: processing from {len(files)} files")
 
     count = 0
-    key_func = lambda r: (
-        r['domain_label'], r['template_name'],
-        r['reference_normalized_sha1'], r['offset_start'], r['parameter_key']
-    )
-    for batch in chunked_iterable(dedup_rows(files, key_func), BATCH_SIZE):
+    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
         # Resolve domain labels and template names to ids
         domain_labels = set(r['domain_label'] for r in batch)
         domain_to_id = {}
