@@ -1,5 +1,4 @@
 import os
-import re
 import subprocess
 import queue
 import time
@@ -13,59 +12,31 @@ load_dotenv()
 
 max_jobs = 8
 
+
 def sort_key(filepath):
-    # Sort by file size, smallest first
+    """Sort by file size, smallest first."""
     try:
         return os.path.getsize(filepath)
     except OSError:
         return float('inf')
 
-# Regex to parse a metrics line emitted by build_db.py's print_metrics().
-# Example:
-#   2026-03-10 21:00:00 [1/10] [metrics] elapsed=0h5m12s | queue=3/32 | parsers_done=2/4 | tables: articles=100, revisions=5000
-_METRICS_RE = re.compile(
-    r"(?P<prefix>\[.*?\])\s+"           # log-prefix like [1/10]
-    r"\[(?P<kind>[^\]]+)\]\s+"          # [metrics] or [final]
-    r"elapsed=(?P<elapsed>\S+)\s*\|\s*"
-    r"queue=(?P<queue>\S+)\s*\|\s*"
-    r"parsers_done=(?P<parsers>\S+)\s*\|\s*"
-    r"tables:\s*(?P<tables>.*)"
-)
-
-def parse_tables(tables_str):
-    """Parse 'key=val, key=val' into a dict of {str: int}."""
-    result = {}
-    if not tables_str or not tables_str.strip():
-        return result
-    for pair in tables_str.split(","):
-        pair = pair.strip()
-        if "=" in pair:
-            k, v = pair.split("=", 1)
-            try:
-                result[k.strip()] = int(v.strip())
-            except ValueError:
-                pass
-    return result
-
 
 class ProcessSlot:
     """Tracks a subprocess."""
-    def __init__(self, process, log_prefix, filepath):
+    def __init__(self, process, log_prefix, filepath, job_staging_dir):
         self.process = process
         self.log_prefix = log_prefix
         self.filepath = filepath
+        self.job_staging_dir = job_staging_dir
         self.finished = False
 
 
 def reader_thread(slot):
-    """Read stdout from a subprocess line-by-line, silencing metrics."""
+    """Read stdout from a subprocess line-by-line."""
     for raw in slot.process.stdout:
         line = raw.strip()
         if not line:
             continue
-        if _METRICS_RE.search(line):
-            continue
-        # Non-metrics output: print through with timestamp
         print(line, flush=True)
 
 
@@ -84,7 +55,8 @@ def main():
     parser.add_argument("-d", "--directory", required=True, help="Directory containing .mwrev.zst files")
     parser.add_argument("-o", "--staging-dir", default=os.environ.get('STAGING_DIR', './staging'),
                         help="Directory to write staged JSONL.zst files (default: STAGING_DIR env or ./staging)")
-    parser.add_argument("-j", "--jobs", type=int, default=max_jobs, help="Number of concurrent jobs/files to process (default: 8)")
+    parser.add_argument("-j", "--jobs", type=int, default=max_jobs,
+                        help="Number of concurrent jobs/files to process (default: 8)")
     parser.add_argument("--metrics-interval", type=float, default=float(os.environ.get("METRICS_INTERVAL", "10")),
                         help="Seconds between aggregated metrics prints (default: 10 or METRICS_INTERVAL env)")
     args = parser.parse_args()
@@ -99,6 +71,22 @@ def main():
         if os.path.isfile(os.path.join(directory, f)) and f.endswith('.mwrev.zst')
     ]
     files.sort(key=sort_key)
+
+    # Clean up incomplete shards (STARTED but not DONE)
+    if os.path.isdir(args.staging_dir):
+        for subdir in os.listdir(args.staging_dir):
+            subdir_path = os.path.join(args.staging_dir, subdir)
+            if not os.path.isdir(subdir_path):
+                continue
+            started = os.path.exists(os.path.join(subdir_path, 'STARTED.txt'))
+            done = os.path.exists(os.path.join(subdir_path, 'DONE.txt'))
+            if started and not done:
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [build_all] Clearing incomplete shard: {subdir}", flush=True)
+                for fname in os.listdir(subdir_path):
+                    if fname.endswith('.jsonl.zst'):
+                        os.remove(os.path.join(subdir_path, fname))
+                # Also remove stale STARTED.txt so it gets a fresh timestamp
+                os.remove(os.path.join(subdir_path, 'STARTED.txt'))
 
     all_slots = []
     finished_count = 0
@@ -119,7 +107,6 @@ def main():
 
         log_prefix = f"[{counter+1}/{len(files)}]"
         # Each job gets a subdirectory under the staging dir named after the input file
-        # Strip the full .mwrev.zst suffix (not just the last extension)
         basename = os.path.basename(file)
         for suffix in ('.mwrev.zst',):
             if basename.endswith(suffix):
@@ -128,19 +115,20 @@ def main():
         else:
             basename = os.path.splitext(basename)[0]
         job_staging_dir = os.path.join(args.staging_dir, basename)
+
+        # Skip already-completed shards
+        if os.path.exists(os.path.join(job_staging_dir, 'DONE.txt')):
+            print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {log_prefix} [skip] {file} (already done)", flush=True)
+            finished_count += 1
+            continue
+
         process = subprocess.Popen([
             "python3", "build_db.py", file,
             "-o", job_staging_dir,
-            "--parse-procs", os.environ.get("PARSE_PROCS", "4"),
-            "--write-procs", os.environ.get("WRITE_PROCS", "1"),
             "--batch-size", os.environ.get("BATCH_SIZE", "1000"),
-            "--queue-max", os.environ.get("QUEUE_MAX", "32"),
-            "--metrics-interval", os.environ.get("METRICS_INTERVAL", "5"),
-            "--log-prefix", log_prefix,
         ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
-        slot = ProcessSlot(process, log_prefix, file)
-        slot.job_staging_dir = job_staging_dir
+        slot = ProcessSlot(process, log_prefix, file, job_staging_dir)
         all_slots.append(slot)
         process_queue.put(slot)
 
@@ -179,10 +167,9 @@ def cleanup_finished_processes(process_queue, all_slots):
             slot.finished = True
             newly_done += 1
             # Write DONE.txt with current timestamp
-            if hasattr(slot, 'job_staging_dir') and slot.job_staging_dir:
-                os.makedirs(slot.job_staging_dir, exist_ok=True)
-                with open(os.path.join(slot.job_staging_dir, 'DONE.txt'), 'w') as f:
-                    f.write(datetime.now(timezone.utc).isoformat() + '\n')
+            os.makedirs(slot.job_staging_dir, exist_ok=True)
+            with open(os.path.join(slot.job_staging_dir, 'DONE.txt'), 'w') as f:
+                f.write(datetime.now(timezone.utc).isoformat() + '\n')
             # Release subprocess resources
             slot.process.stdout.close()
             slot.process.wait()

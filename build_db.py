@@ -1,38 +1,15 @@
 import io
-import bz2
 import json
 import os
 import sys
-import time
-import signal
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+import argparse
+from typing import Dict, Any
 from dotenv import load_dotenv
-import multiprocessing
-from multiprocessing import Queue, Event, Process
-from xml.etree import ElementTree
 import zstandard as zstd
-from sqlalchemy.exc import DBAPIError, OperationalError
 from refs_extractor.article import extract_references
 from refs_extractor.syntax import normalize_wikitext, get_sha1
 
-
-def _is_retryable_db_disconnect(exc: BaseException) -> bool:
-    """Return True for transient disconnects like 'SSL SYSCALL error: Socket is not connected'."""
-    if isinstance(exc, (OperationalError, DBAPIError)):
-        if getattr(exc, 'connection_invalidated', False):
-            return True
-        msg = str(getattr(exc, 'orig', exc))
-        retryable_substrings = (
-            'SSL SYSCALL error: Socket is not connected',
-            'could not receive data from server',
-            'server closed the connection unexpectedly',
-            'connection not open',
-            'terminating connection due to administrator command',
-            'remaining connection slots are reserved',
-        )
-        return any(s in msg for s in retryable_substrings)
-    return False
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # StagingWriter — writes JSONL compressed with zstandard to per-source files
@@ -73,37 +50,6 @@ class StagingWriter:
         self._compressors.clear()
 
 
-load_dotenv()
-
-# Defaults (overridable via CLI)
-BATCH_SIZE = 1000           # revisions per batch from parsers
-PARSE_PROCS = max(1, multiprocessing.cpu_count() - 1)
-WRITE_PROCS = 1             # staging writers
-QUEUE_MAX_BATCHES = 32      # backpressure capacity (batches)
-METRICS_INTERVAL = 120.0    # seconds
-
-
-@dataclass
-class Metrics:
-    # producer side
-    revisions_read: int = 0
-    batches_enqueued: int = 0
-    # consumer side
-    batches_dequeued: int = 0
-    revisions_committed: int = 0
-    per_table_rows: Dict[str, int] = field(default_factory=dict)
-    # housekeeping
-    start_ts: float = field(default_factory=time.time)
-    last_print_ts: float = field(default_factory=time.time)
-    last_revisions_read: int = 0
-    last_revisions_committed: int = 0
-
-def get_filenames(relative_path):
-    absolute_path = os.path.abspath(relative_path)
-    for dirpath, _, filenames in os.walk(absolute_path):
-        for filename in filenames:
-            yield os.path.join(dirpath, filename)
-
 def get_revisions_from_mwrev_zst(filename):
     """Stream and parse revisions from a .mwrev.zst file.
 
@@ -136,7 +82,6 @@ def get_revisions_from_mwrev_zst(filename):
                         meta[k.strip()] = v.strip() if v is not None else ''
 
                     page_id = int(meta.get('page_id')) if meta.get('page_id') else None
-                    # namespace id (ns) may be missing on some lines; store as None when absent
                     namespace_id = int(meta.get('ns')) if meta.get('ns') else None
                     rev_id = int(meta.get('rev_id')) if meta.get('rev_id') else None
                     parent_rev_id = meta.get('parent_rev_id')
@@ -155,12 +100,12 @@ def get_revisions_from_mwrev_zst(filename):
                 elif raw_line.startswith(' '):
                     text_lines.append(raw_line[1:].rstrip('\n'))
                 else:
-                    # Ignore any other lines (shouldn't normally occur)
                     continue
             # Flush last
             if current is not None:
                 current['revision_text'] = "\n".join(text_lines)
                 yield current
+
 
 def _normalize_template_name(raw: str) -> str:
     """Normalize a wiki template name: underscores to spaces, capitalize first letter."""
@@ -180,12 +125,12 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
     citations, citation_histories, normalized_citations = [], [], []
     revisions_rows = []
 
-    domains_rows = []  # {'value': ..., 'for_container': ...}
-    containers_rows = []  # {'label': ...}
-    documents_rows = []  # {'language_code': ..., 'has_container_label': ..., 'page_id': ...}
+    domains_rows = []
+    containers_rows = []
+    documents_rows = []
     web_resources_rows = []
-    ncwr_rows = []  # (reference_normalized_sha1, url)
-    wiki_template_rows = []  # {'domain_label': ..., 'name': ...}
+    ncwr_rows = []
+    wiki_template_rows = []
     template_data_rows = []
 
     # Emit container for this domain
@@ -353,201 +298,35 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
         }
     }
 
-def parser_worker(filelist: List[str], batch_size: int, out_q: Queue, stop_event: Event, metrics_q: Queue):
-    m = {'revisions_read': 0, 'batches_enqueued': 0}
-    try:
-        for filename in filelist:
-            if stop_event.is_set():
-                break
-            if not filename.endswith('.mwrev.zst'):
-                continue
-            # Derive source stem: strip .mwrev.zst (or any extension) from basename
-            source_stem = os.path.basename(filename)
-            if source_stem.endswith('.mwrev.zst'):
-                source_stem = source_stem[:-len('.mwrev.zst')]
-            batch = []
-            for revision in get_revisions_from_mwrev_zst(filename):
-                if stop_event.is_set():
-                    break
-                batch.append(revision)
-                m['revisions_read'] += 1
-                if len(batch) >= batch_size:
-                    out_q.put((source_stem, batch))
-                    m['batches_enqueued'] += 1
-                    batch = []
-            if batch:
-                out_q.put((source_stem, batch))
-                m['batches_enqueued'] += 1
-    finally:
-        # signal completion for this parser
-        metrics_q.put(('parser_done', m))
-
-
-def staging_worker(domain: str, staging_dir: str, in_q: Queue, stop_event: Event, metrics_q: Queue):
-    """Consume batches from the queue and write derived rows to staging files."""
-    staging = StagingWriter(staging_dir)
-    try:
-        while True:
-            if stop_event.is_set() and in_q.empty():
-                break
-            try:
-                source_stem, batch = in_q.get(timeout=0.5)
-            except Exception:
-                continue
-            result = process_revisions(batch, staging=staging, domain=domain, source_stem=source_stem)
-            metrics_q.put(('writer_batch', result))
-    finally:
-        staging.close()
-
-
-def chunk(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
-
-
-def run_pipeline(files: List[str], domain: str, parse_procs: int, write_procs: int, batch_size: int, queue_max: int, staging_dir: str, metrics_interval: float, log_prefix: str = ""):
-    # Bounded queue enforces backpressure from writers to parsers
-    q: Queue = multiprocessing.Queue(maxsize=queue_max)
-    metrics_q: Queue = multiprocessing.Queue()
-    stop_event = multiprocessing.Event()
-
-    # Assign files to parsers (simple round-robin chunks)
-    files_per_parser = max(1, (len(files) + parse_procs - 1) // parse_procs)
-    parser_files = list(chunk(files, files_per_parser))
-
-    parsers: List[Process] = []
-    for pf in parser_files[:parse_procs]:
-        p = multiprocessing.Process(target=parser_worker, args=(pf, batch_size, q, stop_event, metrics_q), daemon=True)
-        p.start()
-        parsers.append(p)
-
-    writers: List[Process] = []
-    for _ in range(write_procs):
-        w = multiprocessing.Process(target=staging_worker, args=(domain, staging_dir, q, stop_event, metrics_q), daemon=True)
-        w.start()
-        writers.append(w)
-
-    # Metrics aggregator/loop
-    total_parsers = len(parsers)
-    parsers_done = 0
-    agg = Metrics()
-
-    def _format_duration(seconds: float) -> str:
-        total = int(max(0, seconds))
-        days, rem = divmod(total, 24 * 3600)
-        hours, rem = divmod(rem, 3600)
-        minutes, secs = divmod(rem, 60)
-
-        parts = []
-        if days:
-            parts.append(f"{days}d")
-        if hours or parts:
-            parts.append(f"{hours}h")
-        if minutes or parts:
-            parts.append(f"{minutes}m")
-        parts.append(f"{secs}s")
-        return "".join(parts)
-
-    def print_metrics(prefix: str = "[metrics]"):
-        now = time.time()
-        elapsed = now - agg.start_ts
-        dt = max(1e-6, now - agg.last_print_ts)
-        agg.last_revisions_read = agg.revisions_read
-        agg.last_revisions_committed = agg.revisions_committed
-        try:
-            qsize = q.qsize()
-        except NotImplementedError:
-            qsize = -1
-        per_table = ", ".join(f"{k}={v}" for k, v in sorted(agg.per_table_rows.items()))
-        ts = time.strftime('%Y-%m-%d %H:%M:%S')
-        lp = f"{log_prefix} " if log_prefix else ""
-        print(
-            f"{ts} {lp}{prefix} elapsed={_format_duration(elapsed)} | queue={qsize}/{queue_max} | "
-            f"parsers_done={parsers_done}/{total_parsers} | tables: {per_table}",
-            flush=True,
-        )
-        agg.last_print_ts = now
-
-    try:
-        last_print = time.time()
-        while True:
-            # Drain metrics queue with a small timeout
-            try:
-                kind, payload = metrics_q.get(timeout=0.5)
-            except Exception:
-                kind = None
-                payload = None
-
-            if kind == 'parser_done':
-                parsers_done += 1
-                agg.revisions_read += payload.get('revisions_read', 0)
-                agg.batches_enqueued += payload.get('batches_enqueued', 0)
-            elif kind == 'writer_batch':
-                agg.batches_dequeued += 1
-                agg.revisions_committed += int(payload.get('revisions_committed') or 0)
-                for k, v in (payload.get('per_table_rows') or {}).items():
-                    agg.per_table_rows[k] = agg.per_table_rows.get(k, 0) + int(v or 0)
-
-            # Periodic printing
-            now = time.time()
-            if now - last_print >= metrics_interval:
-                print_metrics()
-                last_print = now
-
-            # Exit condition: all parsers finished AND queue drained
-            if parsers_done >= total_parsers:
-                try:
-                    empty = q.empty()
-                except NotImplementedError:
-                    # On some platforms q.empty is unreliable; rely on writers idle time after stop
-                    empty = False
-                if empty:
-                    break
-
-        # Signal writers to finish after queue drain
-        stop_event.set()
-
-    finally:
-        # Join all children
-        for p in parsers:
-            p.join(timeout=5)
-        for w in writers:
-            w.join(timeout=10)
-        print_metrics(prefix='[final]')
 
 def parse_args(argv=None):
-    import argparse
-    ap = argparse.ArgumentParser(description='Parse wiki revisions and stage derived rows as JSONL.zst files')
-    ap.add_argument('path', nargs='?', default='./sources/', help='File or directory containing .mwrev.zst')
-    ap.add_argument('-o', '--staging-dir', default=os.environ.get('STAGING_DIR', './staging'),
-                    help='Directory to write staged JSONL.zst files (default: STAGING_DIR env or ./staging)')
-    ap.add_argument('--domain', default='en.wikipedia.org', help='Wiki domain for curid URLs (default: en.wikipedia.org)')
-    ap.add_argument('--batch-size', type=int, default=BATCH_SIZE, help=f'Revisions per parsed batch (default: {BATCH_SIZE})')
-    ap.add_argument('--parse-procs', type=int, default=PARSE_PROCS, help=f'Parser processes (default: {PARSE_PROCS})')
-    ap.add_argument('--write-procs', type=int, default=WRITE_PROCS, help=f'Staging writer processes (default: {WRITE_PROCS})')
-    ap.add_argument('--queue-max', type=int, default=QUEUE_MAX_BATCHES, help=f'Max queued batches (default: {QUEUE_MAX_BATCHES})')
-    ap.add_argument('--metrics-interval', type=float, default=METRICS_INTERVAL, help=f'Seconds between metrics prints (default: {METRICS_INTERVAL})')
-    ap.add_argument('--log-prefix', default='', help='Prefix for log lines (e.g. [1/939])')
+    ap = argparse.ArgumentParser(description='Parse a single .mwrev.zst file and stage derived rows as JSONL.zst files')
+    ap.add_argument('file', help='Single .mwrev.zst file to process')
+    ap.add_argument('-o', '--staging-dir', required=True,
+                    help='Directory to write staged JSONL.zst files')
+    ap.add_argument('--domain', default='en.wikipedia.org',
+                    help='Wiki domain for curid URLs (default: en.wikipedia.org)')
+    ap.add_argument('--batch-size', type=int, default=1000,
+                    help='Revisions per processing batch (default: 1000)')
     return ap.parse_args(argv)
 
 
 if __name__ == '__main__':
     args = parse_args()
-    # Build file list
-    if os.path.isdir(args.path):
-        filenames = [os.path.join(args.path, f) for f in os.listdir(args.path) if f.endswith('.mwrev.zst')]
-        filenames.sort()
-    else:
-        filenames = [args.path]
 
-    run_pipeline(
-        files=filenames,
-        domain=args.domain,
-        parse_procs=max(1, int(args.parse_procs)),
-        write_procs=max(1, int(args.write_procs)),
-        batch_size=max(1, int(args.batch_size)),
-        queue_max=max(1, int(args.queue_max)),
-        staging_dir=args.staging_dir,
-        metrics_interval=float(args.metrics_interval),
-        log_prefix=args.log_prefix,
-    )
+    source_stem = os.path.basename(args.file)
+    if source_stem.endswith('.mwrev.zst'):
+        source_stem = source_stem[:-len('.mwrev.zst')]
+
+    staging = StagingWriter(args.staging_dir)
+
+    batch = []
+    for revision in get_revisions_from_mwrev_zst(args.file):
+        batch.append(revision)
+        if len(batch) >= args.batch_size:
+            process_revisions(batch, staging, domain=args.domain, source_stem=source_stem)
+            batch = []
+    if batch:
+        process_revisions(batch, staging, domain=args.domain, source_stem=source_stem)
+
+    staging.close()
