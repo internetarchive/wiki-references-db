@@ -3,8 +3,8 @@
 Phase 1.5: Consolidate & deduplicate staged JSONL.zst files across all shards.
 
 Reads per-shard staged files from STAGING_DIR, deduplicates using a temporary
-SQLite database (disk-backed, bounded memory), and writes consolidated
-deduplicated .jsonl.zst files to STAGING_DIR/deduped/.
+DuckDB database (disk-backed, optimised for bulk analytical operations), and
+writes consolidated deduplicated .jsonl.zst files to STAGING_DIR/deduped/.
 
 Usage:
     python dedup_staged.py [-d STAGING_DIR] [--shard-size N] [--batch-size N]
@@ -18,13 +18,13 @@ import io
 import json
 import glob
 import os
-import sqlite3
 import tempfile
 import time
 
 from dotenv import load_dotenv
 load_dotenv()
 
+import duckdb
 import zstandard as zstd
 
 
@@ -35,9 +35,9 @@ import zstandard as zstd
 STAGING_DIR = os.getenv('STAGING_DIR', './staging')
 DEDUPED_DIR_NAME = 'deduped'
 MAX_ROWS_PER_SHARD = int(os.getenv('DEDUP_SHARD_SIZE', '2_000_000'))
-DEDUP_BATCH_SIZE = int(os.getenv('DEDUP_BATCH_SIZE', '10_000'))
+DEDUP_BATCH_SIZE = int(os.getenv('DEDUP_BATCH_SIZE', '50_000'))
 
-# Dedup key columns per table — used to build the SQLite UNIQUE constraint.
+# Dedup key columns per table — used to build the DuckDB UNIQUE constraint.
 # Order matters: these must match the fields present in the staged JSONL rows.
 TABLE_KEYS = {
     'containers':             ['label'],
@@ -143,64 +143,107 @@ class ShardedWriter:
 
 
 # ---------------------------------------------------------------------------
-# SQLite-backed deduplication
+# DuckDB-backed deduplication
 # ---------------------------------------------------------------------------
 
-class SQLiteDedup:
-    """Disk-backed deduplication using a temporary SQLite database.
+class DuckDBDedup:
+    """Disk-backed deduplication using a temporary DuckDB database.
 
-    Uses INSERT OR IGNORE into a table with a UNIQUE constraint on the key
-    columns.  Rows are checked in batches for throughput.
+    Uses a bulk anti-join pattern optimised for DuckDB's columnar engine:
+    each batch is loaded into a staging table, new keys are identified via
+    NOT EXISTS, and then inserted into the ``seen`` table.
     """
 
     def __init__(self, table_name, key_columns):
         self.key_columns = key_columns
+        self.num_cols = len(key_columns)
         self.unique = 0
         self.dupes = 0
 
-        # Create temp file for the SQLite DB
+        # Create temp file for the DuckDB database
         fd, self.db_path = tempfile.mkstemp(
-            suffix='.db', prefix=f'dedup_{table_name}_'
+            suffix='.duckdb', prefix=f'dedup_{table_name}_'
         )
         os.close(fd)
+        os.unlink(self.db_path)  # let DuckDB create its own file
 
-        self.conn = sqlite3.connect(self.db_path)
-        self.conn.execute('PRAGMA journal_mode=WAL')
-        self.conn.execute('PRAGMA synchronous=OFF')
-        self.conn.execute('PRAGMA temp_store=MEMORY')
-        self.conn.execute('PRAGMA cache_size=-64000')  # 64 MB page cache
+        self.conn = duckdb.connect(self.db_path)
 
-        cols_def = ', '.join(f'c{i} TEXT' for i in range(len(key_columns)))
-        cols_list = ', '.join(f'c{i}' for i in range(len(key_columns)))
-        self.conn.execute(
-            f'CREATE TABLE seen ({cols_def}, UNIQUE({cols_list}))'
+        cols_def = ', '.join(f'c{i} VARCHAR' for i in range(self.num_cols))
+        self._cols_list = ', '.join(f'c{i}' for i in range(self.num_cols))
+        self._join_cond = ' AND '.join(
+            f'b.c{i} = s.c{i}' for i in range(self.num_cols)
         )
-        self._insert_sql = (
-            f'INSERT OR IGNORE INTO seen ({cols_list}) '
-            f'VALUES ({",".join("?" for _ in key_columns)})'
+
+        self.conn.execute(
+            f'CREATE TABLE seen ({cols_def}, UNIQUE({self._cols_list}))'
+        )
+        self.conn.execute(
+            f'CREATE TABLE batch_staging ({cols_def})'
         )
 
     def filter_batch(self, rows):
         """Accept a batch of rows; return only the ones not yet seen."""
+        if not rows:
+            return []
+
+        # 1. Bulk-load the batch into the staging table
+        batch_data = [
+            tuple(str(row.get(k, '')) for k in self.key_columns)
+            for row in rows
+        ]
+        self.conn.executemany(
+            f'INSERT INTO batch_staging VALUES '
+            f'({", ".join("?" for _ in range(self.num_cols))})',
+            batch_data,
+        )
+
+        # 2. Identify new *distinct* keys via anti-join.
+        #    DISTINCT ensures within-batch duplicates are collapsed so that
+        #    only one copy of each new key is kept (matching the old SQLite
+        #    INSERT OR IGNORE behaviour where the first occurrence wins).
+        new_keys_result = self.conn.execute(f"""
+            SELECT DISTINCT {self._cols_list} FROM batch_staging b
+            WHERE NOT EXISTS (
+                SELECT 1 FROM seen s WHERE {self._join_cond}
+            )
+        """).fetchall()
+
+        new_key_set = set(new_keys_result)
+
+        # 3. Insert the new keys into seen
+        if new_key_set:
+            self.conn.execute(f"""
+                INSERT INTO seen
+                SELECT DISTINCT {self._cols_list} FROM batch_staging b
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM seen s WHERE {self._join_cond}
+                )
+            """)
+
+        # 4. Truncate staging for next batch
+        self.conn.execute('DELETE FROM batch_staging')
+
+        # 5. Filter original rows — keep only the first occurrence per new key
         new_rows = []
-        cursor = self.conn.cursor()
+        seen_in_batch = set()
         for row in rows:
-            key_vals = tuple(str(row.get(k, '')) for k in self.key_columns)
-            cursor.execute(self._insert_sql, key_vals)
-            if cursor.rowcount == 1:
+            key = tuple(str(row.get(k, '')) for k in self.key_columns)
+            if key in new_key_set and key not in seen_in_batch:
                 new_rows.append(row)
-                self.unique += 1
-            else:
-                self.dupes += 1
-        self.conn.commit()
+                seen_in_batch.add(key)
+
+        self.unique += len(new_rows)
+        self.dupes += len(rows) - len(new_rows)
         return new_rows
 
     def close(self):
         self.conn.close()
-        try:
-            os.unlink(self.db_path)
-        except OSError:
-            pass
+        for suffix in ['', '.wal']:
+            try:
+                os.unlink(self.db_path + suffix)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +258,7 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
         return
 
     log(f"  {table_name}: reading {len(files)} file(s) …")
-    dedup = SQLiteDedup(table_name, key_columns)
+    dedup = DuckDBDedup(table_name, key_columns)
     writer = ShardedWriter(deduped_dir, table_name, max_rows=shard_size)
 
     batch = []
@@ -263,7 +306,7 @@ def main():
     )
     parser.add_argument(
         '--batch-size', type=int, default=DEDUP_BATCH_SIZE,
-        help=f'Rows per SQLite batch (default: {DEDUP_BATCH_SIZE})',
+        help=f'Rows per DuckDB dedup batch (default: {DEDUP_BATCH_SIZE})',
     )
     parser.add_argument(
         '--tables', nargs='*', default=None,

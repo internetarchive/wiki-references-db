@@ -59,7 +59,7 @@ build_all.py  →  dedup_staged.py  →  load_all.py
 
 **Phase 1 — Derive & Stage (`build_all.py` / `build_db.py`):** Reads `.mwrev.zst` revision bundles, extracts and normalizes references, and writes the derived rows as compressed JSONL files (`*.jsonl.zst`) into a staging directory. This phase is CPU-bound and does not touch the database.
 
-**Phase 1.5 — Deduplicate (`dedup_staged.py`):** Consolidates the per-bundle staged files across all shards, removes duplicate rows using an ephemeral SQLite index, and writes deduplicated shards into a `deduped/` subdirectory under the staging directory.
+**Phase 1.5 — Deduplicate (`dedup_staged.py`):** Consolidates the per-bundle staged files across all shards, removes duplicate rows using an ephemeral DuckDB database (optimised for bulk analytical deduplication), and writes deduplicated shards into a `deduped/` subdirectory under the staging directory.
 
 **Phase 2 — Load (`load_all.py`):** Reads the deduplicated JSONL files and bulk-inserts them into PostgreSQL, respecting foreign-key ordering. ON CONFLICT upserts handle residual duplicates or re-runs.
 
@@ -119,13 +119,13 @@ Parses a single `.mwrev.zst` file and writes derived rows as JSONL.zst files int
 
 ### `dedup_staged.py`
 
-Consolidates and deduplicates staged JSONL.zst files across all shards. Uses a temporary SQLite database to track seen keys per table.
+Consolidates and deduplicates staged JSONL.zst files across all shards. Uses a temporary DuckDB database to track seen keys per table.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-d, --staging-dir` | `STAGING_DIR` env or `./staging` | Staging directory to read from |
 | `--shard-size` | `DEDUP_SHARD_SIZE` env or `2000000` | Max rows per output shard file |
-| `--batch-size` | `DEDUP_BATCH_SIZE` env or `10000` | Rows per SQLite INSERT OR IGNORE batch |
+| `--batch-size` | `DEDUP_BATCH_SIZE` env or `50000` | Rows per DuckDB dedup batch |
 | `--tables` | all tables | Only dedup these tables (space-separated) |
 
 ### `load_all.py`
@@ -161,7 +161,7 @@ All environment variables are loaded from a `.env` file via `python-dotenv`. See
 | `BATCH_SIZE` | build_all → build_db | `1000` | Revisions per batch in build_db workers |
 | `METRICS_INTERVAL` | build_all | `10` | Seconds between status prints |
 | `DEDUP_SHARD_SIZE` | dedup_staged | `2000000` | Max rows per deduplicated output shard |
-| `DEDUP_BATCH_SIZE` | dedup_staged | `10000` | Rows per SQLite INSERT OR IGNORE batch |
+| `DEDUP_BATCH_SIZE` | dedup_staged | `50000` | Rows per DuckDB dedup batch |
 | `LOAD_BATCH_SIZE` | load_all | `5000` | Rows per INSERT batch when loading into Postgres |
 
 ## Revision Bundles

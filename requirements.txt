@@ -8,3 +8,4 @@ Flask
 Jinja2
 python-dotenv
 zstandard>=0.22.0
+duckdb>=1.0.0
