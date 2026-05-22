@@ -79,11 +79,11 @@ def read_jsonl_zst(filepath):
     dctx = zstd.ZstdDecompressor()
     with open(filepath, 'rb') as fh:
         with dctx.stream_reader(fh) as reader:
-            text_stream = io.TextIOWrapper(reader, encoding='utf-8')
-            for line in text_stream:
-                line = line.strip()
-                if line:
-                    yield json.loads(line)
+            raw = reader.read()
+    for line in raw.decode('utf-8').splitlines():
+        line = line.strip()
+        if line:
+            yield json.loads(line)
 
 
 def read_jsonl_zst_duckdb(filepath, conn):
