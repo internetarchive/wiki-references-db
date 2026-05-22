@@ -56,18 +56,18 @@ def read_jsonl_zst(filepath):
         compressed = fh.read()
     if not compressed:
         return
-    # decompress() is the most reliable single-call API; it fully
-    # decompresses the content in C without Python-level streaming issues.
-    # max_output_size is required when the frame doesn't advertise a size.
-    try:
-        raw = dctx.decompress(compressed, max_output_size=512 * 1024 * 1024)
-    except zstd.ZstdError:
-        # Fallback: use read_to_iter for multi-frame or unusual streams
-        raw = b''.join(dctx.read_to_iter(compressed))
+    # read_to_iter is the most reliable decompression API: it handles
+    # multi-frame streams and files of any size without needing to know
+    # the uncompressed size up front (unlike decompress()).
+    raw = b''.join(dctx.read_to_iter(compressed))
     for line in raw.decode('utf-8').splitlines():
         line = line.strip()
         if line:
-            yield json.loads(line)
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                log(f"warning: skipping malformed line in {filepath}: {line[:120]}")
+                continue
 
 
 def find_staging_files(staging_dir, table_name):
