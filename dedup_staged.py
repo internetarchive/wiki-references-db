@@ -2,9 +2,9 @@
 """
 Phase 1.5: Consolidate & deduplicate staged JSONL.zst files across all shards.
 
-Reads per-shard staged files from STAGING_DIR, deduplicates using a temporary
-DuckDB database (disk-backed, optimised for bulk analytical operations), and
-writes consolidated deduplicated .jsonl.zst files to STAGING_DIR/deduped/.
+Reads per-shard staged files from STAGING_DIR, deduplicates using hash
+partitioning (bounded memory, no external DB), and writes consolidated
+deduplicated .jsonl.zst files to STAGING_DIR/deduped/.
 
 Usage:
     python dedup_staged.py [-d STAGING_DIR] [--shard-size N] [--batch-size N]
@@ -26,7 +26,8 @@ load_dotenv()
 
 import datetime
 
-import duckdb
+import hashlib
+import struct
 import zstandard as zstd
 
 
@@ -44,8 +45,10 @@ STAGING_DIR = os.getenv('STAGING_DIR', './staging')
 DEDUPED_DIR_NAME = 'deduped'
 MAX_ROWS_PER_SHARD = int(os.getenv('DEDUP_SHARD_SIZE', '2_000_000'))
 DEDUP_BATCH_SIZE = int(os.getenv('DEDUP_BATCH_SIZE', '50_000'))
+DEDUP_NUM_PARTITIONS = int(os.getenv('DEDUP_NUM_PARTITIONS', '0'))  # 0 = auto
+DEDUP_ROWS_PER_PARTITION = int(os.getenv('DEDUP_ROWS_PER_PARTITION', '5_000_000'))
 
-# Dedup key columns per table — used to build the DuckDB UNIQUE constraint.
+# Dedup key columns per table.
 # Order matters: these must match the fields present in the staged JSONL rows.
 TABLE_KEYS = {
     'containers':             ['label'],
@@ -93,17 +96,6 @@ def read_jsonl_zst(filepath):
                 continue
 
 
-def read_jsonl_zst_duckdb(filepath, conn):
-    """Read a .jsonl.zst file using DuckDB's native JSONL reader.
-
-    Returns a list of dicts.  DuckDB handles decompression and parsing
-    in its vectorised engine, avoiding Python-side overhead.
-    """
-    result = conn.execute(
-        "SELECT * FROM read_json_auto(?)", [filepath]
-    ).fetchall()
-    columns = [desc[0] for desc in conn.description]
-    return [dict(zip(columns, row)) for row in result]
 
 
 def find_all_files(staging_dir, table_name, deduped_dir):
@@ -137,7 +129,7 @@ class ShardedWriter:
     def _shard_path(self):
         return os.path.join(
             self.deduped_dir,
-            f"{self.table_name}-{self.shard_idx:03d}.jsonl.zst",
+            f"{self.table_name}-{self.shard_idx:08d}.jsonl.zst",
         )
 
     def _open_new_shard(self):
@@ -188,109 +180,57 @@ class ShardedWriter:
 
 
 # ---------------------------------------------------------------------------
-# DuckDB-backed deduplication
+# Hash-partitioned deduplication
 # ---------------------------------------------------------------------------
 
-class DuckDBDedup:
-    """Disk-backed deduplication using a temporary DuckDB database.
+def _row_key(row, key_columns):
+    """Return the dedup key tuple for *row*."""
+    return tuple(str(row.get(k, '')) for k in key_columns)
 
-    Uses a bulk anti-join pattern optimised for DuckDB's columnar engine:
-    each batch is loaded into a staging table, new keys are identified via
-    NOT EXISTS, and then inserted into the ``seen`` table.
-    """
 
-    def __init__(self, table_name, key_columns):
-        self.key_columns = key_columns
-        self.num_cols = len(key_columns)
-        self.unique = 0
-        self.dupes = 0
+def _partition_index(key_tuple, num_partitions):
+    """Deterministically map a key tuple to a partition index [0, K)."""
+    h = hashlib.md5('\x00'.join(key_tuple).encode('utf-8')).digest()
+    return struct.unpack('<I', h[:4])[0] % num_partitions
 
-        # Create temp file for the DuckDB database
-        fd, self.db_path = tempfile.mkstemp(
-            suffix='.duckdb', prefix=f'dedup_{table_name}_'
-        )
-        os.close(fd)
-        os.unlink(self.db_path)  # let DuckDB create its own file
 
-        self.conn = duckdb.connect(self.db_path)
+class _PartitionWriter:
+    """Manages K temporary .jsonl.zst bucket files for hash partitioning."""
 
-        cols_def = ', '.join(f'c{i} VARCHAR' for i in range(self.num_cols))
-        self._cols_list = ', '.join(f'c{i}' for i in range(self.num_cols))
-        self._join_cond = ' AND '.join(
-            f'b.c{i} = s.c{i}' for i in range(self.num_cols)
-        )
+    def __init__(self, num_partitions, table_name):
+        self.num_partitions = num_partitions
+        self._tmpdir = tempfile.mkdtemp(prefix=f'dedup_{table_name}_')
+        self._files = []
+        self._writers = []
+        self._row_counts = [0] * num_partitions
+        for i in range(num_partitions):
+            path = os.path.join(self._tmpdir, f'part-{i:05d}.jsonl.zst')
+            fh = open(path, 'wb')
+            cctx = zstd.ZstdCompressor(level=1)
+            writer = cctx.stream_writer(fh)
+            self._files.append(fh)
+            self._writers.append(writer)
 
-        self.conn.execute(
-            f'CREATE TABLE seen ({cols_def}, UNIQUE({self._cols_list}))'
-        )
-        self.conn.execute(
-            f'CREATE TABLE batch_staging ({cols_def})'
-        )
-
-    def filter_batch(self, rows):
-        """Accept a batch of rows; return only the ones not yet seen."""
-        if not rows:
-            return []
-
-        # 1. Bulk-load the batch into the staging table
-        batch_data = [
-            tuple(str(row.get(k, '')) for k in self.key_columns)
-            for row in rows
-        ]
-        self.conn.executemany(
-            f'INSERT INTO batch_staging VALUES '
-            f'({", ".join("?" for _ in range(self.num_cols))})',
-            batch_data,
-        )
-
-        # 2. Identify new *distinct* keys via anti-join.
-        #    DISTINCT ensures within-batch duplicates are collapsed so that
-        #    only one copy of each new key is kept (matching the old SQLite
-        #    INSERT OR IGNORE behaviour where the first occurrence wins).
-        new_keys_result = self.conn.execute(f"""
-            SELECT DISTINCT {self._cols_list} FROM batch_staging b
-            WHERE NOT EXISTS (
-                SELECT 1 FROM seen s WHERE {self._join_cond}
-            )
-        """).fetchall()
-
-        new_key_set = set(new_keys_result)
-
-        # 3. Insert the new keys into seen
-        if new_key_set:
-            self.conn.execute(f"""
-                INSERT INTO seen
-                SELECT DISTINCT {self._cols_list} FROM batch_staging b
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM seen s WHERE {self._join_cond}
-                )
-            """)
-
-        # 4. Truncate staging for next batch
-        self.conn.execute('DROP TABLE batch_staging')
-        cols_def = ', '.join(f'c{i} VARCHAR' for i in range(self.num_cols))
-        self.conn.execute(f'CREATE TABLE batch_staging ({cols_def})')
-
-        # 5. Filter original rows — keep only the first occurrence per new key
-        new_rows = []
-        seen_in_batch = set()
-        for row in rows:
-            key = tuple(str(row.get(k, '')) for k in self.key_columns)
-            if key in new_key_set and key not in seen_in_batch:
-                new_rows.append(row)
-                seen_in_batch.add(key)
-
-        self.unique += len(new_rows)
-        self.dupes += len(rows) - len(new_rows)
-        return new_rows
+    def write(self, partition_idx, row):
+        line = json.dumps(row, ensure_ascii=False, default=_json_default) + '\n'
+        self._writers[partition_idx].write(line.encode('utf-8'))
+        self._row_counts[partition_idx] += 1
 
     def close(self):
-        self.conn.close()
-        for suffix in ['', '.wal']:
-            try:
-                os.unlink(self.db_path + suffix)
-            except OSError:
-                pass
+        for w in self._writers:
+            w.close()
+        for f in self._files:
+            f.close()
+
+    def partition_paths(self):
+        return [
+            os.path.join(self._tmpdir, f'part-{i:05d}.jsonl.zst')
+            for i in range(self.num_partitions)
+        ]
+
+    def cleanup(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +249,6 @@ def load_table(staging_dir, deduped_dir, table_name, shard_size):
         return
 
     log(f"  {table_name}: loading {len(files)} file(s) (no dedup) …")
-    conn = duckdb.connect(':memory:')
     writer = ShardedWriter(deduped_dir, table_name, max_rows=shard_size)
 
     file_count = 0
@@ -318,84 +257,119 @@ def load_table(staging_dir, deduped_dir, table_name, shard_size):
         if os.path.getsize(fp) == 0:
             continue
         try:
-            file_rows = read_jsonl_zst_duckdb(fp, conn)
-        except Exception:
-            try:
-                file_rows = list(read_jsonl_zst(fp))
-            except Exception as exc:
-                log(f"    {table_name}: skipping unreadable file {fp} — {exc}")
-                continue
+            file_rows = list(read_jsonl_zst(fp))
+        except Exception as exc:
+            log(f"    {table_name}: skipping unreadable file {fp} — {exc}")
+            continue
         writer.write_batch(file_rows)
         if file_count % 10 == 0:
             log(f"    {table_name}: loaded {file_count}/{len(files)} files …")
 
     total_rows, num_shards = writer.finish()
     log(f"  {table_name}: {total_rows} rows loaded → {num_shards} shard(s)")
-    conn.close()
+
+
+def _choose_num_partitions(total_rows, explicit_k, rows_per_partition):
+    """Return the number of hash partitions to use."""
+    if explicit_k > 0:
+        return explicit_k
+    # Auto: aim for rows_per_partition rows per bucket, minimum 1
+    k = max(1, (total_rows + rows_per_partition - 1) // rows_per_partition)
+    # Round up to next power of 2 for even hash distribution
+    p = 1
+    while p < k:
+        p <<= 1
+    return p
+
+
+def _count_rows_in_files(files):
+    """Quickly count total lines across all staged .jsonl.zst files."""
+    total = 0
+    dctx = zstd.ZstdDecompressor()
+    for fp in files:
+        if os.path.getsize(fp) == 0:
+            continue
+        try:
+            with open(fp, 'rb') as fh:
+                raw = b''.join(dctx.read_to_iter(fh.read()))
+            total += sum(1 for line in raw.split(b'\n') if line.strip())
+        except Exception:
+            pass
+    return total
 
 
 def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
-                shard_size, batch_size):
+                shard_size, batch_size, num_partitions=0,
+                rows_per_partition=DEDUP_ROWS_PER_PARTITION):
     files = find_all_files(staging_dir, table_name, deduped_dir)
     if not files:
         log(f"  {table_name}: no source files found, skipping")
         return
 
-    log(f"  {table_name}: reading {len(files)} file(s) …")
-    dedup = DuckDBDedup(table_name, key_columns)
-    writer = ShardedWriter(deduped_dir, table_name, max_rows=shard_size)
+    # --- Pass 0: estimate row count to choose K ---
+    log(f"  {table_name}: counting rows in {len(files)} file(s) …")
+    total_rows = _count_rows_in_files(files)
+    if total_rows == 0:
+        log(f"  {table_name}: no rows found, skipping")
+        return
+    K = _choose_num_partitions(total_rows, num_partitions, rows_per_partition)
+    log(f"  {table_name}: ~{total_rows} rows, using {K} hash partition(s)")
 
-    batch = []
+    # --- Pass 1: read files, intra-file dedup, hash-partition to buckets ---
+    log(f"  {table_name}: partitioning {len(files)} file(s) …")
+    pw = _PartitionWriter(K, table_name)
+    total_input = 0
+    total_after_intra = 0
     file_count = 0
     for fp in files:
         file_count += 1
-        # Skip empty files (e.g. 0-byte or header-only compressed files)
         if os.path.getsize(fp) == 0:
-            #log(f"    {table_name}: skipping empty file {fp}")
             continue
-        # Use DuckDB's native JSONL reader for vectorised decompression
-        # and parsing; fall back to Python reader on failure.
         try:
-            file_rows = read_jsonl_zst_duckdb(fp, dedup.conn)
-        except Exception:
-            try:
-                file_rows = list(read_jsonl_zst(fp))
-            except Exception as exc:
-                log(f"    {table_name}: skipping unreadable file {fp} — {exc}")
-                continue
-        # Intra-file dedup: remove duplicates within this file before
-        # adding to the batch — cheap O(n) set lookups that reduce the
-        # volume of data flowing through the DuckDB dedup pipeline.
+            file_rows = list(read_jsonl_zst(fp))
+        except Exception as exc:
+            log(f"    {table_name}: skipping unreadable file {fp} — {exc}")
+            continue
+        # Intra-file dedup
         seen_in_file = set()
-        unique_file_rows = []
         for row in file_rows:
-            key = tuple(str(row.get(k, '')) for k in key_columns)
+            total_input += 1
+            key = _row_key(row, key_columns)
             if key not in seen_in_file:
                 seen_in_file.add(key)
-                unique_file_rows.append(row)
-        batch.extend(unique_file_rows)
-        while len(batch) >= batch_size:
-            new_rows = dedup.filter_batch(batch[:batch_size])
-            writer.write_batch(new_rows)
-            batch = batch[batch_size:]
-        # Log progress every 10 files
+                pidx = _partition_index(key, K)
+                pw.write(pidx, row)
+                total_after_intra += 1
         if file_count % 10 == 0:
-            if batch:
-                new_rows = dedup.filter_batch(batch)
-                writer.write_batch(new_rows)
-                batch = []
-            log(f"    {table_name}: processed {file_count}/{len(files)} files, "
-                f"{dedup.unique} unique so far …")
+            log(f"    {table_name}: partitioned {file_count}/{len(files)} files …")
+    pw.close()
+    intra_dupes = total_input - total_after_intra
+    log(f"  {table_name}: pass 1 done — {total_after_intra} rows after "
+        f"intra-file dedup ({intra_dupes} intra-file dupes removed)")
 
-    # Flush remaining batch
-    if batch:
-        new_rows = dedup.filter_batch(batch)
-        writer.write_batch(new_rows)
+    # --- Pass 2: dedup each partition independently, write to output shards ---
+    log(f"  {table_name}: deduplicating {K} partition(s) …")
+    writer = ShardedWriter(deduped_dir, table_name, max_rows=shard_size)
+    cross_dupes = 0
+    for pidx, ppath in enumerate(pw.partition_paths()):
+        if not os.path.exists(ppath) or os.path.getsize(ppath) == 0:
+            continue
+        seen = set()
+        for row in read_jsonl_zst(ppath):
+            key = _row_key(row, key_columns)
+            if key not in seen:
+                seen.add(key)
+                writer.write_row(row)
+            else:
+                cross_dupes += 1
+        if (pidx + 1) % max(1, K // 10) == 0:
+            log(f"    {table_name}: deduped {pidx + 1}/{K} partitions …")
 
-    total_rows, num_shards = writer.finish()
-    log(f"  {table_name}: {total_rows} unique rows, {dedup.dupes} duplicates "
+    total_unique, num_shards = writer.finish()
+    total_dupes = intra_dupes + cross_dupes
+    log(f"  {table_name}: {total_unique} unique rows, {total_dupes} duplicates "
         f"removed → {num_shards} shard(s)")
-    dedup.close()
+    pw.cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +391,15 @@ def main():
     )
     parser.add_argument(
         '--batch-size', type=int, default=DEDUP_BATCH_SIZE,
-        help=f'Rows per DuckDB dedup batch (default: {DEDUP_BATCH_SIZE})',
+        help=f'Rows per dedup batch (default: {DEDUP_BATCH_SIZE})',
+    )
+    parser.add_argument(
+        '--num-partitions', type=int, default=DEDUP_NUM_PARTITIONS,
+        help='Number of hash partitions (0 = auto)',
+    )
+    parser.add_argument(
+        '--rows-per-partition', type=int, default=DEDUP_ROWS_PER_PARTITION,
+        help=f'Target rows per partition for auto K (default: {DEDUP_ROWS_PER_PARTITION})',
     )
     parser.add_argument(
         '--tables', nargs='*', default=None,
@@ -456,6 +438,8 @@ def main():
                     dedup_table, staging_dir, deduped_dir, table_name,
                     TABLE_KEYS[table_name],
                     shard_size=args.shard_size, batch_size=args.batch_size,
+                    num_partitions=args.num_partitions,
+                    rows_per_partition=args.rows_per_partition,
                 )
             futures[fut] = table_name
         for future in as_completed(futures):
