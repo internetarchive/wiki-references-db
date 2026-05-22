@@ -56,7 +56,6 @@ TABLE_KEYS = {
     'normalized_citations':   ['record_sha1'],
     'citations':              ['record_sha1', 'reference_raw_sha1'],
     'revisions':              ['revision_id'],
-    'citation_histories':     ['record_sha1', 'revision_id'],
     'ncwr':                   ['reference_normalized_sha1', 'url'],
     'template_data':          ['domain_label', 'template_name',
                                'reference_normalized_sha1', 'offset_start',
@@ -298,6 +297,43 @@ class DuckDBDedup:
 # Per-table dedup driver
 # ---------------------------------------------------------------------------
 
+# Tables whose staged rows are already unique — skip dedup, just consolidate.
+NO_DEDUP_TABLES = {'citation_histories'}
+
+
+def load_table(staging_dir, deduped_dir, table_name, shard_size):
+    """Consolidate staged files into sharded output without deduplication."""
+    files = find_all_files(staging_dir, table_name, deduped_dir)
+    if not files:
+        log(f"  {table_name}: no source files found, skipping")
+        return
+
+    log(f"  {table_name}: loading {len(files)} file(s) (no dedup) …")
+    conn = duckdb.connect(':memory:')
+    writer = ShardedWriter(deduped_dir, table_name, max_rows=shard_size)
+
+    file_count = 0
+    for fp in files:
+        file_count += 1
+        if os.path.getsize(fp) == 0:
+            continue
+        try:
+            file_rows = read_jsonl_zst_duckdb(fp, conn)
+        except Exception:
+            try:
+                file_rows = list(read_jsonl_zst(fp))
+            except Exception as exc:
+                log(f"    {table_name}: skipping unreadable file {fp} — {exc}")
+                continue
+        writer.write_batch(file_rows)
+        if file_count % 10 == 0:
+            log(f"    {table_name}: loaded {file_count}/{len(files)} files …")
+
+    total_rows, num_shards = writer.finish()
+    log(f"  {table_name}: {total_rows} rows loaded → {num_shards} shard(s)")
+    conn.close()
+
+
 def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
                 shard_size, batch_size):
     files = find_all_files(staging_dir, table_name, deduped_dir)
@@ -385,8 +421,9 @@ def main():
 
     deduped_dir = os.path.join(staging_dir, DEDUPED_DIR_NAME)
 
-    tables = args.tables or list(TABLE_KEYS.keys())
-    invalid = [t for t in tables if t not in TABLE_KEYS]
+    tables = args.tables or (list(TABLE_KEYS.keys()) + list(NO_DEDUP_TABLES))
+    all_tables = set(TABLE_KEYS.keys()) | NO_DEDUP_TABLES
+    invalid = [t for t in tables if t not in all_tables]
     if invalid:
         raise SystemExit(f"Unknown table(s): {', '.join(invalid)}")
 
@@ -397,14 +434,20 @@ def main():
     log(f"Processing {len(tables)} table(s) with {max_workers} worker(s)")
 
     with ProcessPoolExecutor(max_workers=max_workers) as pool:
-        futures = {
-            pool.submit(
-                dedup_table, staging_dir, deduped_dir, table_name,
-                TABLE_KEYS[table_name],
-                shard_size=args.shard_size, batch_size=args.batch_size,
-            ): table_name
-            for table_name in tables
-        }
+        futures = {}
+        for table_name in tables:
+            if table_name in NO_DEDUP_TABLES:
+                fut = pool.submit(
+                    load_table, staging_dir, deduped_dir, table_name,
+                    shard_size=args.shard_size,
+                )
+            else:
+                fut = pool.submit(
+                    dedup_table, staging_dir, deduped_dir, table_name,
+                    TABLE_KEYS[table_name],
+                    shard_size=args.shard_size, batch_size=args.batch_size,
+                )
+            futures[fut] = table_name
         for future in as_completed(futures):
             table_name = futures[future]
             try:
