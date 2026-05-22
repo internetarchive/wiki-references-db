@@ -20,6 +20,7 @@ import glob
 import os
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -75,6 +76,19 @@ def read_jsonl_zst(filepath):
                 line = line.strip()
                 if line:
                     yield json.loads(line)
+
+
+def read_jsonl_zst_duckdb(filepath, conn):
+    """Read a .jsonl.zst file using DuckDB's native JSONL reader.
+
+    Returns a list of dicts.  DuckDB handles decompression and parsing
+    in its vectorised engine, avoiding Python-side overhead.
+    """
+    result = conn.execute(
+        "SELECT * FROM read_json_auto(?)", [filepath]
+    ).fetchall()
+    columns = [desc[0] for desc in conn.description]
+    return [dict(zip(columns, row)) for row in result]
 
 
 def find_all_files(staging_dir, table_name, deduped_dir):
@@ -134,8 +148,24 @@ class ShardedWriter:
             self._open_new_shard()
 
     def write_batch(self, rows):
+        if not rows:
+            return
+        # Buffer the entire batch into a single bytes blob to reduce
+        # per-row write() syscall overhead.
+        buf = []
         for row in rows:
-            self.write_row(row)
+            buf.append(json.dumps(row, ensure_ascii=False))
+            self.rows_in_shard += 1
+            self.total_rows += 1
+            if self.rows_in_shard >= self.max_rows:
+                # Flush accumulated lines to current shard, then rotate
+                if buf:
+                    self._writer.write(('\n'.join(buf) + '\n').encode('utf-8'))
+                    buf = []
+                self.shard_idx += 1
+                self._open_new_shard()
+        if buf:
+            self._writer.write(('\n'.join(buf) + '\n').encode('utf-8'))
 
     def finish(self):
         self._close()
@@ -222,7 +252,9 @@ class DuckDBDedup:
             """)
 
         # 4. Truncate staging for next batch
-        self.conn.execute('DELETE FROM batch_staging')
+        self.conn.execute('DROP TABLE batch_staging')
+        cols_def = ', '.join(f'c{i} VARCHAR' for i in range(self.num_cols))
+        self.conn.execute(f'CREATE TABLE batch_staging ({cols_def})')
 
         # 5. Filter original rows — keep only the first occurrence per new key
         new_rows = []
@@ -265,12 +297,17 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
     file_count = 0
     for fp in files:
         file_count += 1
-        for row in read_jsonl_zst(fp):
-            batch.append(row)
-            if len(batch) >= batch_size:
-                new_rows = dedup.filter_batch(batch)
-                writer.write_batch(new_rows)
-                batch = []
+        # Use DuckDB's native JSONL reader for vectorised decompression
+        # and parsing; fall back to Python reader on failure.
+        try:
+            file_rows = read_jsonl_zst_duckdb(fp, dedup.conn)
+        except Exception:
+            file_rows = list(read_jsonl_zst(fp))
+        batch.extend(file_rows)
+        while len(batch) >= batch_size:
+            new_rows = dedup.filter_batch(batch[:batch_size])
+            writer.write_batch(new_rows)
+            batch = batch[batch_size:]
         # Log progress every 50 files
         if file_count % 50 == 0:
             if batch:
@@ -332,11 +369,25 @@ def main():
     log(f"Deduplicating staged files in {staging_dir} → {deduped_dir}")
     t0 = time.time()
 
-    for table_name in tables:
-        dedup_table(
-            staging_dir, deduped_dir, table_name, TABLE_KEYS[table_name],
-            shard_size=args.shard_size, batch_size=args.batch_size,
-        )
+    max_workers = min(len(tables), os.cpu_count() or 1)
+    log(f"Processing {len(tables)} table(s) with {max_workers} worker(s)")
+
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(
+                dedup_table, staging_dir, deduped_dir, table_name,
+                TABLE_KEYS[table_name],
+                shard_size=args.shard_size, batch_size=args.batch_size,
+            ): table_name
+            for table_name in tables
+        }
+        for future in as_completed(futures):
+            table_name = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                log(f"  {table_name}: FAILED — {exc}")
+                raise
 
     elapsed = time.time() - t0
     log(f"Done. Total elapsed: {elapsed:.1f}s")
