@@ -273,6 +273,10 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
                 batch = []
         # Log progress every 50 files
         if file_count % 50 == 0:
+            if batch:
+                new_rows = dedup.filter_batch(batch)
+                writer.write_batch(new_rows)
+                batch = []
             log(f"    {table_name}: processed {file_count}/{len(files)} files, "
                 f"{dedup.unique} unique so far …")
 
