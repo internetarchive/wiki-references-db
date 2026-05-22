@@ -307,7 +307,7 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
         file_count += 1
         # Skip empty files (e.g. 0-byte or header-only compressed files)
         if os.path.getsize(fp) == 0:
-            log(f"    {table_name}: skipping empty file {fp}")
+            #log(f"    {table_name}: skipping empty file {fp}")
             continue
         # Use DuckDB's native JSONL reader for vectorised decompression
         # and parsing; fall back to Python reader on failure.
