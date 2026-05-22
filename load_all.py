@@ -53,9 +53,15 @@ BATCH_SIZE = int(os.getenv('LOAD_BATCH_SIZE', '5000'))
 def read_jsonl_zst(filepath):
     """Yield dicts from a .jsonl.zst file."""
     dctx = zstd.ZstdDecompressor()
+    chunks = []
     with open(filepath, 'rb') as fh:
         with dctx.stream_reader(fh) as reader:
-            raw = reader.read()
+            while True:
+                chunk = reader.read(16384)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+    raw = b''.join(chunks)
     for line in raw.decode('utf-8').splitlines():
         line = line.strip()
         if line:
