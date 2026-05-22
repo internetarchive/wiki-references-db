@@ -363,7 +363,17 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
             except Exception as exc:
                 log(f"    {table_name}: skipping unreadable file {fp} — {exc}")
                 continue
-        batch.extend(file_rows)
+        # Intra-file dedup: remove duplicates within this file before
+        # adding to the batch — cheap O(n) set lookups that reduce the
+        # volume of data flowing through the DuckDB dedup pipeline.
+        seen_in_file = set()
+        unique_file_rows = []
+        for row in file_rows:
+            key = tuple(str(row.get(k, '')) for k in key_columns)
+            if key not in seen_in_file:
+                seen_in_file.add(key)
+                unique_file_rows.append(row)
+        batch.extend(unique_file_rows)
         while len(batch) >= batch_size:
             new_rows = dedup.filter_batch(batch[:batch_size])
             writer.write_batch(new_rows)
