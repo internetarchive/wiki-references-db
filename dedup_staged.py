@@ -14,7 +14,6 @@ Pipeline:
 """
 
 import argparse
-import io
 import json
 import glob
 import os
@@ -77,15 +76,18 @@ def log(msg):
 def read_jsonl_zst(filepath):
     """Yield dicts from a .jsonl.zst file."""
     dctx = zstd.ZstdDecompressor()
-    chunks = []
     with open(filepath, 'rb') as fh:
-        with dctx.stream_reader(fh) as reader:
-            while True:
-                chunk = reader.read(16384)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-    raw = b''.join(chunks)
+        compressed = fh.read()
+    if not compressed:
+        return
+    # decompress() is the most reliable single-call API; it fully
+    # decompresses the content in C without Python-level streaming issues.
+    # max_output_size is required when the frame doesn't advertise a size.
+    try:
+        raw = dctx.decompress(compressed, max_output_size=512 * 1024 * 1024)
+    except zstd.ZstdError:
+        # Fallback: use read_to_iter for multi-frame or unusual streams
+        raw = b''.join(dctx.read_to_iter(compressed))
     for line in raw.decode('utf-8').splitlines():
         line = line.strip()
         if line:
