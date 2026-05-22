@@ -324,8 +324,8 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
             new_rows = dedup.filter_batch(batch[:batch_size])
             writer.write_batch(new_rows)
             batch = batch[batch_size:]
-        # Log progress every 50 files
-        if file_count % 50 == 0:
+        # Log progress every 10 files
+        if file_count % 10 == 0:
             if batch:
                 new_rows = dedup.filter_batch(batch)
                 writer.write_batch(new_rows)
