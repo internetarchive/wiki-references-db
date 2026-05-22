@@ -305,12 +305,20 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
     file_count = 0
     for fp in files:
         file_count += 1
+        # Skip empty files (e.g. 0-byte or header-only compressed files)
+        if os.path.getsize(fp) == 0:
+            log(f"    {table_name}: skipping empty file {fp}")
+            continue
         # Use DuckDB's native JSONL reader for vectorised decompression
         # and parsing; fall back to Python reader on failure.
         try:
             file_rows = read_jsonl_zst_duckdb(fp, dedup.conn)
         except Exception:
-            file_rows = list(read_jsonl_zst(fp))
+            try:
+                file_rows = list(read_jsonl_zst(fp))
+            except Exception as exc:
+                log(f"    {table_name}: skipping unreadable file {fp} — {exc}")
+                continue
         batch.extend(file_rows)
         while len(batch) >= batch_size:
             new_rows = dedup.filter_batch(batch[:batch_size])
