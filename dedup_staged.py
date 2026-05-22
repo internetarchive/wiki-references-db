@@ -25,8 +25,16 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dotenv import load_dotenv
 load_dotenv()
 
+import datetime
+
 import duckdb
 import zstandard as zstd
+
+
+def _json_default(obj):
+    if isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +147,7 @@ class ShardedWriter:
             self._fh.close()
 
     def write_row(self, row: dict):
-        line = json.dumps(row, ensure_ascii=False) + '\n'
+        line = json.dumps(row, ensure_ascii=False, default=_json_default) + '\n'
         self._writer.write(line.encode('utf-8'))
         self.rows_in_shard += 1
         self.total_rows += 1
@@ -154,7 +162,7 @@ class ShardedWriter:
         # per-row write() syscall overhead.
         buf = []
         for row in rows:
-            buf.append(json.dumps(row, ensure_ascii=False))
+            buf.append(json.dumps(row, ensure_ascii=False, default=_json_default))
             self.rows_in_shard += 1
             self.total_rows += 1
             if self.rows_in_shard >= self.max_rows:
