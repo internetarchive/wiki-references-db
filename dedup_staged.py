@@ -287,20 +287,25 @@ def _choose_num_partitions(total_rows, explicit_k, rows_per_partition):
     return p
 
 
-def _count_rows_in_files(files):
-    """Quickly count total lines across all staged .jsonl.zst files."""
-    total = 0
-    dctx = zstd.ZstdDecompressor()
-    for fp in files:
-        if os.path.getsize(fp) == 0:
-            continue
-        try:
-            with open(fp, 'rb') as fh:
-                raw = b''.join(dctx.read_to_iter(fh.read()))
-            total += sum(1 for line in raw.split(b'\n') if line.strip())
-        except Exception:
-            pass
-    return total
+def _count_rows_in_file(fp):
+    """Worker: count lines in a single .jsonl.zst file."""
+    if os.path.getsize(fp) == 0:
+        return 0
+    try:
+        dctx = zstd.ZstdDecompressor()
+        with open(fp, 'rb') as fh:
+            raw = b''.join(dctx.read_to_iter(fh.read()))
+        return sum(1 for line in raw.split(b'\n') if line.strip())
+    except Exception:
+        return 0
+
+
+def _count_rows_in_files(files, num_workers=1):
+    """Count total lines across all staged .jsonl.zst files."""
+    if num_workers <= 1 or len(files) <= 1:
+        return sum(_count_rows_in_file(fp) for fp in files)
+    with ProcessPoolExecutor(max_workers=min(num_workers, len(files))) as pool:
+        return sum(pool.map(_count_rows_in_file, files))
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +371,7 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
 
     # --- Pass 0: estimate row count to choose K ---
     log(f"  {table_name}: counting rows in {len(files)} file(s) …")
-    total_rows = _count_rows_in_files(files)
+    total_rows = _count_rows_in_files(files, num_workers=num_workers)
     if total_rows == 0:
         log(f"  {table_name}: no rows found, skipping")
         return
