@@ -72,6 +72,42 @@ def log(msg):
     print(f"{ts} [dedup] {msg}", flush=True)
 
 
+def _done_marker_path(deduped_dir, table_name):
+    """Return the path to the DONE marker file for a table."""
+    return os.path.join(deduped_dir, f'DONE_{table_name}.txt')
+
+
+def _is_table_done(deduped_dir, table_name):
+    """Check whether a table has already been fully deduped."""
+    return os.path.exists(_done_marker_path(deduped_dir, table_name))
+
+
+def _mark_table_done(deduped_dir, table_name):
+    """Write a DONE marker file with the current timestamp."""
+    os.makedirs(deduped_dir, exist_ok=True)
+    marker = _done_marker_path(deduped_dir, table_name)
+    with open(marker, 'w') as f:
+        f.write(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S') + '\n')
+    log(f"  {table_name}: marked as done → {marker}")
+
+
+def _clean_partial_table(staging_dir, deduped_dir, table_name):
+    """Remove any partial deduped output and intermediate files for a table."""
+    # Remove deduped shards for this table
+    pattern = os.path.join(deduped_dir, f'{table_name}-*.jsonl.zst')
+    for fp in glob.glob(pattern):
+        os.remove(fp)
+        log(f"  {table_name}: removed partial deduped file {os.path.basename(fp)}")
+    # Remove intermediate dirs for this table
+    intermediate_base = os.path.join(staging_dir, 'intermediate')
+    if os.path.isdir(intermediate_base):
+        for entry in os.listdir(intermediate_base):
+            if entry.startswith(f'dedup_{table_name}_'):
+                path = os.path.join(intermediate_base, entry)
+                shutil.rmtree(path, ignore_errors=True)
+                log(f"  {table_name}: removed intermediate dir {entry}")
+
+
 # ---------------------------------------------------------------------------
 # I/O helpers
 # ---------------------------------------------------------------------------
@@ -575,6 +611,13 @@ def main():
     t0 = time.time()
 
     for table_name in tables:
+        if _is_table_done(deduped_dir, table_name):
+            log(f"  {table_name}: already done, skipping")
+            continue
+
+        # Clean up any partial results from a previous incomplete run
+        _clean_partial_table(staging_dir, deduped_dir, table_name)
+
         try:
             if table_name in NO_DEDUP_TABLES:
                 load_table(staging_dir, deduped_dir, table_name,
@@ -587,6 +630,7 @@ def main():
                             num_partitions=args.num_partitions,
                             rows_per_partition=args.rows_per_partition,
                             num_workers=num_workers)
+            _mark_table_done(deduped_dir, table_name)
         except Exception as exc:
             log(f"  {table_name}: FAILED — {exc}")
             raise
