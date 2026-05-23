@@ -95,21 +95,89 @@ def _mark_table_done(deduped_dir, table_name):
     log(f"  {table_name}: marked as done → {marker}")
 
 
+def _phase_marker_path(deduped_dir, table_name, phase):
+    """Return the path to the phase-level DONE marker file."""
+    return os.path.join(deduped_dir, f'DONE_{table_name}_phase{phase}.txt')
+
+
+def _is_phase_done(deduped_dir, table_name, phase):
+    """Check whether a phase has already been completed."""
+    return os.path.exists(_phase_marker_path(deduped_dir, table_name, phase))
+
+
+def _mark_phase_done(deduped_dir, table_name, phase, stats=None):
+    """Write a phase-level DONE marker with timestamp and optional stats."""
+    os.makedirs(deduped_dir, exist_ok=True)
+    marker = _phase_marker_path(deduped_dir, table_name, phase)
+    with open(marker, 'w') as f:
+        f.write(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S') + '\n')
+        if stats:
+            for k, v in stats.items():
+                f.write(f'{k}: {v}\n')
+    log(f"  {table_name}: phase {phase} marked as done → {marker}")
+
+
+def _read_phase_stats(deduped_dir, table_name, phase):
+    """Read stats from a phase marker file. Returns a dict of key-value pairs."""
+    marker = _phase_marker_path(deduped_dir, table_name, phase)
+    stats = {}
+    if not os.path.exists(marker):
+        return stats
+    with open(marker, 'r') as f:
+        lines = f.readlines()
+    for line in lines[1:]:  # skip timestamp line
+        line = line.strip()
+        if ': ' in line:
+            k, v = line.split(': ', 1)
+            try:
+                stats[k] = int(v)
+            except ValueError:
+                stats[k] = v
+    return stats
+
+
 def _clean_partial_table(staging_dir, deduped_dir, table_name):
-    """Remove any partial deduped output and intermediate files for a table."""
-    # Remove deduped shards for this table
+    """Remove partial deduped output and incomplete intermediate files.
+
+    Preserves intermediate data for phases that completed successfully
+    (have a DONE marker) so that a resumed run can skip them.
+    """
+    # Always remove final deduped shards — phase 3 was not completed
     pattern = os.path.join(deduped_dir, f'{table_name}-*.jsonl.zst')
     for fp in glob.glob(pattern):
         os.remove(fp)
         log(f"  {table_name}: removed partial deduped file {os.path.basename(fp)}")
-    # Remove intermediate dirs for this table
+
     intermediate_base = os.path.join(staging_dir, 'intermediate')
+    phase1_done = _is_phase_done(deduped_dir, table_name, 1)
+    phase2_done = _is_phase_done(deduped_dir, table_name, 2)
+
+    if not phase1_done:
+        # Phase 1 incomplete — clean its intermediate dir
+        intra_dir = os.path.join(intermediate_base, f'dedup_{table_name}_intra')
+        if os.path.isdir(intra_dir):
+            shutil.rmtree(intra_dir, ignore_errors=True)
+            log(f"  {table_name}: removed incomplete phase 1 intermediate dir")
+
+    if not phase2_done:
+        # Phase 2 incomplete — clean its merged dir and marker
+        merged_dir = os.path.join(intermediate_base, f'dedup_{table_name}_merged')
+        if os.path.isdir(merged_dir):
+            shutil.rmtree(merged_dir, ignore_errors=True)
+            log(f"  {table_name}: removed incomplete phase 2 intermediate dir")
+        marker = _phase_marker_path(deduped_dir, table_name, 2)
+        if os.path.exists(marker):
+            os.remove(marker)
+
+    # Also clean up any legacy random-suffix intermediate dirs
     if os.path.isdir(intermediate_base):
         for entry in os.listdir(intermediate_base):
-            if entry.startswith(f'dedup_{table_name}_'):
+            if entry.startswith(f'dedup_{table_name}_') and entry not in (
+                f'dedup_{table_name}_intra', f'dedup_{table_name}_merged',
+            ):
                 path = os.path.join(intermediate_base, entry)
                 shutil.rmtree(path, ignore_errors=True)
-                log(f"  {table_name}: removed intermediate dir {entry}")
+                log(f"  {table_name}: removed legacy intermediate dir {entry}")
 
 
 # ---------------------------------------------------------------------------
@@ -455,108 +523,166 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
     K = _choose_num_partitions(total_rows, num_partitions, rows_per_partition)
     log(f"  {table_name}: ~{total_rows} rows, using {K} hash partition(s)")
 
-    # Create a shared temp directory for all intermediate partition files
+    # Use deterministic intermediate directories so they survive restarts
     intermediate_base = os.path.join(staging_dir, 'intermediate')
     os.makedirs(intermediate_base, exist_ok=True)
-    tmp_dir = tempfile.mkdtemp(prefix=f'dedup_{table_name}_', dir=intermediate_base)
+    tmp_dir = os.path.join(intermediate_base, f'dedup_{table_name}_intra')
+    os.makedirs(tmp_dir, exist_ok=True)
+    merge_dir = os.path.join(intermediate_base, f'dedup_{table_name}_merged')
+    os.makedirs(merge_dir, exist_ok=True)
 
     # --- Phase 1: parallel intra-file dedup ---
-    log(f"  {table_name}: phase 1 — parallel intra-file dedup of "
-        f"{len(files)} file(s) with {num_workers} worker(s) …")
-    total_input = 0
-    total_after_intra = 0
-    all_partition_paths = []  # list of lists, one per file
-
-    phase1_workers = min(num_workers, len(files))
-    if phase1_workers <= 1:
-        # Sequential fallback for single worker
-        for fp in files:
-            _wait_for_memory(max_memory_pct, table_name)
-            inp, kept, paths = _dedup_single_file(
-                fp, key_columns, K, tmp_dir, table_name)
-            total_input += inp
-            total_after_intra += kept
-            if paths:
-                all_partition_paths.append(paths)
+    if _is_phase_done(deduped_dir, table_name, 1):
+        phase1_stats = _read_phase_stats(deduped_dir, table_name, 1)
+        total_input = phase1_stats.get('total_input', 0)
+        total_after_intra = phase1_stats.get('after_intra_dedup', 0)
+        intra_dupes = total_input - total_after_intra
+        log(f"  {table_name}: phase 1 already done, skipping "
+            f"({total_after_intra} rows after intra-file dedup)")
+        # Reconstruct all_partition_paths from existing intermediate files
+        all_partition_paths = []
+        # Discover partition files written by phase 1
+        for entry in sorted(os.listdir(tmp_dir)):
+            if entry.endswith('.jsonl.zst'):
+                # Files are named like: <source_basename>-part<pidx>.jsonl.zst
+                # We need to group them by source file
+                pass
+        # Simpler: just collect all partition files grouped by partition index
+        # (phase 2 only needs grouped[pidx] -> list of files)
+        grouped = {pidx: [] for pidx in range(K)}
+        for entry in sorted(os.listdir(tmp_dir)):
+            fp = os.path.join(tmp_dir, entry)
+            if entry.endswith('.jsonl.zst') and os.path.getsize(fp) > 0:
+                # Extract partition index from filename: *-part<NNNNN>.jsonl.zst
+                try:
+                    part_str = entry.rsplit('-part', 1)[1].replace('.jsonl.zst', '')
+                    pidx = int(part_str)
+                    grouped[pidx].append(fp)
+                except (IndexError, ValueError):
+                    pass
     else:
-        sem = threading.Semaphore(phase1_workers)
-        with ProcessPoolExecutor(max_workers=phase1_workers) as pool:
-            futures = {}
+        log(f"  {table_name}: phase 1 — parallel intra-file dedup of "
+            f"{len(files)} file(s) with {num_workers} worker(s) …")
+        total_input = 0
+        total_after_intra = 0
+        all_partition_paths = []  # list of lists, one per file
+
+        phase1_workers = min(num_workers, len(files))
+        if phase1_workers <= 1:
+            # Sequential fallback for single worker
             for fp in files:
                 _wait_for_memory(max_memory_pct, table_name)
-                sem.acquire()
-                fut = pool.submit(_dedup_single_file, fp, key_columns, K,
-                                  tmp_dir, table_name)
-                fut.add_done_callback(lambda f: sem.release())
-                futures[fut] = fp
-            done_count = 0
-            for fut in as_completed(futures):
-                inp, kept, paths = fut.result()
+                inp, kept, paths = _dedup_single_file(
+                    fp, key_columns, K, tmp_dir, table_name)
                 total_input += inp
                 total_after_intra += kept
                 if paths:
                     all_partition_paths.append(paths)
-                done_count += 1
-                if done_count % 10 == 0:
-                    log(f"    {table_name}: phase 1 — "
-                        f"{done_count}/{len(files)} files done …")
+        else:
+            sem = threading.Semaphore(phase1_workers)
+            with ProcessPoolExecutor(max_workers=phase1_workers) as pool:
+                futures = {}
+                for fp in files:
+                    _wait_for_memory(max_memory_pct, table_name)
+                    sem.acquire()
+                    fut = pool.submit(_dedup_single_file, fp, key_columns, K,
+                                      tmp_dir, table_name)
+                    fut.add_done_callback(lambda f: sem.release())
+                    futures[fut] = fp
+                done_count = 0
+                for fut in as_completed(futures):
+                    inp, kept, paths = fut.result()
+                    total_input += inp
+                    total_after_intra += kept
+                    if paths:
+                        all_partition_paths.append(paths)
+                    done_count += 1
+                    if done_count % 10 == 0:
+                        log(f"    {table_name}: phase 1 — "
+                            f"{done_count}/{len(files)} files done …")
 
-    intra_dupes = total_input - total_after_intra
-    log(f"  {table_name}: phase 1 done — {total_after_intra} rows after "
-        f"intra-file dedup ({intra_dupes} intra-file dupes removed)")
+        intra_dupes = total_input - total_after_intra
+        log(f"  {table_name}: phase 1 done — {total_after_intra} rows after "
+            f"intra-file dedup ({intra_dupes} intra-file dupes removed)")
+
+        _mark_phase_done(deduped_dir, table_name, 1, stats={
+            'total_input': total_input,
+            'after_intra_dedup': total_after_intra,
+            'intra_dupes_removed': intra_dupes,
+        })
+
+        # Build grouped for phase 2
+        grouped = {pidx: [] for pidx in range(K)}
+        for paths in all_partition_paths:
+            for pidx, ppath in enumerate(paths):
+                if os.path.exists(ppath) and os.path.getsize(ppath) > 0:
+                    grouped[pidx].append(ppath)
 
     # --- Phase 2: parallel cross-file dedup per partition ---
-    # Group intermediate files by partition index
-    grouped = {pidx: [] for pidx in range(K)}
-    for paths in all_partition_paths:
-        for pidx, ppath in enumerate(paths):
-            if os.path.exists(ppath) and os.path.getsize(ppath) > 0:
-                grouped[pidx].append(ppath)
-
-    # Create temp dir for merged partition outputs
-    merge_dir = tempfile.mkdtemp(prefix=f'dedup_{table_name}_merged_', dir=intermediate_base)
-
-    log(f"  {table_name}: phase 2 — parallel cross-file dedup of "
-        f"{K} partition(s) with {num_workers} worker(s) …")
-
-    phase2_workers = min(num_workers, K)
-    partition_outputs = {}  # pidx -> output_path
-    total_unique = 0
-
-    # Build tasks
-    tasks = []
-    for pidx in range(K):
-        if not grouped[pidx]:
-            continue
-        out_path = os.path.join(merge_dir, f'merged-{pidx:05d}.jsonl.zst')
-        partition_outputs[pidx] = out_path
-        tasks.append((pidx, grouped[pidx], key_columns, out_path))
-
-    if phase2_workers <= 1 or len(tasks) <= 1:
-        for pidx, flist, kcols, out_path in tasks:
-            _wait_for_memory(max_memory_pct, table_name)
-            count = _dedup_partition(pidx, flist, kcols, out_path)
-            total_unique += count
+    if _is_phase_done(deduped_dir, table_name, 2):
+        phase2_stats = _read_phase_stats(deduped_dir, table_name, 2)
+        total_unique = phase2_stats.get('total_unique', 0)
+        cross_dupes = phase2_stats.get('cross_dupes_removed', 0)
+        log(f"  {table_name}: phase 2 already done, skipping "
+            f"({total_unique} unique rows)")
+        # Reconstruct partition_outputs from existing merged files
+        partition_outputs = {}
+        for entry in sorted(os.listdir(merge_dir)):
+            fp = os.path.join(merge_dir, entry)
+            if entry.startswith('merged-') and entry.endswith('.jsonl.zst'):
+                try:
+                    pidx = int(entry.replace('merged-', '').replace('.jsonl.zst', ''))
+                    if os.path.getsize(fp) > 0:
+                        partition_outputs[pidx] = fp
+                except ValueError:
+                    pass
     else:
-        sem = threading.Semaphore(phase2_workers)
-        with ProcessPoolExecutor(max_workers=phase2_workers) as pool:
-            futures = {}
+        log(f"  {table_name}: phase 2 — parallel cross-file dedup of "
+            f"{K} partition(s) with {num_workers} worker(s) …")
+
+        phase2_workers = min(num_workers, K)
+        partition_outputs = {}  # pidx -> output_path
+        total_unique = 0
+
+        # Build tasks
+        tasks = []
+        for pidx in range(K):
+            if not grouped[pidx]:
+                continue
+            out_path = os.path.join(merge_dir, f'merged-{pidx:05d}.jsonl.zst')
+            partition_outputs[pidx] = out_path
+            tasks.append((pidx, grouped[pidx], key_columns, out_path))
+
+        if phase2_workers <= 1 or len(tasks) <= 1:
             for pidx, flist, kcols, out_path in tasks:
                 _wait_for_memory(max_memory_pct, table_name)
-                sem.acquire()
-                fut = pool.submit(_dedup_partition, pidx, flist, kcols, out_path)
-                fut.add_done_callback(lambda f: sem.release())
-                futures[fut] = pidx
-            done_count = 0
-            for fut in as_completed(futures):
-                count = fut.result()
+                count = _dedup_partition(pidx, flist, kcols, out_path)
                 total_unique += count
-                done_count += 1
-                if done_count % max(1, len(tasks) // 10) == 0:
-                    log(f"    {table_name}: phase 2 — "
-                        f"{done_count}/{len(tasks)} partitions done …")
+        else:
+            sem = threading.Semaphore(phase2_workers)
+            with ProcessPoolExecutor(max_workers=phase2_workers) as pool:
+                futures = {}
+                for pidx, flist, kcols, out_path in tasks:
+                    _wait_for_memory(max_memory_pct, table_name)
+                    sem.acquire()
+                    fut = pool.submit(_dedup_partition, pidx, flist, kcols, out_path)
+                    fut.add_done_callback(lambda f: sem.release())
+                    futures[fut] = pidx
+                done_count = 0
+                for fut in as_completed(futures):
+                    count = fut.result()
+                    total_unique += count
+                    done_count += 1
+                    if done_count % max(1, len(tasks) // 10) == 0:
+                        log(f"    {table_name}: phase 2 — "
+                            f"{done_count}/{len(tasks)} partitions done …")
 
-    cross_dupes = total_after_intra - total_unique
+        cross_dupes = total_after_intra - total_unique
+
+        _mark_phase_done(deduped_dir, table_name, 2, stats={
+            'total_unique': total_unique,
+            'cross_dupes_removed': cross_dupes,
+        })
 
     # --- Phase 3: write merged partitions into final sharded output ---
     log(f"  {table_name}: writing final shards …")
@@ -573,9 +699,13 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
     log(f"  {table_name}: {final_total} unique rows, {total_dupes} duplicates "
         f"removed → {num_shards} shard(s)")
 
-    # Cleanup temp files
+    # Cleanup intermediate files and phase markers
     shutil.rmtree(tmp_dir, ignore_errors=True)
     shutil.rmtree(merge_dir, ignore_errors=True)
+    for phase in (1, 2):
+        marker = _phase_marker_path(deduped_dir, table_name, phase)
+        if os.path.exists(marker):
+            os.remove(marker)
 
 
 # ---------------------------------------------------------------------------
