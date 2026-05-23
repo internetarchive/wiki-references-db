@@ -77,24 +77,36 @@ def log(msg):
 # ---------------------------------------------------------------------------
 
 def read_jsonl_zst(filepath):
-    """Yield dicts from a .jsonl.zst file."""
-    dctx = zstd.ZstdDecompressor()
-    with open(filepath, 'rb') as fh:
-        compressed = fh.read()
-    if not compressed:
+    """Yield dicts from a .jsonl.zst file (streaming, low memory)."""
+    if os.path.getsize(filepath) == 0:
         return
-    # read_to_iter is the most reliable decompression API: it handles
-    # multi-frame streams and files of any size without needing to know
-    # the uncompressed size up front (unlike decompress()).
-    raw = b''.join(dctx.read_to_iter(compressed))
-    for line in raw.decode('utf-8').splitlines():
-        line = line.strip()
-        if line:
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                log(f"warning: skipping malformed line in {filepath}: {line[:120]}")
-                continue
+    dctx = zstd.ZstdDecompressor()
+    leftover = b''
+    with open(filepath, 'rb') as fh:
+        reader = dctx.stream_reader(fh)
+        while True:
+            chunk = reader.read(1024 * 1024)  # 1 MiB at a time
+            if not chunk:
+                break
+            data = leftover + chunk
+            # Split on newlines; last piece may be incomplete
+            parts = data.split(b'\n')
+            leftover = parts.pop()  # keep incomplete trailing piece
+            for raw_line in parts:
+                raw_line = raw_line.strip()
+                if raw_line:
+                    try:
+                        yield json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        log(f"warning: skipping malformed line in {filepath}: {raw_line[:120]}")
+                        continue
+    # Handle any remaining data after EOF
+    if leftover and leftover.strip():
+        try:
+            yield json.loads(leftover)
+        except json.JSONDecodeError:
+            log(f"warning: skipping malformed line in {filepath}: {leftover[:120]}")
+            pass
 
 
 
@@ -288,14 +300,26 @@ def _choose_num_partitions(total_rows, explicit_k, rows_per_partition):
 
 
 def _count_rows_in_file(fp):
-    """Worker: count lines in a single .jsonl.zst file."""
+    """Worker: count lines in a single .jsonl.zst file (streaming)."""
     if os.path.getsize(fp) == 0:
         return 0
     try:
         dctx = zstd.ZstdDecompressor()
+        count = 0
+        leftover = b''
         with open(fp, 'rb') as fh:
-            raw = b''.join(dctx.read_to_iter(fh.read()))
-        return sum(1 for line in raw.split(b'\n') if line.strip())
+            reader = dctx.stream_reader(fh)
+            while True:
+                chunk = reader.read(1024 * 1024)
+                if not chunk:
+                    break
+                data = leftover + chunk
+                parts = data.split(b'\n')
+                leftover = parts.pop()
+                count += sum(1 for line in parts if line.strip())
+        if leftover and leftover.strip():
+            count += 1
+        return count
     except Exception:
         return 0
 
@@ -316,24 +340,24 @@ def _dedup_single_file(fp, key_columns, K, tmp_dir, table_name):
     """Worker: read one file, intra-file dedup, write K partition temp files."""
     if os.path.getsize(fp) == 0:
         return 0, 0, []
-    try:
-        file_rows = list(read_jsonl_zst(fp))
-    except Exception as exc:
-        log(f"    {table_name}: skipping unreadable file {fp} — {exc}")
-        return 0, 0, []
 
     pw = _PartitionWriter(K, table_name, base_dir=tmp_dir,
                           prefix=os.path.basename(fp))
     total_input = 0
     total_kept = 0
     seen = set()
-    for row in file_rows:
-        total_input += 1
-        key = _row_key(row, key_columns)
-        if key not in seen:
-            seen.add(key)
-            pw.write(_partition_index(key, K), row)
-            total_kept += 1
+    try:
+        for row in read_jsonl_zst(fp):
+            total_input += 1
+            key = _row_key(row, key_columns)
+            if key not in seen:
+                seen.add(key)
+                pw.write(_partition_index(key, K), row)
+                total_kept += 1
+    except Exception as exc:
+        log(f"    {table_name}: skipping unreadable file {fp} — {exc}")
+        pw.close()
+        return 0, 0, []
     pw.close()
     return total_input, total_kept, pw.partition_paths()
 
