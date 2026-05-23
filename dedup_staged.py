@@ -19,8 +19,11 @@ import glob
 import os
 import shutil
 import tempfile
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import psutil
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -48,6 +51,7 @@ MAX_ROWS_PER_SHARD = int(os.getenv('DEDUP_SHARD_SIZE', '2_000_000'))
 DEDUP_BATCH_SIZE = int(os.getenv('DEDUP_BATCH_SIZE', '50_000'))
 DEDUP_NUM_PARTITIONS = int(os.getenv('DEDUP_NUM_PARTITIONS', '0'))  # 0 = auto
 DEDUP_ROWS_PER_PARTITION = int(os.getenv('DEDUP_ROWS_PER_PARTITION', '5_000_000'))
+DEFAULT_MAX_MEMORY_PCT = int(os.getenv('DEDUP_MAX_MEMORY_PCT', '80'))
 
 # Dedup key columns per table.
 # Order matters: these must match the fields present in the staged JSONL rows.
@@ -421,10 +425,22 @@ def _dedup_partition(partition_idx, file_list, key_columns, output_path):
     return count
 
 
+def _wait_for_memory(threshold_pct, table_name=''):
+    """Block until system memory usage drops below *threshold_pct*."""
+    warned = False
+    while psutil.virtual_memory().percent > threshold_pct:
+        if not warned:
+            log(f"    {table_name}: memory at "
+                f"{psutil.virtual_memory().percent:.0f}% "
+                f"(threshold {threshold_pct}%), waiting …")
+            warned = True
+        time.sleep(2)
+
+
 def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
                 shard_size, batch_size, num_partitions=0,
                 rows_per_partition=DEDUP_ROWS_PER_PARTITION,
-                num_workers=1):
+                num_workers=1, max_memory_pct=DEFAULT_MAX_MEMORY_PCT):
     files = find_all_files(staging_dir, table_name, deduped_dir)
     if not files:
         log(f"  {table_name}: no source files found, skipping")
@@ -455,6 +471,7 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
     if phase1_workers <= 1:
         # Sequential fallback for single worker
         for fp in files:
+            _wait_for_memory(max_memory_pct, table_name)
             inp, kept, paths = _dedup_single_file(
                 fp, key_columns, K, tmp_dir, table_name)
             total_input += inp
@@ -462,12 +479,16 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
             if paths:
                 all_partition_paths.append(paths)
     else:
+        sem = threading.Semaphore(phase1_workers)
         with ProcessPoolExecutor(max_workers=phase1_workers) as pool:
-            futures = {
-                pool.submit(_dedup_single_file, fp, key_columns, K,
-                            tmp_dir, table_name): fp
-                for fp in files
-            }
+            futures = {}
+            for fp in files:
+                _wait_for_memory(max_memory_pct, table_name)
+                sem.acquire()
+                fut = pool.submit(_dedup_single_file, fp, key_columns, K,
+                                  tmp_dir, table_name)
+                fut.add_done_callback(lambda f: sem.release())
+                futures[fut] = fp
             done_count = 0
             for fut in as_completed(futures):
                 inp, kept, paths = fut.result()
@@ -513,14 +534,19 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
 
     if phase2_workers <= 1 or len(tasks) <= 1:
         for pidx, flist, kcols, out_path in tasks:
+            _wait_for_memory(max_memory_pct, table_name)
             count = _dedup_partition(pidx, flist, kcols, out_path)
             total_unique += count
     else:
+        sem = threading.Semaphore(phase2_workers)
         with ProcessPoolExecutor(max_workers=phase2_workers) as pool:
-            futures = {
-                pool.submit(_dedup_partition, pidx, flist, kcols, out_path): pidx
-                for pidx, flist, kcols, out_path in tasks
-            }
+            futures = {}
+            for pidx, flist, kcols, out_path in tasks:
+                _wait_for_memory(max_memory_pct, table_name)
+                sem.acquire()
+                fut = pool.submit(_dedup_partition, pidx, flist, kcols, out_path)
+                fut.add_done_callback(lambda f: sem.release())
+                futures[fut] = pidx
             done_count = 0
             for fut in as_completed(futures):
                 count = fut.result()
@@ -589,6 +615,10 @@ def main():
         '--workers', type=int, default=0,
         help='Number of parallel workers (default: cpu_count)',
     )
+    parser.add_argument(
+        '--max-memory-pct', type=int, default=DEFAULT_MAX_MEMORY_PCT,
+        help=f'Pause submitting new tasks when memory usage exceeds this percent (default: {DEFAULT_MAX_MEMORY_PCT})',
+    )
     args = parser.parse_args()
 
     staging_dir = os.path.abspath(args.staging_dir)
@@ -605,9 +635,12 @@ def main():
 
     num_workers = args.workers if args.workers > 0 else max(1, (os.cpu_count() or 1) - 2)
 
+    max_memory_pct = args.max_memory_pct
+
     log(f"Deduplicating staged files in {staging_dir} → {deduped_dir}")
     log(f"Processing {len(tables)} table(s) sequentially, "
-        f"up to {num_workers} worker(s) per table")
+        f"up to {num_workers} worker(s) per table, "
+        f"memory threshold {max_memory_pct}%")
     t0 = time.time()
 
     for table_name in tables:
@@ -629,7 +662,8 @@ def main():
                             batch_size=args.batch_size,
                             num_partitions=args.num_partitions,
                             rows_per_partition=args.rows_per_partition,
-                            num_workers=num_workers)
+                            num_workers=num_workers,
+                            max_memory_pct=max_memory_pct)
             _mark_table_done(deduped_dir, table_name)
         except Exception as exc:
             log(f"  {table_name}: FAILED — {exc}")
