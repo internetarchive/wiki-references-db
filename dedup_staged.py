@@ -213,6 +213,7 @@ class _PartitionWriter:
     def __init__(self, num_partitions, table_name, base_dir=None, prefix=''):
         self.num_partitions = num_partitions
         if base_dir:
+            os.makedirs(base_dir, exist_ok=True)
             self._tmpdir = tempfile.mkdtemp(prefix=f'{prefix}_', dir=base_dir)
             self._owns_tmpdir = True
         else:
@@ -403,7 +404,9 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
     log(f"  {table_name}: ~{total_rows} rows, using {K} hash partition(s)")
 
     # Create a shared temp directory for all intermediate partition files
-    tmp_dir = tempfile.mkdtemp(prefix=f'dedup_{table_name}_')
+    intermediate_base = os.path.join(staging_dir, 'intermediate')
+    os.makedirs(intermediate_base, exist_ok=True)
+    tmp_dir = tempfile.mkdtemp(prefix=f'dedup_{table_name}_', dir=intermediate_base)
 
     # --- Phase 1: parallel intra-file dedup ---
     log(f"  {table_name}: phase 1 — parallel intra-file dedup of "
@@ -454,7 +457,7 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
                 grouped[pidx].append(ppath)
 
     # Create temp dir for merged partition outputs
-    merge_dir = tempfile.mkdtemp(prefix=f'dedup_{table_name}_merged_')
+    merge_dir = tempfile.mkdtemp(prefix=f'dedup_{table_name}_merged_', dir=intermediate_base)
 
     log(f"  {table_name}: phase 2 — parallel cross-file dedup of "
         f"{K} partition(s) with {num_workers} worker(s) …")
