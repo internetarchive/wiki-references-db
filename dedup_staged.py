@@ -17,6 +17,7 @@ import argparse
 import json
 import glob
 import os
+import shutil
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -197,9 +198,14 @@ def _partition_index(key_tuple, num_partitions):
 class _PartitionWriter:
     """Manages K temporary .jsonl.zst bucket files for hash partitioning."""
 
-    def __init__(self, num_partitions, table_name):
+    def __init__(self, num_partitions, table_name, base_dir=None, prefix=''):
         self.num_partitions = num_partitions
-        self._tmpdir = tempfile.mkdtemp(prefix=f'dedup_{table_name}_')
+        if base_dir:
+            self._tmpdir = tempfile.mkdtemp(prefix=f'{prefix}_', dir=base_dir)
+            self._owns_tmpdir = True
+        else:
+            self._tmpdir = tempfile.mkdtemp(prefix=f'dedup_{table_name}_')
+            self._owns_tmpdir = True
         self._files = []
         self._writers = []
         self._row_counts = [0] * num_partitions
@@ -229,7 +235,6 @@ class _PartitionWriter:
         ]
 
     def cleanup(self):
-        import shutil
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
 
@@ -298,9 +303,62 @@ def _count_rows_in_files(files):
     return total
 
 
+# ---------------------------------------------------------------------------
+# Parallel worker functions (top-level for pickling)
+# ---------------------------------------------------------------------------
+
+def _dedup_single_file(fp, key_columns, K, tmp_dir, table_name):
+    """Worker: read one file, intra-file dedup, write K partition temp files."""
+    if os.path.getsize(fp) == 0:
+        return 0, 0, []
+    try:
+        file_rows = list(read_jsonl_zst(fp))
+    except Exception as exc:
+        log(f"    {table_name}: skipping unreadable file {fp} — {exc}")
+        return 0, 0, []
+
+    pw = _PartitionWriter(K, table_name, base_dir=tmp_dir,
+                          prefix=os.path.basename(fp))
+    total_input = 0
+    total_kept = 0
+    seen = set()
+    for row in file_rows:
+        total_input += 1
+        key = _row_key(row, key_columns)
+        if key not in seen:
+            seen.add(key)
+            pw.write(_partition_index(key, K), row)
+            total_kept += 1
+    pw.close()
+    return total_input, total_kept, pw.partition_paths()
+
+
+def _dedup_partition(partition_idx, file_list, key_columns, output_path):
+    """Worker: merge & dedup all intermediate files for one partition."""
+    seen = set()
+    cctx = zstd.ZstdCompressor(level=1)
+    with open(output_path, 'wb') as fh:
+        writer = cctx.stream_writer(fh)
+        count = 0
+        for fp in file_list:
+            if not os.path.exists(fp) or os.path.getsize(fp) == 0:
+                continue
+            for row in read_jsonl_zst(fp):
+                key = _row_key(row, key_columns)
+                if key not in seen:
+                    seen.add(key)
+                    line = json.dumps(row, ensure_ascii=False,
+                                      default=_json_default) + '\n'
+                    writer.write(line.encode('utf-8'))
+                    count += 1
+        writer.close()
+    return count
+
+
 def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
                 shard_size, batch_size, num_partitions=0,
-                rows_per_partition=DEDUP_ROWS_PER_PARTITION):
+                rows_per_partition=DEDUP_ROWS_PER_PARTITION,
+                num_workers=1):
     files = find_all_files(staging_dir, table_name, deduped_dir)
     if not files:
         log(f"  {table_name}: no source files found, skipping")
@@ -315,61 +373,115 @@ def dedup_table(staging_dir, deduped_dir, table_name, key_columns,
     K = _choose_num_partitions(total_rows, num_partitions, rows_per_partition)
     log(f"  {table_name}: ~{total_rows} rows, using {K} hash partition(s)")
 
-    # --- Pass 1: read files, intra-file dedup, hash-partition to buckets ---
-    log(f"  {table_name}: partitioning {len(files)} file(s) …")
-    pw = _PartitionWriter(K, table_name)
+    # Create a shared temp directory for all intermediate partition files
+    tmp_dir = tempfile.mkdtemp(prefix=f'dedup_{table_name}_')
+
+    # --- Phase 1: parallel intra-file dedup ---
+    log(f"  {table_name}: phase 1 — parallel intra-file dedup of "
+        f"{len(files)} file(s) with {num_workers} worker(s) …")
     total_input = 0
     total_after_intra = 0
-    file_count = 0
-    for fp in files:
-        file_count += 1
-        if os.path.getsize(fp) == 0:
-            continue
-        try:
-            file_rows = list(read_jsonl_zst(fp))
-        except Exception as exc:
-            log(f"    {table_name}: skipping unreadable file {fp} — {exc}")
-            continue
-        # Intra-file dedup
-        seen_in_file = set()
-        for row in file_rows:
-            total_input += 1
-            key = _row_key(row, key_columns)
-            if key not in seen_in_file:
-                seen_in_file.add(key)
-                pidx = _partition_index(key, K)
-                pw.write(pidx, row)
-                total_after_intra += 1
-        if file_count % 10 == 0:
-            log(f"    {table_name}: partitioned {file_count}/{len(files)} files …")
-    pw.close()
+    all_partition_paths = []  # list of lists, one per file
+
+    phase1_workers = min(num_workers, len(files))
+    if phase1_workers <= 1:
+        # Sequential fallback for single worker
+        for fp in files:
+            inp, kept, paths = _dedup_single_file(
+                fp, key_columns, K, tmp_dir, table_name)
+            total_input += inp
+            total_after_intra += kept
+            if paths:
+                all_partition_paths.append(paths)
+    else:
+        with ProcessPoolExecutor(max_workers=phase1_workers) as pool:
+            futures = {
+                pool.submit(_dedup_single_file, fp, key_columns, K,
+                            tmp_dir, table_name): fp
+                for fp in files
+            }
+            done_count = 0
+            for fut in as_completed(futures):
+                inp, kept, paths = fut.result()
+                total_input += inp
+                total_after_intra += kept
+                if paths:
+                    all_partition_paths.append(paths)
+                done_count += 1
+                if done_count % 10 == 0:
+                    log(f"    {table_name}: phase 1 — "
+                        f"{done_count}/{len(files)} files done …")
+
     intra_dupes = total_input - total_after_intra
-    log(f"  {table_name}: pass 1 done — {total_after_intra} rows after "
+    log(f"  {table_name}: phase 1 done — {total_after_intra} rows after "
         f"intra-file dedup ({intra_dupes} intra-file dupes removed)")
 
-    # --- Pass 2: dedup each partition independently, write to output shards ---
-    log(f"  {table_name}: deduplicating {K} partition(s) …")
-    writer = ShardedWriter(deduped_dir, table_name, max_rows=shard_size)
-    cross_dupes = 0
-    for pidx, ppath in enumerate(pw.partition_paths()):
-        if not os.path.exists(ppath) or os.path.getsize(ppath) == 0:
-            continue
-        seen = set()
-        for row in read_jsonl_zst(ppath):
-            key = _row_key(row, key_columns)
-            if key not in seen:
-                seen.add(key)
-                writer.write_row(row)
-            else:
-                cross_dupes += 1
-        if (pidx + 1) % max(1, K // 10) == 0:
-            log(f"    {table_name}: deduped {pidx + 1}/{K} partitions …")
+    # --- Phase 2: parallel cross-file dedup per partition ---
+    # Group intermediate files by partition index
+    grouped = {pidx: [] for pidx in range(K)}
+    for paths in all_partition_paths:
+        for pidx, ppath in enumerate(paths):
+            if os.path.exists(ppath) and os.path.getsize(ppath) > 0:
+                grouped[pidx].append(ppath)
 
-    total_unique, num_shards = writer.finish()
+    # Create temp dir for merged partition outputs
+    merge_dir = tempfile.mkdtemp(prefix=f'dedup_{table_name}_merged_')
+
+    log(f"  {table_name}: phase 2 — parallel cross-file dedup of "
+        f"{K} partition(s) with {num_workers} worker(s) …")
+
+    phase2_workers = min(num_workers, K)
+    partition_outputs = {}  # pidx -> output_path
+    total_unique = 0
+
+    # Build tasks
+    tasks = []
+    for pidx in range(K):
+        if not grouped[pidx]:
+            continue
+        out_path = os.path.join(merge_dir, f'merged-{pidx:05d}.jsonl.zst')
+        partition_outputs[pidx] = out_path
+        tasks.append((pidx, grouped[pidx], key_columns, out_path))
+
+    if phase2_workers <= 1 or len(tasks) <= 1:
+        for pidx, flist, kcols, out_path in tasks:
+            count = _dedup_partition(pidx, flist, kcols, out_path)
+            total_unique += count
+    else:
+        with ProcessPoolExecutor(max_workers=phase2_workers) as pool:
+            futures = {
+                pool.submit(_dedup_partition, pidx, flist, kcols, out_path): pidx
+                for pidx, flist, kcols, out_path in tasks
+            }
+            done_count = 0
+            for fut in as_completed(futures):
+                count = fut.result()
+                total_unique += count
+                done_count += 1
+                if done_count % max(1, len(tasks) // 10) == 0:
+                    log(f"    {table_name}: phase 2 — "
+                        f"{done_count}/{len(tasks)} partitions done …")
+
+    cross_dupes = total_after_intra - total_unique
+
+    # --- Phase 3: write merged partitions into final sharded output ---
+    log(f"  {table_name}: writing final shards …")
+    writer = ShardedWriter(deduped_dir, table_name, max_rows=shard_size)
+    for pidx in sorted(partition_outputs.keys()):
+        out_path = partition_outputs[pidx]
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            continue
+        for row in read_jsonl_zst(out_path):
+            writer.write_row(row)
+    final_total, num_shards = writer.finish()
+
     total_dupes = intra_dupes + cross_dupes
-    log(f"  {table_name}: {total_unique} unique rows, {total_dupes} duplicates "
+    log(f"  {table_name}: {final_total} unique rows, {total_dupes} duplicates "
         f"removed → {num_shards} shard(s)")
-    pw.cleanup()
+
+    # Cleanup temp files
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    shutil.rmtree(merge_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +517,10 @@ def main():
         '--tables', nargs='*', default=None,
         help='Only dedup these tables (default: all)',
     )
+    parser.add_argument(
+        '--workers', type=int, default=0,
+        help='Number of parallel workers (default: cpu_count)',
+    )
     args = parser.parse_args()
 
     staging_dir = os.path.abspath(args.staging_dir)
@@ -419,36 +535,29 @@ def main():
     if invalid:
         raise SystemExit(f"Unknown table(s): {', '.join(invalid)}")
 
+    num_workers = args.workers if args.workers > 0 else (os.cpu_count() or 1)
+
     log(f"Deduplicating staged files in {staging_dir} → {deduped_dir}")
+    log(f"Processing {len(tables)} table(s) sequentially, "
+        f"up to {num_workers} worker(s) per table")
     t0 = time.time()
 
-    max_workers = min(len(tables), os.cpu_count() or 1)
-    log(f"Processing {len(tables)} table(s) with {max_workers} worker(s)")
-
-    with ProcessPoolExecutor(max_workers=max_workers) as pool:
-        futures = {}
-        for table_name in tables:
+    for table_name in tables:
+        try:
             if table_name in NO_DEDUP_TABLES:
-                fut = pool.submit(
-                    load_table, staging_dir, deduped_dir, table_name,
-                    shard_size=args.shard_size,
-                )
+                load_table(staging_dir, deduped_dir, table_name,
+                           shard_size=args.shard_size)
             else:
-                fut = pool.submit(
-                    dedup_table, staging_dir, deduped_dir, table_name,
-                    TABLE_KEYS[table_name],
-                    shard_size=args.shard_size, batch_size=args.batch_size,
-                    num_partitions=args.num_partitions,
-                    rows_per_partition=args.rows_per_partition,
-                )
-            futures[fut] = table_name
-        for future in as_completed(futures):
-            table_name = futures[future]
-            try:
-                future.result()
-            except Exception as exc:
-                log(f"  {table_name}: FAILED — {exc}")
-                raise
+                dedup_table(staging_dir, deduped_dir, table_name,
+                            TABLE_KEYS[table_name],
+                            shard_size=args.shard_size,
+                            batch_size=args.batch_size,
+                            num_partitions=args.num_partitions,
+                            rows_per_partition=args.rows_per_partition,
+                            num_workers=num_workers)
+        except Exception as exc:
+            log(f"  {table_name}: FAILED — {exc}")
+            raise
 
     elapsed = time.time() - t0
     log(f"Done. Total elapsed: {elapsed:.1f}s")
