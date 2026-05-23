@@ -603,7 +603,7 @@ def main():
     if invalid:
         raise SystemExit(f"Unknown table(s): {', '.join(invalid)}")
 
-    num_workers = args.workers if args.workers > 0 else (os.cpu_count() or 1)
+    num_workers = args.workers if args.workers > 0 else max(1, (os.cpu_count() or 1) - 2)
 
     log(f"Deduplicating staged files in {staging_dir} → {deduped_dir}")
     log(f"Processing {len(tables)} table(s) sequentially, "
