@@ -8,7 +8,9 @@ MAX_LINES="${DEDUP_SHARD_SIZE:-2000000}"
 
 mkdir -p "$OUTPUT_DIR"
 
-cat "$STAGING_DIR"/*-${TABLE}.jsonl.zst \
+find "$STAGING_DIR" -name "*-${TABLE}.jsonl.zst" -not -path "*/deduped/*" -not -path "*/intermediate/*" -print0 \
+  | sort -z \
+  | xargs -0 cat \
   | zstd -dc \
   | jq -c '.' \
   | split -l "$MAX_LINES" -d -a 8 \
