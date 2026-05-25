@@ -10,6 +10,8 @@ Pipeline:
 Usage:
     python3 load_all.py -d ./staging
     python3 load_all.py  # uses STAGING_DIR from .env or default ./staging
+    python3 load_all.py --tables containers domains documents
+    python3 load_all.py --tables citation_histories  # load only citation_histories
 """
 
 import itertools
@@ -454,6 +456,25 @@ def main():
                         help='Staging directory (default: STAGING_DIR env or ./staging)')
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE,
                         help=f'Rows per INSERT batch (default: {BATCH_SIZE})')
+
+    all_phases = OrderedDict([
+        ('containers',          ('Phase 1:  containers',          lambda s, d, ctx: load_containers(s, d))),
+        ('domains',             ('Phase 2:  domains',             lambda s, d, ctx: load_domains(s, d))),
+        ('documents',           ('Phase 3:  documents',           lambda s, d, ctx: ctx.update(page_to_doc_id=load_documents(s, d)))),
+        ('web_resources',       ('Phase 4:  web_resources',       lambda s, d, ctx: load_web_resources(s, d, ctx.get('page_to_doc_id', {})))),
+        ('wiki_templates',      ('Phase 5:  wiki_templates',      lambda s, d, ctx: load_wiki_templates(s, d))),
+        ('normalized_citations',('Phase 6:  normalized_citations', lambda s, d, ctx: load_normalized_citations(s, d, ctx.get('page_to_doc_id', {})))),
+        ('citations',           ('Phase 7:  citations',           lambda s, d, ctx: load_citations(s, d))),
+        ('revisions',           ('Phase 8:  revisions',           lambda s, d, ctx: load_revisions(s, d))),
+        ('citation_histories',  ('Phase 9:  citation_histories',  lambda s, d, ctx: load_citation_histories(s, d))),
+        ('ncwr',                ('Phase 10: ncwr',                lambda s, d, ctx: load_ncwr(s, d))),
+        ('template_data',       ('Phase 11: template_data',       lambda s, d, ctx: load_template_data(s, d))),
+    ])
+
+    parser.add_argument('--tables', nargs='+', metavar='TABLE',
+                        choices=list(all_phases.keys()),
+                        help='Load only the specified table(s). '
+                             f'Choices: {" ".join(all_phases.keys())}')
     args = parser.parse_args()
 
     staging_dir = args.staging_dir
@@ -465,40 +486,15 @@ def main():
     session = Session()
     t0 = time.time()
 
+    phases_to_run = OrderedDict(
+        (k, all_phases[k]) for k in (args.tables if args.tables else all_phases)
+    )
+
     try:
-        # Load order respects foreign key dependencies
-        log("Phase 1: containers")
-        load_containers(session, staging_dir)
-
-        log("Phase 2: domains")
-        load_domains(session, staging_dir)
-
-        log("Phase 3: documents")
-        page_to_doc_id = load_documents(session, staging_dir)
-
-        log("Phase 4: web_resources")
-        load_web_resources(session, staging_dir, page_to_doc_id)
-
-        log("Phase 5: wiki_templates")
-        load_wiki_templates(session, staging_dir)
-
-        log("Phase 6: normalized_citations")
-        load_normalized_citations(session, staging_dir, page_to_doc_id)
-
-        log("Phase 7: citations")
-        load_citations(session, staging_dir)
-
-        log("Phase 8: revisions")
-        load_revisions(session, staging_dir)
-
-        log("Phase 9: citation_histories")
-        load_citation_histories(session, staging_dir)
-
-        log("Phase 10: ncwr")
-        load_ncwr(session, staging_dir)
-
-        log("Phase 11: template_data")
-        load_template_data(session, staging_dir)
+        ctx = {}  # shared context (e.g. page_to_doc_id) between phases
+        for name, (label, loader) in phases_to_run.items():
+            log(label)
+            loader(session, staging_dir, ctx)
 
         elapsed = time.time() - t0
         log(f"Done. Total elapsed: {elapsed:.1f}s")
