@@ -82,6 +82,7 @@ def find_staging_files(staging_dir, table_name):
 def stream_rows(filepaths):
     """Yield rows from multiple JSONL.zst files."""
     for fp in filepaths:
+        log(f"  reading {os.path.basename(fp)}")
         yield from read_jsonl_zst(fp)
 
 
