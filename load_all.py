@@ -27,7 +27,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import zstandard as zstd
-from sqlalchemy import create_engine, text, insert, select as sa_select
+from sqlalchemy import create_engine, text, select as sa_select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 from models import (
