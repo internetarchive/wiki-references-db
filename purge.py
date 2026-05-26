@@ -12,6 +12,11 @@ def main() -> None:
         help="Drop only the specified table (by SQLAlchemy model table name). "
              "If omitted, all tables are dropped.",
     )
+    parser.add_argument(
+        "--truncate",
+        action="store_true",
+        help="Delete all rows instead of dropping the table(s).",
+    )
     args = parser.parse_args()
 
     load_dotenv()
@@ -32,9 +37,18 @@ def main() -> None:
         if table is None:
             available = sorted(Base.metadata.tables.keys())
             parser.error(f"Unknown table '{args.table}'. Available tables: {', '.join(available)}")
-        table.drop(bind=Engine, checkfirst=True)
+        if args.truncate:
+            with Engine.begin() as conn:
+                conn.execute(table.delete())
+        else:
+            table.drop(bind=Engine, checkfirst=True)
     else:
-        Base.metadata.drop_all(Engine)
+        if args.truncate:
+            with Engine.begin() as conn:
+                for table in reversed(Base.metadata.sorted_tables):
+                    conn.execute(table.delete())
+        else:
+            Base.metadata.drop_all(Engine)
 
 
 if __name__ == "__main__":
