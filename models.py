@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, BigInteger, String, ForeignKey, Text, UniqueConstraint, PrimaryKeyConstraint, select
+from sqlalchemy import Column, Index, Integer, BigInteger, String, ForeignKey, Text, UniqueConstraint, PrimaryKeyConstraint, select, func
 from sqlalchemy.types import SmallInteger
 from sqlalchemy.orm import relationship, Session
 from sqlalchemy.ext.declarative import declarative_base
@@ -412,7 +412,7 @@ class WikiTemplate(Base):
     domain_row = relationship("Domain", foreign_keys=[domain])
 
     __table_args__ = (
-        UniqueConstraint('domain', 'name', name='uix_template_domain_name'),
+        Index('uix_template_domain_name', 'domain', func.md5(name), unique=True),
     )
 
     @staticmethod
@@ -432,7 +432,7 @@ class WikiTemplate(Base):
         stmt = insert(WikiTemplate).values(**kwargs)
         set_values = {k: v for k, v in kwargs.items() if v is not None}
         stmt = stmt.on_conflict_do_update(
-            index_elements=['domain', 'name'],
+            index_elements=[WikiTemplate.domain, func.md5(WikiTemplate.name)],
             set_=set_values
         )
         session.execute(stmt)
@@ -461,7 +461,7 @@ class WikiTemplate(Base):
             return
         # Sort by conflict key to ensure consistent lock ordering and prevent deadlocks
         stmt = insert(WikiTemplate).values(sorted(merged.values(), key=lambda r: (r.get('domain', 0), r.get('name', '')))).on_conflict_do_update(
-            index_elements=['domain', 'name'],
+            index_elements=[WikiTemplate.domain, func.md5(WikiTemplate.name)],
             set_={
                 'wikidata_id': insert(WikiTemplate).excluded.wikidata_id,
                 'librarybase_id': insert(WikiTemplate).excluded.librarybase_id,
