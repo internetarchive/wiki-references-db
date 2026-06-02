@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Index, Integer, BigInteger, String, ForeignKey, Text, UniqueConstraint, PrimaryKeyConstraint, select, func
+import hashlib
+from sqlalchemy import Column, Index, Integer, BigInteger, String, CHAR, ForeignKey, Text, UniqueConstraint, PrimaryKeyConstraint, select, func
 from sqlalchemy.types import SmallInteger
 from sqlalchemy.orm import relationship, Session
 from sqlalchemy.ext.declarative import declarative_base
@@ -41,7 +42,8 @@ class Document(Base):
 class WebResource(Base):
     __tablename__              =  'web_resources'
     id                         =  Column(BigInteger, primary_key=True, nullable=False)
-    url                        =  Column(String, nullable=False, unique=True)
+    url                        =  Column(String, nullable=False)
+    url_hash                   =  Column(CHAR(64), nullable=False, unique=True)
     instance_of_document       =  Column(Integer, ForeignKey('documents.id'))
     availability_status        =  Column(Integer)
     is_archive_of              =  Column(BigInteger, ForeignKey('web_resources.id'))
@@ -53,11 +55,18 @@ class WebResource(Base):
     domain                     =  relationship("Domain", foreign_keys=[domain_id])
 
     @staticmethod
+    def compute_url_hash(url: str) -> str:
+        return hashlib.sha256(url.encode('utf-8')).hexdigest()
+
+    @staticmethod
     def upsert(session: Session, **kwargs):
-        stmt = insert(WebResource).values({k: v for k, v in kwargs.items() if k != 'id'})
-        set_values = {k: v for k, v in kwargs.items() if v is not None and k != 'id'}
+        values = {k: v for k, v in kwargs.items() if k != 'id'}
+        if 'url' in values and 'url_hash' not in values:
+            values['url_hash'] = WebResource.compute_url_hash(values['url'])
+        stmt = insert(WebResource).values(values)
+        set_values = {k: v for k, v in kwargs.items() if v is not None and k not in ('id', 'url_hash')}
         stmt = stmt.on_conflict_do_update(
-            index_elements=['url'],
+            index_elements=['url_hash'],
             set_=set_values
         )
         session.execute(stmt)
@@ -79,6 +88,7 @@ class WebResource(Base):
         # Columns we may upsert for WebResource in this bulk path
         expected_keys = {
             'url',
+            'url_hash',
             'domain_id',
             'numeric_page_id',
             'numeric_namespace_id',
@@ -92,6 +102,9 @@ class WebResource(Base):
             if key is None:
                 # Skip rows without a URL; they would violate NOT NULL/UNIQUE
                 continue
+            # Compute url_hash if not present
+            if 'url_hash' not in base:
+                base['url_hash'] = WebResource.compute_url_hash(key)
             if key in deduped:
                 # Merge, preferring non-None from the newer row
                 current = deduped[key]
@@ -109,17 +122,21 @@ class WebResource(Base):
         if not cleaned:
             return
         # Sort by conflict key to ensure consistent lock ordering and prevent deadlocks
-        cleaned.sort(key=lambda r: r.get('url', ''))
+        cleaned.sort(key=lambda r: r.get('url_hash', ''))
+        # Build SET clause that only updates columns with non-null values using COALESCE
+        excluded = insert(WebResource).excluded
+        set_clause = {
+            'url': excluded.url,
+            'instance_of_document': func.coalesce(excluded.instance_of_document, WebResource.instance_of_document),
+            'availability_status': func.coalesce(excluded.availability_status, WebResource.availability_status),
+            'is_archive_of': func.coalesce(excluded.is_archive_of, WebResource.is_archive_of),
+            'domain_id': func.coalesce(excluded.domain_id, WebResource.domain_id),
+            'numeric_page_id': func.coalesce(excluded.numeric_page_id, WebResource.numeric_page_id),
+            'numeric_namespace_id': func.coalesce(excluded.numeric_namespace_id, WebResource.numeric_namespace_id),
+        }
         stmt = insert(WebResource).values(cleaned).on_conflict_do_update(
-            index_elements=['url'],
-            set_={
-                'instance_of_document': insert(WebResource).excluded.instance_of_document,
-                'availability_status': insert(WebResource).excluded.availability_status,
-                'is_archive_of': insert(WebResource).excluded.is_archive_of,
-                'domain_id': insert(WebResource).excluded.domain_id,
-                'numeric_page_id': insert(WebResource).excluded.numeric_page_id,
-                'numeric_namespace_id': insert(WebResource).excluded.numeric_namespace_id,
-            }
+            index_elements=['url_hash'],
+            set_=set_clause
         )
         session.execute(stmt)
 

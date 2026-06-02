@@ -197,6 +197,9 @@ def load_web_resources(session, staging_dir, page_to_doc_id):
         return
     log(f"web_resources: processing from {len(files)} files")
 
+    # Defer foreign key constraint checks until commit for faster inserts
+    session.execute(text("SET CONSTRAINTS ALL DEFERRED"))
+
     count = 0
     for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
         # Resolve domain labels to ids
