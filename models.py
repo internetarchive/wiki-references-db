@@ -43,7 +43,7 @@ class WebResource(Base):
     __tablename__              =  'web_resources'
     id                         =  Column(BigInteger, primary_key=True, nullable=False)
     url                        =  Column(String, nullable=False)
-    url_hash                   =  Column(CHAR(64), nullable=False, unique=True)
+    url_hash                   =  Column(CHAR(32), nullable=False, unique=True)
     instance_of_document       =  Column(Integer, ForeignKey('documents.id'))
     availability_status        =  Column(Integer)
     is_archive_of              =  Column(BigInteger, ForeignKey('web_resources.id'))
@@ -56,7 +56,7 @@ class WebResource(Base):
 
     @staticmethod
     def compute_url_hash(url: str) -> str:
-        return hashlib.sha256(url.encode('utf-8')).hexdigest()
+        return hashlib.md5(url.encode('utf-8')).hexdigest()
 
     @staticmethod
     def upsert(session: Session, **kwargs):
