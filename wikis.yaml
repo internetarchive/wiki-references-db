@@ -9,8 +9,25 @@ en.wikipedia.org:
     - references
     - sources
     - works cited
+    - discography
+    - see also
   citation_templates:
     prefixes:
       - cite
     exact:
       - citation
+it.wikipedia.org:
+  reference_sections:
+    - note
+    - bibliografia
+    - fonti
+    - collegamenti esterni
+    - opere
+    - discografia
+    - pagine correlate
+    - voci correlate
+  citation_templates:
+    prefixes:
+      - cita
+    exact:
+      - citazione
