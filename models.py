@@ -496,21 +496,27 @@ class TemplateData(Base):
     reference_normalized_sha1 = Column(String, nullable=False)
     offset_start = Column(Integer, nullable=False)
     parameter_key = Column(String, nullable=False)
+    parameter_key_md5 = Column(CHAR(32), nullable=False)
     parameter_value = Column(Text, nullable=True)
 
     template = relationship("WikiTemplate", foreign_keys=[wiki_template_id])
 
     __table_args__ = (
-        UniqueConstraint('wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key', name='uix_template_param'),
-        PrimaryKeyConstraint('wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key', name='pk_template_param'),
+        PrimaryKeyConstraint('wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key_md5', name='pk_template_param'),
     )
 
     @staticmethod
+    def _compute_key_md5(kwargs):
+        if 'parameter_key' in kwargs and kwargs['parameter_key'] is not None:
+            kwargs['parameter_key_md5'] = hashlib.md5(kwargs['parameter_key'].encode()).hexdigest()
+
+    @staticmethod
     def upsert(session: Session, **kwargs):
+        TemplateData._compute_key_md5(kwargs)
         stmt = insert(TemplateData).values(**kwargs)
         set_values = {k: v for k, v in kwargs.items() if v is not None}
         stmt = stmt.on_conflict_do_update(
-            index_elements=['wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key'],
+            index_elements=['wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key_md5'],
             set_=set_values
         )
         session.execute(stmt)
@@ -519,25 +525,26 @@ class TemplateData(Base):
     def bulk_upsert(session: Session, rows):
         if not rows:
             return
-        # Deduplicate by composite unique key and merge, preferring non-None parameter_value
+        # Compute MD5 for parameter_key and deduplicate by composite unique key
         merged = {}
         for r in rows:
-            key = (r.get('wiki_template_id'), r.get('reference_normalized_sha1'), r.get('offset_start'), r.get('parameter_key'))
+            r2 = dict(r)
+            TemplateData._compute_key_md5(r2)
+            key = (r2.get('wiki_template_id'), r2.get('reference_normalized_sha1'), r2.get('offset_start'), r2.get('parameter_key_md5'))
             if None in key:
                 continue
             if key in merged:
                 cur = merged[key]
-                # Only field that reasonably changes is parameter_value; but merge all non-None
-                for k, v in r.items():
+                for k, v in r2.items():
                     if v is not None:
                         cur[k] = v
             else:
-                merged[key] = dict(r)
+                merged[key] = r2
         if not merged:
             return
         # Sort by conflict key to ensure consistent lock ordering and prevent deadlocks
-        stmt = insert(TemplateData).values(sorted(merged.values(), key=lambda r: (r.get('wiki_template_id', 0), r.get('reference_normalized_sha1', ''), r.get('offset_start', 0), r.get('parameter_key', '')))).on_conflict_do_update(
-            index_elements=['wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key'],
+        stmt = insert(TemplateData).values(sorted(merged.values(), key=lambda r: (r.get('wiki_template_id', 0), r.get('reference_normalized_sha1', ''), r.get('offset_start', 0), r.get('parameter_key_md5', '')))).on_conflict_do_update(
+            index_elements=['wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key_md5'],
             set_={'parameter_value': insert(TemplateData).excluded.parameter_value}
         )
         session.execute(stmt)
