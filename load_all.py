@@ -1,11 +1,11 @@
-"""Load pre-deduplicated staged JSONL.zst files into PostgreSQL.
+"""Load pre-deduplicated staged Parquet files into PostgreSQL.
 
-Reads the deduped/ subdirectory produced by dedup_staged.py and
-bulk-inserts into Postgres.  ON CONFLICT upserts are kept as a
+Reads the deduped/ subdirectory produced by dedup_parquet.py and
+bulk-inserts into Postgres. ON CONFLICT upserts are kept as a
 safety net for residual duplicates or re-runs.
 
 Pipeline:
-    build_all.py  →  dedup_staged.py  →  load_all.py
+    build_db.py (Parquet)  →  dedup_parquet.py  →  load_all.py
 
 Usage:
     python3 load_all.py -d ./staging
@@ -14,8 +14,8 @@ Usage:
     python3 load_all.py --tables citation_histories  # load only citation_histories
 """
 
+import hashlib
 import itertools
-import json
 import os
 import sys
 import time
@@ -26,13 +26,13 @@ from collections import OrderedDict
 from dotenv import load_dotenv
 load_dotenv()
 
-import zstandard as zstd
-from sqlalchemy import create_engine, text, select as sa_select
+import duckdb
+from sqlalchemy import create_engine, text, select as sa_select, func as sa_func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 from models import (
-    Base, Container, Domain, Document, WebResource, Citation,
+    Base, Container, Domain, Document, WebResource, CitationInstance,
     CitationHistory, Revision, NormalizedCitation,
     NormalizedCitationWebResource, WikiTemplate, TemplateData,
 )
@@ -52,39 +52,42 @@ BATCH_SIZE = int(os.getenv('LOAD_BATCH_SIZE', '5000'))
 # Helpers
 # ---------------------------------------------------------------------------
 
-def read_jsonl_zst(filepath):
-    """Yield dicts from a .jsonl.zst file."""
-    dctx = zstd.ZstdDecompressor()
-    with open(filepath, 'rb') as fh:
-        compressed = fh.read()
-    if not compressed:
-        return
-    # read_to_iter is the most reliable decompression API: it handles
-    # multi-frame streams and files of any size without needing to know
-    # the uncompressed size up front (unlike decompress()).
-    raw = b''.join(dctx.read_to_iter(compressed))
-    for line in raw.decode('utf-8').splitlines():
-        line = line.strip()
-        if line:
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                log(f"warning: skipping malformed line in {filepath}: {line[:120]}")
-                continue
+def log(msg):
+    ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    print(f"{ts} [load_all] {msg}", flush=True)
 
 
-def find_staging_files(staging_dir, table_name):
-    """Find all .jsonl.zst files for a given table in the deduped/ subdirectory."""
+def find_deduped_parquet(staging_dir, table_name):
+    """Find the deduped Parquet file for a given table."""
     deduped_dir = os.path.join(staging_dir, 'deduped')
-    pattern = os.path.join(deduped_dir, f'{table_name}-*.jsonl.zst')
-    return sorted(glob.glob(pattern))
+    path = os.path.join(deduped_dir, f'{table_name}.parquet')
+    if os.path.exists(path):
+        return path
+    return None
 
 
-def stream_rows(filepaths):
-    """Yield rows from multiple JSONL.zst files."""
-    for fp in filepaths:
-        log(f"  reading {os.path.basename(fp)}")
-        yield from read_jsonl_zst(fp)
+def read_parquet_batches(filepath, batch_size=BATCH_SIZE):
+    """Yield batches of dicts from a Parquet file using DuckDB for efficiency."""
+    if not filepath or not os.path.exists(filepath):
+        return
+    con = duckdb.connect()
+    result = con.execute(f"SELECT * FROM '{filepath}'")
+    columns = [desc[0] for desc in result.description]
+    while True:
+        chunk = result.fetchmany(batch_size)
+        if not chunk:
+            break
+        batch = []
+        for row in chunk:
+            d = {}
+            for i, col in enumerate(columns):
+                val = row[i]
+                # Convert DuckDB NoneType properly
+                if val is not None:
+                    d[col] = val
+            batch.append(d)
+        yield batch
+    con.close()
 
 
 def chunked_iterable(iterable, n):
@@ -97,38 +100,31 @@ def chunked_iterable(iterable, n):
         yield chunk
 
 
-def log(msg):
-    ts = time.strftime('%Y-%m-%d %H:%M:%S')
-    print(f"{ts} [load_all] {msg}", flush=True)
-
-
 # ---------------------------------------------------------------------------
-# Load functions per table — using temp tables for upsert
+# Load functions per table
 # ---------------------------------------------------------------------------
 
 def load_containers(session, staging_dir):
-    files = find_staging_files(staging_dir, 'containers')
-    if not files:
+    filepath = find_deduped_parquet(staging_dir, 'containers')
+    if not filepath:
         return
-    log(f"containers: processing from {len(files)} files")
+    log(f"containers: loading from {filepath}")
     count = 0
-    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
+    for batch in read_parquet_batches(filepath):
         Container.bulk_upsert(session, batch)
         count += len(batch)
-    log(f"containers: {count} unique rows loaded")
+    log(f"containers: {count} rows loaded")
     session.commit()
 
 
 def load_domains(session, staging_dir):
-    files = find_staging_files(staging_dir, 'domains')
-    if not files:
+    filepath = find_deduped_parquet(staging_dir, 'domains')
+    if not filepath:
         return
-    log(f"domains: processing from {len(files)} files")
-    
-    # We still need to resolve containers, but we can do it in batches if needed.
-    # For now, let's keep it simple but stream the rows.
+    log(f"domains: loading from {filepath}")
+
     count = 0
-    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
+    for batch in read_parquet_batches(filepath):
         # Resolve container labels to ids for this batch
         labels = set(r.get('for_container_label') for r in batch if r.get('for_container_label'))
         label_to_id = {}
@@ -137,7 +133,7 @@ def load_domains(session, staging_dir):
                 sa_select(Container.label, Container.id).where(Container.label.in_(list(labels)))
             ).all()
             label_to_id = {l: i for l, i in result}
-        
+
         cleaned = []
         for r in batch:
             d = {'value': r['value']}
@@ -145,27 +141,23 @@ def load_domains(session, staging_dir):
             if fcl and fcl in label_to_id:
                 d['for_container'] = label_to_id[fcl]
             cleaned.append(d)
-        
+
         Domain.bulk_upsert(session, cleaned)
         count += len(cleaned)
-    log(f"domains: {count} unique rows loaded")
+    log(f"domains: {count} rows loaded")
     session.commit()
 
 
 def load_documents(session, staging_dir):
     """Load documents. Returns a mapping of (domain, page_id) -> document_id."""
-    files = find_staging_files(staging_dir, 'documents')
-    if not files:
+    filepath = find_deduped_parquet(staging_dir, 'documents')
+    if not filepath:
         return {}
-    log(f"documents: processing from {len(files)} files")
+    log(f"documents: loading from {filepath}")
 
-    # Resolve container labels for mapping
-    # Note: page_to_doc_id could still be large. 
-    # If it becomes a problem, we might need to avoid returning it.
     page_to_doc_id = {}
-    
     count = 0
-    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
+    for batch in read_parquet_batches(filepath):
         # Resolve container labels
         labels = set(r.get('has_container_label') for r in batch if r.get('has_container_label'))
         label_to_id = {}
@@ -185,23 +177,23 @@ def load_documents(session, staging_dir):
             )
             page_to_doc_id[(container_label or '', r['page_id'])] = doc_id
             count += 1
-    
-    log(f"documents: {count} unique rows loaded")
+
+    log(f"documents: {count} rows loaded")
     session.commit()
     return page_to_doc_id
 
 
 def load_web_resources(session, staging_dir, page_to_doc_id):
-    files = find_staging_files(staging_dir, 'web_resources')
-    if not files:
+    filepath = find_deduped_parquet(staging_dir, 'web_resources')
+    if not filepath:
         return
-    log(f"web_resources: processing from {len(files)} files")
+    log(f"web_resources: loading from {filepath}")
 
     # Defer foreign key constraint checks until commit for faster inserts
     session.execute(text("SET CONSTRAINTS ALL DEFERRED"))
 
     count = 0
-    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
+    for batch in read_parquet_batches(filepath):
         # Resolve domain labels to ids
         domain_labels = set(r.get('domain_label') for r in batch if r.get('domain_label'))
         domain_to_id = {}
@@ -232,19 +224,19 @@ def load_web_resources(session, staging_dir, page_to_doc_id):
 
         WebResource.bulk_upsert(session, cleaned)
         count += len(cleaned)
-    
-    log(f"web_resources: {count} unique rows loaded")
+
+    log(f"web_resources: {count} rows loaded")
     session.commit()
 
 
 def load_wiki_templates(session, staging_dir):
-    files = find_staging_files(staging_dir, 'wiki_templates')
-    if not files:
+    filepath = find_deduped_parquet(staging_dir, 'wiki_templates')
+    if not filepath:
         return
-    log(f"wiki_templates: processing from {len(files)} files")
+    log(f"wiki_templates: loading from {filepath}")
 
     count = 0
-    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
+    for batch in read_parquet_batches(filepath):
         # Resolve domain labels
         domain_labels = set(r['domain_label'] for r in batch)
         domain_to_id = {}
@@ -262,18 +254,18 @@ def load_wiki_templates(session, staging_dir):
 
         WikiTemplate.bulk_upsert(session, cleaned)
         count += len(cleaned)
-    log(f"wiki_templates: {count} unique rows loaded")
+    log(f"wiki_templates: {count} rows loaded")
     session.commit()
 
 
 def load_normalized_citations(session, staging_dir, page_to_doc_id):
-    files = find_staging_files(staging_dir, 'normalized_citations')
-    if not files:
+    filepath = find_deduped_parquet(staging_dir, 'normalized_citations')
+    if not filepath:
         return
-    log(f"normalized_citations: processing from {len(files)} files")
+    log(f"normalized_citations: loading from {filepath}")
 
     count = 0
-    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
+    for batch in read_parquet_batches(filepath):
         cleaned = []
         for r in batch:
             domain = r.get('appears_on_domain', '')
@@ -282,58 +274,74 @@ def load_normalized_citations(session, staging_dir, page_to_doc_id):
             if doc_id is None:
                 continue
             cleaned.append({
-                'record_sha1': r['record_sha1'],
-                'reference_normalized_sha1': r['reference_normalized_sha1'],
+                'normalized_sha1': r['normalized_sha1'],
                 'reference_normalized': r['reference_normalized'],
                 'appears_on_article': doc_id,
             })
 
         if cleaned:
             stmt = insert(NormalizedCitation).values(cleaned).on_conflict_do_update(
-                index_elements=['record_sha1'],
+                index_elements=['normalized_sha1'],
                 set_={
                     'reference_normalized': insert(NormalizedCitation).excluded.reference_normalized,
-                    'reference_normalized_sha1': insert(NormalizedCitation).excluded.reference_normalized_sha1,
                     'appears_on_article': insert(NormalizedCitation).excluded.appears_on_article,
                 }
             )
             session.execute(stmt)
             count += len(cleaned)
-    log(f"normalized_citations: {count} unique rows loaded")
+    log(f"normalized_citations: {count} rows loaded")
     session.commit()
 
 
-def load_citations(session, staging_dir):
-    files = find_staging_files(staging_dir, 'citations')
-    if not files:
+def load_citation_instances(session, staging_dir):
+    """Load citation instances. Resolves normalized_sha1 -> normalized_id via DB lookup."""
+    filepath = find_deduped_parquet(staging_dir, 'citation_instances')
+    if not filepath:
         return
-    log(f"citations: processing from {len(files)} files")
+    log(f"citation_instances: loading from {filepath}")
 
     count = 0
-    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
-        stmt = insert(Citation).values(batch).on_conflict_do_update(
-            index_elements=['record_sha1', 'reference_raw_sha1'],
-            set_={
-                'offset_start': insert(Citation).excluded.offset_start,
-                'length': insert(Citation).excluded.length,
-                'reference_type': insert(Citation).excluded.reference_type,
-                'reference_name': insert(Citation).excluded.reference_name,
-            }
-        )
-        session.execute(stmt)
-        count += len(batch)
-    log(f"citations: {count} unique rows loaded")
+    for batch in read_parquet_batches(filepath):
+        # Resolve normalized_sha1 -> normalized_id
+        sha1s = list(set(r['normalized_sha1'] for r in batch if r.get('normalized_sha1')))
+        sha1_to_id = {}
+        if sha1s:
+            # Query in chunks to avoid overly large IN clauses
+            for chunk in chunked_iterable(sha1s, 1000):
+                result = session.execute(
+                    sa_select(NormalizedCitation.normalized_sha1, NormalizedCitation.id)
+                    .where(NormalizedCitation.normalized_sha1.in_(chunk))
+                ).all()
+                sha1_to_id.update({s: i for s, i in result})
+
+        cleaned = []
+        for r in batch:
+            norm_id = sha1_to_id.get(r.get('normalized_sha1'))
+            if norm_id is None:
+                continue
+            cleaned.append({
+                'page_id': r['page_id'],
+                'raw_sha1': r['raw_sha1'],
+                'normalized_id': norm_id,
+                'reference_type': r.get('reference_type', 0),
+                'reference_name': r.get('reference_name'),
+            })
+
+        if cleaned:
+            CitationInstance.bulk_upsert(session, cleaned)
+            count += len(cleaned)
+    log(f"citation_instances: {count} rows loaded")
     session.commit()
 
 
 def load_revisions(session, staging_dir):
-    files = find_staging_files(staging_dir, 'revisions')
-    if not files:
+    filepath = find_deduped_parquet(staging_dir, 'revisions')
+    if not filepath:
         return
-    log(f"revisions: processing from {len(files)} files")
+    log(f"revisions: loading from {filepath}")
 
     count = 0
-    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
+    for batch in read_parquet_batches(filepath):
         stmt = insert(Revision).values(batch).on_conflict_do_update(
             index_elements=['revision_id'],
             set_={
@@ -344,64 +352,106 @@ def load_revisions(session, staging_dir):
         )
         session.execute(stmt)
         count += len(batch)
-    log(f"revisions: {count} unique rows loaded")
+    log(f"revisions: {count} rows loaded")
     session.commit()
 
 
 def load_citation_histories(session, staging_dir):
-    files = find_staging_files(staging_dir, 'citation_histories')
-    if not files:
+    """Load citation histories. Resolves (page_id, raw_sha1) -> citation_instance_id."""
+    filepath = find_deduped_parquet(staging_dir, 'citation_histories')
+    if not filepath:
         return
-    log(f"citation_histories: processing from {len(files)} files")
+    log(f"citation_histories: loading from {filepath}")
 
     count = 0
-    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
-        stmt = insert(CitationHistory).values(batch).on_conflict_do_nothing()
-        session.execute(stmt)
-        count += len(batch)
-    log(f"citation_histories: {count} unique rows loaded")
+    skipped = 0
+    for batch in read_parquet_batches(filepath):
+        # Resolve (page_id, raw_sha1) -> citation_instance_id
+        keys = list(set((r['page_id'], r['raw_sha1']) for r in batch))
+        key_to_id = {}
+        if keys:
+            from sqlalchemy import tuple_
+            for chunk in chunked_iterable(keys, 1000):
+                result = session.execute(
+                    sa_select(CitationInstance.page_id, CitationInstance.raw_sha1, CitationInstance.id)
+                    .where(tuple_(CitationInstance.page_id, CitationInstance.raw_sha1).in_(chunk))
+                ).all()
+                key_to_id.update({(p, s): i for p, s, i in result})
+
+        cleaned = []
+        for r in batch:
+            ci_id = key_to_id.get((r['page_id'], r['raw_sha1']))
+            if ci_id is None:
+                skipped += 1
+                continue
+            cleaned.append({
+                'citation_instance_id': ci_id,
+                'revision_id': r['revision_id'],
+            })
+
+        if cleaned:
+            stmt = insert(CitationHistory).values(cleaned).on_conflict_do_nothing()
+            session.execute(stmt)
+            count += len(cleaned)
+
+    if skipped:
+        log(f"citation_histories: warning: {skipped} rows skipped (no matching citation_instance)")
+    log(f"citation_histories: {count} rows loaded")
     session.commit()
 
 
 def load_ncwr(session, staging_dir):
-    files = find_staging_files(staging_dir, 'ncwr')
-    if not files:
+    """Load normalized_citation_web_resources. Resolves normalized_sha1 -> normalized_id and url -> web_resource_id."""
+    filepath = find_deduped_parquet(staging_dir, 'ncwr')
+    if not filepath:
         return
-    log(f"ncwr: processing from {len(files)} files")
+    log(f"ncwr: loading from {filepath}")
 
     count = 0
-    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
+    for batch in read_parquet_batches(filepath):
         # Resolve URLs to web_resource_ids
         urls = list(set(r['url'] for r in batch))
         url_to_id = {}
-        result = session.execute(
-            sa_select(WebResource.url, WebResource.id).where(WebResource.url.in_(urls))
-        ).all()
-        url_to_id.update({u: i for u, i in result})
+        for chunk in chunked_iterable(urls, 1000):
+            result = session.execute(
+                sa_select(WebResource.url, WebResource.id).where(WebResource.url.in_(chunk))
+            ).all()
+            url_to_id.update({u: i for u, i in result})
+
+        # Resolve normalized_sha1 -> normalized_id
+        sha1s = list(set(r['normalized_sha1'] for r in batch))
+        sha1_to_id = {}
+        for chunk in chunked_iterable(sha1s, 1000):
+            result = session.execute(
+                sa_select(NormalizedCitation.normalized_sha1, NormalizedCitation.id)
+                .where(NormalizedCitation.normalized_sha1.in_(chunk))
+            ).all()
+            sha1_to_id.update({s: i for s, i in result})
 
         cleaned = []
         for r in batch:
             wr_id = url_to_id.get(r['url'])
-            if wr_id is not None:
+            norm_id = sha1_to_id.get(r['normalized_sha1'])
+            if wr_id is not None and norm_id is not None:
                 cleaned.append({
-                    'reference_normalized_sha1': r['reference_normalized_sha1'],
+                    'normalized_id': norm_id,
                     'web_resource_id': wr_id,
                 })
         if cleaned:
             NormalizedCitationWebResource.bulk_upsert(session, cleaned)
             count += len(cleaned)
-    log(f"ncwr: {count} unique rows loaded")
+    log(f"ncwr: {count} rows loaded")
     session.commit()
 
 
 def load_template_data(session, staging_dir):
-    files = find_staging_files(staging_dir, 'template_data')
-    if not files:
+    filepath = find_deduped_parquet(staging_dir, 'template_data')
+    if not filepath:
         return
-    log(f"template_data: processing from {len(files)} files")
+    log(f"template_data: loading from {filepath}")
 
     count = 0
-    for batch in chunked_iterable(stream_rows(files), BATCH_SIZE):
+    for batch in read_parquet_batches(filepath):
         # Resolve domain labels and template names to ids
         domain_labels = set(r['domain_label'] for r in batch)
         domain_to_id = {}
@@ -427,6 +477,16 @@ def load_template_data(session, staging_dir):
             ).all()
             template_key_to_id = {(d, n): i for d, n, i in result}
 
+        # Resolve normalized_sha1 -> normalized_id
+        sha1s = list(set(r['normalized_sha1'] for r in batch))
+        sha1_to_id = {}
+        for chunk in chunked_iterable(sha1s, 1000):
+            result = session.execute(
+                sa_select(NormalizedCitation.normalized_sha1, NormalizedCitation.id)
+                .where(NormalizedCitation.normalized_sha1.in_(chunk))
+            ).all()
+            sha1_to_id.update({s: i for s, i in result})
+
         cleaned = []
         for r in batch:
             dom_id = domain_to_id.get(r['domain_label'])
@@ -435,9 +495,12 @@ def load_template_data(session, staging_dir):
             tpl_id = template_key_to_id.get((dom_id, r['template_name']))
             if tpl_id is None:
                 continue
+            norm_id = sha1_to_id.get(r['normalized_sha1'])
+            if norm_id is None:
+                continue
             cleaned.append({
                 'wiki_template_id': tpl_id,
-                'reference_normalized_sha1': r['reference_normalized_sha1'],
+                'normalized_id': norm_id,
                 'offset_start': r['offset_start'],
                 'parameter_key': r['parameter_key'],
                 'parameter_value': r.get('parameter_value'),
@@ -446,7 +509,7 @@ def load_template_data(session, staging_dir):
         if cleaned:
             TemplateData.bulk_upsert(session, cleaned)
             count += len(cleaned)
-    log(f"template_data: {count} unique rows loaded")
+    log(f"template_data: {count} rows loaded")
     session.commit()
 
 
@@ -456,7 +519,7 @@ def load_template_data(session, staging_dir):
 
 def main():
     global BATCH_SIZE
-    parser = argparse.ArgumentParser(description='Load staged JSONL.zst files into PostgreSQL')
+    parser = argparse.ArgumentParser(description='Load staged Parquet files into PostgreSQL')
     parser.add_argument('-d', '--staging-dir', default=os.environ.get('STAGING_DIR', './staging'),
                         help='Staging directory (default: STAGING_DIR env or ./staging)')
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE,
@@ -469,7 +532,7 @@ def main():
         ('web_resources',       ('Phase 4:  web_resources',       lambda s, d, ctx: load_web_resources(s, d, ctx.get('page_to_doc_id', {})))),
         ('wiki_templates',      ('Phase 5:  wiki_templates',      lambda s, d, ctx: load_wiki_templates(s, d))),
         ('normalized_citations',('Phase 6:  normalized_citations', lambda s, d, ctx: load_normalized_citations(s, d, ctx.get('page_to_doc_id', {})))),
-        ('citations',           ('Phase 7:  citations',           lambda s, d, ctx: load_citations(s, d))),
+        ('citation_instances',  ('Phase 7:  citation_instances',  lambda s, d, ctx: load_citation_instances(s, d))),
         ('revisions',           ('Phase 8:  revisions',           lambda s, d, ctx: load_revisions(s, d))),
         ('citation_histories',  ('Phase 9:  citation_histories',  lambda s, d, ctx: load_citation_histories(s, d))),
         ('ncwr',                ('Phase 10: ncwr',                lambda s, d, ctx: load_ncwr(s, d))),

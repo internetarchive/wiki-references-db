@@ -54,7 +54,7 @@ def main():
     parser = argparse.ArgumentParser(description="Spawn build_db.py for each .mwrev.zst file in a directory.")
     parser.add_argument("-d", "--directory", required=True, help="Directory containing .mwrev.zst files")
     parser.add_argument("-o", "--staging-dir", default=os.environ.get('STAGING_DIR', './staging'),
-                        help="Directory to write staged JSONL.zst files (default: STAGING_DIR env or ./staging)")
+                        help="Directory to write staged Parquet files (default: STAGING_DIR env or ./staging)")
     parser.add_argument("-j", "--jobs", type=int, default=max_jobs,
                         help="Number of concurrent jobs/files to process (default: 8)")
     parser.add_argument("--metrics-interval", type=float, default=float(os.environ.get("METRICS_INTERVAL", "10")),
@@ -83,7 +83,7 @@ def main():
             if started and not done:
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [build_all] Clearing incomplete shard: {subdir}", flush=True)
                 for fname in os.listdir(subdir_path):
-                    if fname.endswith('.jsonl.zst'):
+                    if fname.endswith('.jsonl.zst') or fname.endswith('.parquet'):
                         os.remove(os.path.join(subdir_path, fname))
                 # Also remove stale STARTED.txt so it gets a fresh timestamp
                 os.remove(os.path.join(subdir_path, 'STARTED.txt'))

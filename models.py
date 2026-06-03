@@ -249,61 +249,113 @@ class Container(Base):
         )
         session.execute(stmt)
 
-# "Citations" appear on Wikipedia articles and other documents. Citations can have one or more
-# Referenced Documents. This table tracks the earliest and latest revisions the citation
-# appears in, while each individual revision containing the reference is stored as Citation History.
-# Instead of storing the raw text, we store the start offset and length of the reference in the wikitext.
-class Citation(Base):
-    __tablename__ = 'citations'
-    record_sha1 = Column(String, nullable=False)
-    reference_raw_sha1 = Column(String, nullable=False)
-    offset_start = Column(Integer, nullable=True)
-    length = Column(Integer, nullable=True)
-    # reference_type is an application-level small int enum: 0=other, 1=inline, 2=endnote (extensible)
-    reference_type = Column(SmallInteger, nullable=False, server_default='0')
-    reference_normalized_sha1 = Column(String, nullable=False)
-    reference_name = Column(String)
-    wiki_article_id = Column(Integer, nullable=False)
+# "Normalized Citations" are citations that have been run through a normalization function. This
+# alphabetizes template parameters, makes newlines and whitespace consistent, removes ref names, etc.
+# This allows for the identification of citations that are identical in content/meaning but not formatting.
+# The integer `id` is used as the join key throughout the schema; `normalized_sha1` is retained as a
+# UNIQUE column for content-addressed lookup and dedup on ingest.
+class NormalizedCitation(Base):
+    __tablename__ = 'normalized_citations'
+    id = Column(Integer, primary_key=True, nullable=False, autoincrement=True)
+    normalized_sha1 = Column(CHAR(40), nullable=False, unique=True)
+    reference_normalized = Column(Text, nullable=False)
+    appears_on_article = Column(Integer, ForeignKey('documents.id'), nullable=False)
+    wiki_article_document = relationship("Document", foreign_keys=[appears_on_article])
 
     __table_args__ = (
-        UniqueConstraint('record_sha1', 'reference_raw_sha1', name='uix_record_raw'),
-        PrimaryKeyConstraint('record_sha1', 'reference_raw_sha1', name='pk_citation'),
+        UniqueConstraint('normalized_sha1', name='uix_normalized_sha1'),
     )
 
     @staticmethod
     def upsert(session: Session, **kwargs):
-        stmt = insert(Citation).values(**kwargs)
+        stmt = insert(NormalizedCitation).values(**kwargs)
+        set_values = {k: v for k, v in kwargs.items() if v is not None and k != 'id'}
         stmt = stmt.on_conflict_do_update(
-            index_elements=['record_sha1', 'reference_raw_sha1'],
+            index_elements=['normalized_sha1'],
+            set_=set_values
+        )
+        session.execute(stmt)
+
+# "Citation Instances" represent a unique citation occurrence on a specific article. Each instance
+# maps a raw citation string (identified by raw_sha1) on a page to its normalized form. The integer
+# `id` is used as the FK in citation_history for efficient joins; (page_id, raw_sha1) is the
+# content-addressed dedup key.
+class CitationInstance(Base):
+    __tablename__ = 'citation_instances'
+    id = Column(BigInteger, primary_key=True, nullable=False, autoincrement=True)
+    normalized_id = Column(Integer, ForeignKey('normalized_citations.id'), nullable=False)
+    page_id = Column(Integer, nullable=False)
+    raw_sha1 = Column(CHAR(40), nullable=False)
+    # reference_type is an application-level small int enum: 0=other, 1=inline, 2=endnote (extensible)
+    reference_type = Column(SmallInteger, nullable=False, server_default='0')
+    reference_name = Column(String)
+
+    normalized_citation = relationship("NormalizedCitation", foreign_keys=[normalized_id])
+
+    __table_args__ = (
+        UniqueConstraint('page_id', 'raw_sha1', name='uix_ci_page_raw'),
+        Index('idx_ci_page', 'page_id'),
+        Index('idx_ci_normalized', 'normalized_id'),
+    )
+
+    @staticmethod
+    def upsert(session: Session, **kwargs):
+        stmt = insert(CitationInstance).values(**kwargs)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=['page_id', 'raw_sha1'],
+            set_={k: v for k, v in kwargs.items() if v is not None and k not in ('id', 'page_id', 'raw_sha1')}
+        )
+        session.execute(stmt)
+
+    @staticmethod
+    def bulk_upsert(session: Session, rows):
+        if not rows:
+            return
+        # Deduplicate by (page_id, raw_sha1) within the batch
+        merged = {}
+        for r in rows:
+            key = (r.get('page_id'), r.get('raw_sha1'))
+            if None in key:
+                continue
+            if key in merged:
+                cur = merged[key]
+                for k, v in r.items():
+                    if v is not None:
+                        cur[k] = v
+            else:
+                merged[key] = dict(r)
+        if not merged:
+            return
+        cleaned = sorted(merged.values(), key=lambda r: (r.get('page_id', 0), r.get('raw_sha1', '')))
+        stmt = insert(CitationInstance).values(cleaned).on_conflict_do_update(
+            index_elements=['page_id', 'raw_sha1'],
             set_={
-                'offset_start': kwargs.get('offset_start', Citation.offset_start),
-                'length': kwargs.get('length', Citation.length),
-                'reference_type': kwargs.get('reference_type', Citation.reference_type),
-                'reference_normalized_sha1': kwargs.get('reference_normalized_sha1', Citation.reference_normalized_sha1),
-                'reference_name': kwargs.get('reference_name', Citation.reference_name),
-                'wiki_article_id': kwargs.get('wiki_article_id', Citation.wiki_article_id),
+                'normalized_id': insert(CitationInstance).excluded.normalized_id,
+                'reference_type': insert(CitationInstance).excluded.reference_type,
+                'reference_name': insert(CitationInstance).excluded.reference_name,
             }
         )
         session.execute(stmt)
 
-# "Citation History" tracks the individual article revisions in which a given Citation appears.
+# "Citation History" tracks the individual article revisions in which a given CitationInstance
+# appears. This is the largest table (~28.8B rows). It uses integer FKs exclusively for
+# efficient joins and minimal row size (~16 bytes per row).
 class CitationHistory(Base):
     __tablename__ = 'citation_history'
-    record_sha1 = Column(String, nullable=False, primary_key=True)
-    revision_id = Column(BigInteger, nullable=False, primary_key=True)
-    reference_normalized_sha1 = Column(String, nullable=False)
-    reference_raw_sha1 = Column(String, nullable=False)
+    citation_instance_id = Column(BigInteger, ForeignKey('citation_instances.id'), nullable=False, primary_key=True)
+    revision_id = Column(BigInteger, ForeignKey('revisions.revision_id'), nullable=False, primary_key=True)
 
-    __table_args__ = (UniqueConstraint('record_sha1', 'revision_id', name='uix_record_revision'),)
+    citation_instance = relationship("CitationInstance", foreign_keys=[citation_instance_id])
+    revision = relationship("Revision", foreign_keys=[revision_id])
+
+    __table_args__ = (
+        Index('idx_ch_revision', 'revision_id'),
+    )
 
     @staticmethod
     def upsert(session: Session, **kwargs):
         stmt = insert(CitationHistory).values(**kwargs)
-        set_values = {k: v for k, v in kwargs.items() if v is not None}
-        stmt = stmt.on_conflict_do_update(
-            index_elements=['record_sha1', 'revision_id'],
-            set_=set_values
-        )
+        stmt = stmt.on_conflict_do_nothing()
         session.execute(stmt)
 
 # "RevisionBundle" represents a compressed file containing the contents of a Revision.
@@ -354,56 +406,25 @@ class Revision(Base):
         )
         session.execute(stmt)
 
-# "Normalized Citations" are Citations that have been run through a normalization function. This
-# alphabetizes template parameters, makes newlines and whitespace consistent, removes ref names, etc.
-# This allows for the identification of citations that are identical in content/meaning but not formatting.
-class NormalizedCitation(Base):
-    __tablename__ = 'normalized_citations'
-    record_sha1 = Column(String, nullable=False, unique=True, primary_key=True)
-    reference_normalized_sha1 = Column(String, nullable=False)
-    reference_normalized = Column(Text, nullable=False)
-    appears_on_article = Column(Integer, ForeignKey('documents.id'), nullable=False)
-    wiki_article_document = relationship("Document", foreign_keys=[appears_on_article])
-
-    __table_args__ = (
-        UniqueConstraint('record_sha1', name='uix_record_sha1'),
-        UniqueConstraint('record_sha1', 'reference_normalized_sha1', name='uix_record_normalized'),
-    )
-
-    @staticmethod
-    def upsert(session: Session, **kwargs):
-        stmt = insert(NormalizedCitation).values(**kwargs)
-        set_values = {k: v for k, v in kwargs.items() if v is not None}
-        stmt = stmt.on_conflict_do_update(
-            index_elements=['record_sha1', 'reference_normalized_sha1'],
-            set_=set_values
-        )
-        session.execute(stmt)
-
 # "NormalizedCitationWebResource" maps which WebResources appear in which NormalizedCitations.
-# A WebResource is identified by its own auto-incrementing web_resources.id. A NormalizedCitation is
-# identified by its reference_normalized_sha1. This table de-duplicates URL appearances across
-# identical normalized citations.
+# Uses integer FK normalized_id instead of SHA1 string for efficient joins.
 class NormalizedCitationWebResource(Base):
     __tablename__ = 'normalized_citation_web_resources'
-    reference_normalized_sha1 = Column(String, nullable=False)
+    normalized_id = Column(Integer, ForeignKey('normalized_citations.id'), nullable=False)
     web_resource_id = Column(BigInteger, ForeignKey('web_resources.id'), nullable=False)
 
+    normalized_citation = relationship("NormalizedCitation", foreign_keys=[normalized_id])
     resource = relationship("WebResource", foreign_keys=[web_resource_id])
 
     __table_args__ = (
-        UniqueConstraint('reference_normalized_sha1', 'web_resource_id', name='uix_normcit_webresource'),
-        PrimaryKeyConstraint('reference_normalized_sha1', 'web_resource_id', name='pk_normcit_webresource'),
+        UniqueConstraint('normalized_id', 'web_resource_id', name='uix_normcit_webresource'),
+        PrimaryKeyConstraint('normalized_id', 'web_resource_id', name='pk_normcit_webresource'),
     )
 
     @staticmethod
     def upsert(session: Session, **kwargs):
         stmt = insert(NormalizedCitationWebResource).values(**kwargs)
-        set_values = {k: v for k, v in kwargs.items() if v is not None}
-        stmt = stmt.on_conflict_do_update(
-            index_elements=['reference_normalized_sha1', 'web_resource_id'],
-            set_=set_values
-        )
+        stmt = stmt.on_conflict_do_nothing()
         session.execute(stmt)
 
     @staticmethod
@@ -411,7 +432,7 @@ class NormalizedCitationWebResource(Base):
         if not rows:
             return
         # Sort by conflict key to ensure consistent lock ordering and prevent deadlocks
-        rows = sorted(rows, key=lambda r: (r.get('reference_normalized_sha1', ''), r.get('web_resource_id', 0)))
+        rows = sorted(rows, key=lambda r: (r.get('normalized_id', 0), r.get('web_resource_id', 0)))
         stmt = insert(NormalizedCitationWebResource).values(rows).on_conflict_do_nothing()
         session.execute(stmt)
 
@@ -488,21 +509,22 @@ class WikiTemplate(Base):
 
 # "TemplateData" stores key/value parameters for each template invocation found within a
 # normalized citation. Each row is per-parameter, disambiguated by the template concept ID,
-# the normalized citation hash, the template's starting offset within the normalized citation,
-# and the parameter key.
+# the normalized citation integer ID, the template's starting offset within the normalized
+# citation, and the parameter key.
 class TemplateData(Base):
     __tablename__ = 'template_data'
     wiki_template_id = Column(Integer, ForeignKey('wiki_templates.id'), nullable=False)
-    reference_normalized_sha1 = Column(String, nullable=False)
+    normalized_id = Column(Integer, ForeignKey('normalized_citations.id'), nullable=False)
     offset_start = Column(Integer, nullable=False)
     parameter_key = Column(String, nullable=False)
     parameter_key_md5 = Column(CHAR(32), nullable=False)
     parameter_value = Column(Text, nullable=True)
 
     template = relationship("WikiTemplate", foreign_keys=[wiki_template_id])
+    normalized_citation = relationship("NormalizedCitation", foreign_keys=[normalized_id])
 
     __table_args__ = (
-        PrimaryKeyConstraint('wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key_md5', name='pk_template_param'),
+        PrimaryKeyConstraint('wiki_template_id', 'normalized_id', 'offset_start', 'parameter_key_md5', name='pk_template_param'),
     )
 
     @staticmethod
@@ -516,7 +538,7 @@ class TemplateData(Base):
         stmt = insert(TemplateData).values(**kwargs)
         set_values = {k: v for k, v in kwargs.items() if v is not None}
         stmt = stmt.on_conflict_do_update(
-            index_elements=['wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key_md5'],
+            index_elements=['wiki_template_id', 'normalized_id', 'offset_start', 'parameter_key_md5'],
             set_=set_values
         )
         session.execute(stmt)
@@ -530,7 +552,7 @@ class TemplateData(Base):
         for r in rows:
             r2 = dict(r)
             TemplateData._compute_key_md5(r2)
-            key = (r2.get('wiki_template_id'), r2.get('reference_normalized_sha1'), r2.get('offset_start'), r2.get('parameter_key_md5'))
+            key = (r2.get('wiki_template_id'), r2.get('normalized_id'), r2.get('offset_start'), r2.get('parameter_key_md5'))
             if None in key:
                 continue
             if key in merged:
@@ -543,8 +565,15 @@ class TemplateData(Base):
         if not merged:
             return
         # Sort by conflict key to ensure consistent lock ordering and prevent deadlocks
-        stmt = insert(TemplateData).values(sorted(merged.values(), key=lambda r: (r.get('wiki_template_id', 0), r.get('reference_normalized_sha1', ''), r.get('offset_start', 0), r.get('parameter_key_md5', '')))).on_conflict_do_update(
-            index_elements=['wiki_template_id', 'reference_normalized_sha1', 'offset_start', 'parameter_key_md5'],
+        stmt = insert(TemplateData).values(sorted(merged.values(), key=lambda r: (r.get('wiki_template_id', 0), r.get('normalized_id', 0), r.get('offset_start', 0), r.get('parameter_key_md5', '')))).on_conflict_do_update(
+            index_elements=['wiki_template_id', 'normalized_id', 'offset_start', 'parameter_key_md5'],
             set_={'parameter_value': insert(TemplateData).excluded.parameter_value}
         )
         session.execute(stmt)
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility aliases
+# ---------------------------------------------------------------------------
+# Code that imports the old name `Citation` will get `CitationInstance`.
+Citation = CitationInstance

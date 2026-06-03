@@ -3,7 +3,7 @@ from flask import Blueprint, request, render_template
 from sqlalchemy import func, and_, select
 from sqlalchemy.orm import Session
 from models import (
-    WebResource, Document, Citation, CitationHistory, NormalizedCitation,
+    WebResource, Document, CitationInstance, CitationHistory, NormalizedCitation,
     Revision, NormalizedCitationWebResource, WikiTemplate, TemplateData,
 )
 
@@ -63,7 +63,13 @@ def article_view():
 
 @explorer.route("/partials/citations", methods=["GET"])
 def partials_citations():
-    """Return an HTML partial of citation cards for a given page_id + revision_id."""
+    """Return an HTML partial of citation cards for a given page_id + revision_id.
+
+    Uses integer FK joins throughout for efficiency. The main query retrieves
+    all citations present at a given revision in a single statement, then
+    batch-fetches related data (other articles, links, templates) to avoid
+    the N+1 query pattern.
+    """
     page_id = request.args.get("page_id", type=int)
     revision_id = request.args.get("revision_id", type=int)
     if page_id is None or revision_id is None:
@@ -80,49 +86,107 @@ def partials_citations():
             select(func.max(Revision.revision_id)).where(Revision.page_id == page_id)
         ).scalar()
 
-        present_sha1s = (
-            select(CitationHistory.record_sha1, CitationHistory.reference_raw_sha1,
-                   CitationHistory.reference_normalized_sha1)
+        # Get all citation_instance_ids present at this revision
+        present_instances = (
+            select(CitationHistory.citation_instance_id)
             .where(CitationHistory.revision_id == revision_id)
             .subquery()
         )
 
+        # Main query: join through integer FKs
         stmt = (
             select(
-                NormalizedCitation.record_sha1,
-                NormalizedCitation.reference_normalized_sha1,
+                CitationInstance.id.label('ci_id'),
+                CitationInstance.raw_sha1,
+                CitationInstance.reference_name,
+                CitationInstance.reference_type,
+                NormalizedCitation.id.label('nc_id'),
+                NormalizedCitation.normalized_sha1,
                 NormalizedCitation.reference_normalized,
-                Citation.reference_type,
-                func.coalesce(
-                    func.nullif(func.array_agg(func.distinct(Citation.reference_name)), '{NULL}'),
-                    '{}'
-                ).label("reference_names"),
+            )
+            .join(NormalizedCitation, NormalizedCitation.id == CitationInstance.normalized_id)
+            .where(CitationInstance.id.in_(select(present_instances.c.citation_instance_id)))
+        )
+        instance_rows = session.execute(stmt).all()
+
+        if not instance_rows:
+            return render_template(
+                "partials/citations.html",
+                citations=[],
+                citation_count=0,
+                revision_id=revision_id,
+                revision_timestamp=rev_ts,
+            )
+
+        ci_ids = [r.ci_id for r in instance_rows]
+        nc_ids = list(set(r.nc_id for r in instance_rows))
+
+        # Batch: history stats per citation instance
+        history_stats = {}
+        hist_stmt = (
+            select(
+                CitationHistory.citation_instance_id,
                 func.min(Revision.revision_timestamp).label("first_seen_ts"),
                 func.max(Revision.revision_timestamp).label("last_seen_ts"),
                 func.min(Revision.revision_id).label("first_seen_id"),
                 func.max(Revision.revision_id).label("last_seen_id"),
                 func.count(Revision.revision_id).label("appearance_count"),
             )
-            .select_from(present_sha1s)
-            .join(Citation, and_(
-                Citation.record_sha1 == present_sha1s.c.record_sha1,
-                Citation.reference_raw_sha1 == present_sha1s.c.reference_raw_sha1,
-            ))
-            .join(CitationHistory, and_(
-                CitationHistory.record_sha1 == Citation.record_sha1,
-                CitationHistory.reference_raw_sha1 == Citation.reference_raw_sha1,
-            ))
             .join(Revision, Revision.revision_id == CitationHistory.revision_id)
-            .join(NormalizedCitation, NormalizedCitation.record_sha1 == Citation.record_sha1)
-            .group_by(
-                NormalizedCitation.record_sha1,
-                NormalizedCitation.reference_normalized_sha1,
-                NormalizedCitation.reference_normalized,
-                Citation.reference_type,
-            )
-            .order_by(func.max(Revision.revision_timestamp).desc())
+            .where(CitationHistory.citation_instance_id.in_(ci_ids))
+            .group_by(CitationHistory.citation_instance_id)
         )
-        rows = session.execute(stmt).all()
+        for hs in session.execute(hist_stmt).all():
+            history_stats[hs.citation_instance_id] = hs
+
+        # Batch: other articles sharing the same normalized citation
+        other_articles_map = {}
+        if nc_ids:
+            oa_stmt = (
+                select(
+                    NormalizedCitation.id.label('nc_id'),
+                    NormalizedCitation.appears_on_article,
+                    Document.id.label('doc_id'),
+                )
+                .outerjoin(Document, Document.id == NormalizedCitation.appears_on_article)
+                .where(NormalizedCitation.id.in_(nc_ids))
+            )
+            for oa in session.execute(oa_stmt).all():
+                other_articles_map.setdefault(oa.nc_id, []).append(oa)
+
+        # Batch: extracted links per normalized citation
+        links_map = {}
+        if nc_ids:
+            links_stmt = (
+                select(
+                    NormalizedCitationWebResource.normalized_id,
+                    WebResource.id.label('wr_id'),
+                    WebResource.url,
+                )
+                .join(WebResource, WebResource.id == NormalizedCitationWebResource.web_resource_id)
+                .where(NormalizedCitationWebResource.normalized_id.in_(nc_ids))
+            )
+            for lk in session.execute(links_stmt).all():
+                links_map.setdefault(lk.normalized_id, []).append(lk)
+
+        # Batch: templates per normalized citation
+        templates_map = {}
+        if nc_ids:
+            tpl_stmt = (
+                select(
+                    TemplateData.normalized_id,
+                    WikiTemplate.id.label('wt_id'),
+                    WikiTemplate.name,
+                    TemplateData.parameter_key,
+                    TemplateData.parameter_value,
+                    TemplateData.offset_start,
+                )
+                .join(WikiTemplate, WikiTemplate.id == TemplateData.wiki_template_id)
+                .where(TemplateData.normalized_id.in_(nc_ids))
+                .order_by(TemplateData.offset_start, TemplateData.parameter_key)
+            )
+            for t in session.execute(tpl_stmt).all():
+                templates_map.setdefault(t.normalized_id, []).append(t)
 
         # Check next revision for removed_at
         next_rev = session.execute(
@@ -133,44 +197,36 @@ def partials_citations():
             .limit(1)
         ).first()
 
-        next_rev_sha1s = set()
+        next_rev_ci_ids = set()
         if next_rev:
-            next_rev_sha1s = set(session.execute(
-                select(CitationHistory.record_sha1)
+            next_rev_ci_ids = set(session.execute(
+                select(CitationHistory.citation_instance_id)
                 .where(CitationHistory.revision_id == next_rev.revision_id)
             ).scalars().all())
 
+        # Build response
         citations = []
-        for r in rows:
-            # Other articles
-            other_articles = session.execute(
-                select(NormalizedCitation.appears_on_article, Document.id)
-                .outerjoin(Document, Document.id == NormalizedCitation.appears_on_article)
-                .where(NormalizedCitation.reference_normalized_sha1 == r.reference_normalized_sha1)
-                .where(NormalizedCitation.record_sha1 != r.record_sha1)
-            ).all()
+        for r in instance_rows:
+            hs = history_stats.get(r.ci_id)
+
+            # Other articles (exclude self)
+            other_articles = [
+                {"page_id": a.appears_on_article, "document_id": a.doc_id}
+                for a in other_articles_map.get(r.nc_id, [])
+                if a.nc_id != r.nc_id or a.appears_on_article != page_id  # exclude self
+            ]
 
             # Extracted links
-            links = session.execute(
-                select(WebResource.id, WebResource.url)
-                .join(NormalizedCitationWebResource,
-                      NormalizedCitationWebResource.web_resource_id == WebResource.id)
-                .where(NormalizedCitationWebResource.reference_normalized_sha1 == r.reference_normalized_sha1)
-            ).all()
+            links = [
+                {"web_resource_id": lk.wr_id, "url": lk.url}
+                for lk in links_map.get(r.nc_id, [])
+            ]
 
             # Templates
-            templates_raw = session.execute(
-                select(WikiTemplate.id, WikiTemplate.name,
-                       TemplateData.parameter_key, TemplateData.parameter_value,
-                       TemplateData.offset_start)
-                .join(TemplateData, TemplateData.wiki_template_id == WikiTemplate.id)
-                .where(TemplateData.reference_normalized_sha1 == r.reference_normalized_sha1)
-                .order_by(TemplateData.offset_start, TemplateData.parameter_key)
-            ).all()
-
+            tmpl_raw = templates_map.get(r.nc_id, [])
             tmpl_map = {}
-            for t in templates_raw:
-                key = (t.id, t.name, t.offset_start)
+            for t in tmpl_raw:
+                key = (t.wt_id, t.name, t.offset_start)
                 if key not in tmpl_map:
                     tmpl_map[key] = {}
                 tmpl_map[key][t.parameter_key] = t.parameter_value
@@ -180,37 +236,38 @@ def partials_citations():
             ]
 
             removed_at = None
-            if next_rev and r.record_sha1 not in next_rev_sha1s:
+            if next_rev and r.ci_id not in next_rev_ci_ids:
                 removed_at = {
                     "revision_id": next_rev.revision_id,
                     "revision_timestamp": next_rev.revision_timestamp,
                 }
 
-            ref_names = r.reference_names
-            if isinstance(ref_names, str):
-                ref_names = [n for n in ref_names.strip("{}").split(",") if n] if ref_names != "{}" else []
+            ref_names = [r.reference_name] if r.reference_name else []
 
             citations.append({
-                "record_sha1": r.record_sha1,
-                "reference_normalized_sha1": r.reference_normalized_sha1,
+                "citation_instance_id": r.ci_id,
+                "normalized_sha1": r.normalized_sha1,
                 "reference_normalized": r.reference_normalized,
                 "reference_type": TYPE_LABELS.get(r.reference_type, str(r.reference_type)),
                 "reference_names": ref_names,
-                "first_seen": {"revision_id": r.first_seen_id, "revision_timestamp": r.first_seen_ts},
-                "last_seen": {"revision_id": r.last_seen_id, "revision_timestamp": r.last_seen_ts},
+                "first_seen": {
+                    "revision_id": hs.first_seen_id if hs else None,
+                    "revision_timestamp": hs.first_seen_ts if hs else None,
+                },
+                "last_seen": {
+                    "revision_id": hs.last_seen_id if hs else None,
+                    "revision_timestamp": hs.last_seen_ts if hs else None,
+                },
                 "removed_at": removed_at,
-                "currently_visible": r.last_seen_id == latest_rev_id,
-                "appearance_count": r.appearance_count,
-                "other_articles": [
-                    {"page_id": a.appears_on_article, "document_id": a.id}
-                    for a in other_articles
-                ],
-                "extracted_links": [
-                    {"web_resource_id": l.id, "url": l.url}
-                    for l in links
-                ],
+                "currently_visible": (hs.last_seen_id == latest_rev_id) if hs else False,
+                "appearance_count": hs.appearance_count if hs else 0,
+                "other_articles": other_articles,
+                "extracted_links": links,
                 "templates": templates,
             })
+
+        # Sort by last seen descending
+        citations.sort(key=lambda c: c["last_seen"]["revision_timestamp"] or "", reverse=True)
 
     return render_template(
         "partials/citations.html",
@@ -234,10 +291,10 @@ def template_report(wiki_template_id):
             select(
                 NormalizedCitation.reference_normalized,
                 NormalizedCitation.appears_on_article,
-                TemplateData.reference_normalized_sha1,
+                NormalizedCitation.normalized_sha1,
             )
             .join(TemplateData,
-                  TemplateData.reference_normalized_sha1 == NormalizedCitation.reference_normalized_sha1)
+                  TemplateData.normalized_id == NormalizedCitation.id)
             .where(TemplateData.wiki_template_id == wiki_template_id)
             .where(TemplateData.parameter_key == parameter_key)
             .where(TemplateData.parameter_value == parameter_value)
@@ -248,7 +305,7 @@ def template_report(wiki_template_id):
         {
             "reference_normalized": r.reference_normalized,
             "appears_on_article": r.appears_on_article,
-            "reference_normalized_sha1": r.reference_normalized_sha1,
+            "normalized_sha1": r.normalized_sha1,
         }
         for r in rows
     ]

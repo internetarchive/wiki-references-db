@@ -1,26 +1,195 @@
 import io
-import json
 import os
 import sys
 import argparse
-from typing import Dict, Any
+from typing import Dict, Any, List
 from dotenv import load_dotenv
 import zstandard as zstd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from refs_extractor.article import extract_references
 from refs_extractor.syntax import normalize_wikitext, get_sha1
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# StagingWriter — writes JSONL compressed with zstandard to per-source files
+# Parquet schemas for each staging table
+# ---------------------------------------------------------------------------
+SCHEMAS = {
+    'containers': pa.schema([
+        ('label', pa.string()),
+    ]),
+    'domains': pa.schema([
+        ('value', pa.string()),
+        ('for_container_label', pa.string()),
+    ]),
+    'documents': pa.schema([
+        ('language_code', pa.string()),
+        ('has_container_label', pa.string()),
+        ('page_id', pa.int32()),
+    ]),
+    'web_resources': pa.schema([
+        ('url', pa.string()),
+        ('domain_label', pa.string()),
+        ('numeric_page_id', pa.int32()),
+        ('numeric_namespace_id', pa.int32()),
+        ('page_id', pa.int32()),
+    ]),
+    'citation_instances': pa.schema([
+        ('page_id', pa.int32()),
+        ('raw_sha1', pa.string()),
+        ('normalized_sha1', pa.string()),
+        ('reference_type', pa.int16()),
+        ('reference_name', pa.string()),
+    ]),
+    'normalized_citations': pa.schema([
+        ('normalized_sha1', pa.string()),
+        ('reference_normalized', pa.string()),
+        ('appears_on_page_id', pa.int32()),
+        ('appears_on_domain', pa.string()),
+    ]),
+    'citation_histories': pa.schema([
+        ('page_id', pa.int32()),
+        ('raw_sha1', pa.string()),
+        ('revision_id', pa.int64()),
+    ]),
+    'revisions': pa.schema([
+        ('revision_id', pa.int64()),
+        ('page_id', pa.int32()),
+        ('parent_revision_id', pa.int64()),
+        ('revision_timestamp', pa.string()),
+    ]),
+    'ncwr': pa.schema([
+        ('normalized_sha1', pa.string()),
+        ('url', pa.string()),
+    ]),
+    'wiki_templates': pa.schema([
+        ('domain_label', pa.string()),
+        ('name', pa.string()),
+    ]),
+    'template_data': pa.schema([
+        ('domain_label', pa.string()),
+        ('template_name', pa.string()),
+        ('normalized_sha1', pa.string()),
+        ('offset_start', pa.int32()),
+        ('parameter_key', pa.string()),
+        ('parameter_value', pa.string()),
+    ]),
+}
+
+# ---------------------------------------------------------------------------
+# ParquetStagingWriter — writes rows as Parquet with ZSTD compression
+# ---------------------------------------------------------------------------
+ROW_GROUP_SIZE = 10_000
+MAX_ROWS_PER_FILE = 1_000_000
+
+
+class ParquetStagingWriter:
+    """Writes rows as Parquet files with ZSTD compression to a staging directory.
+
+    Each source file gets its own set of output files (keyed by source stem + table name).
+    Row groups are buffered in memory and flushed at ROW_GROUP_SIZE rows.
+    Files are rotated at MAX_ROWS_PER_FILE rows.
+    """
+
+    def __init__(self, staging_dir: str, worker_id: str = '00'):
+        self._staging_dir = staging_dir
+        self._worker_id = worker_id
+        os.makedirs(staging_dir, exist_ok=True)
+        self._writers: Dict[str, Any] = {}  # (source_stem, table_name) -> _TableWriter
+
+    def write_rows(self, table_name: str, rows: list, source_stem: str = 'unknown'):
+        if not rows:
+            return
+        key = (source_stem, table_name)
+        if key not in self._writers:
+            self._writers[key] = _TableWriter(
+                staging_dir=self._staging_dir,
+                worker_id=self._worker_id,
+                source_stem=source_stem,
+                table_name=table_name,
+                schema=SCHEMAS[table_name],
+            )
+        self._writers[key].write_rows(rows)
+
+    def close(self):
+        for w in self._writers.values():
+            w.close()
+        self._writers.clear()
+
+
+class _TableWriter:
+    """Manages Parquet file writing for a single (source_stem, table_name) pair."""
+
+    def __init__(self, staging_dir: str, worker_id: str, source_stem: str,
+                 table_name: str, schema: pa.Schema):
+        self._staging_dir = staging_dir
+        self._worker_id = worker_id
+        self._source_stem = source_stem
+        self._table_name = table_name
+        self._schema = schema
+        self._buffer: List[dict] = []
+        self._file_index = 0
+        self._row_count = 0
+        self._writer = None
+        self._fh = None
+        self._open_writer()
+
+    def _file_path(self):
+        return os.path.join(
+            self._staging_dir,
+            f"{self._source_stem}-{self._table_name}-{self._file_index:04d}.parquet"
+        )
+
+    def _open_writer(self):
+        path = self._file_path()
+        self._writer = pq.ParquetWriter(path, self._schema, compression='zstd')
+
+    def _flush_buffer(self):
+        if not self._buffer:
+            return
+        # Ensure all rows have all schema fields (fill missing with None)
+        field_names = [f.name for f in self._schema]
+        cleaned = []
+        for row in self._buffer:
+            cleaned.append({f: row.get(f) for f in field_names})
+        table = pa.Table.from_pylist(cleaned, schema=self._schema)
+        self._writer.write_table(table)
+        self._row_count += len(self._buffer)
+        self._buffer.clear()
+        if self._row_count >= MAX_ROWS_PER_FILE:
+            self._writer.close()
+            self._file_index += 1
+            self._row_count = 0
+            self._open_writer()
+
+    def write_rows(self, rows: list):
+        for row in rows:
+            self._buffer.append(row)
+            if len(self._buffer) >= ROW_GROUP_SIZE:
+                self._flush_buffer()
+
+    def close(self):
+        if self._buffer:
+            self._flush_buffer()
+        if self._writer:
+            self._writer.close()
+            self._writer = None
+
+
+# ---------------------------------------------------------------------------
+# Legacy StagingWriter — kept for backward compatibility with JSONL+zstd
 # ---------------------------------------------------------------------------
 class StagingWriter:
     """Writes rows as JSONL compressed with zstandard (.jsonl.zst) to a staging directory.
 
     Each source file gets its own set of output files (keyed by source stem + table name).
+    DEPRECATED: Use ParquetStagingWriter instead.
     """
 
     def __init__(self, staging_dir: str):
+        import json
+        self._json = json
         self._staging_dir = staging_dir
         os.makedirs(staging_dir, exist_ok=True)
         self._compressors: Dict[str, Any] = {}  # (source_stem, table_name) -> (cctx, fh, writer)
@@ -40,7 +209,7 @@ class StagingWriter:
             return
         w = self._get_writer(table_name, source_stem)
         for row in rows:
-            line = json.dumps(row, default=str) + '\n'
+            line = self._json.dumps(row, default=str) + '\n'
             w.write(line.encode('utf-8'))
 
     def close(self):
@@ -117,12 +286,13 @@ def _normalize_template_name(raw: str) -> str:
     return norm[0].upper() + norm[1:]
 
 
-def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.org", source_stem: str = 'unknown'):
-    """Derive rows from revisions and write them to staging JSONL.zst files.
+def process_revisions(revisions, staging, domain="en.wikipedia.org", source_stem: str = 'unknown'):
+    """Derive rows from revisions and write them to staging files.
 
     No database connection is used. No in-memory deduplication is performed.
+    Works with both ParquetStagingWriter and legacy StagingWriter.
     """
-    citations, citation_histories, normalized_citations = [], [], []
+    citation_instances, citation_histories, normalized_citations = [], [], []
     revisions_rows = []
 
     domains_rows = []
@@ -170,34 +340,28 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
                 continue
 
             reference_normalized = normalize_wikitext(reference_raw)
-            record_sha1 = get_sha1(domain, page_id, reference_normalized)
-            reference_normalized_sha1 = get_sha1(reference_normalized)
-            reference_raw_sha1 = get_sha1(reference_raw)
+            normalized_sha1 = get_sha1(reference_normalized)
+            raw_sha1 = get_sha1(reference_raw)
             reference_name = ref.get('reference_name')
 
-            citations.append({
-                "record_sha1": record_sha1,
-                "reference_raw_sha1": reference_raw_sha1,
-                "offset_start": offset_start,
-                "length": length,
+            citation_instances.append({
+                "page_id": page_id,
+                "raw_sha1": raw_sha1,
+                "normalized_sha1": normalized_sha1,
                 "reference_type": reference_type,
-                "reference_normalized_sha1": reference_normalized_sha1,
                 "reference_name": reference_name,
-                "wiki_article_id": page_id
             })
 
             normalized_citations.append({
-                "record_sha1": record_sha1,
-                "reference_normalized_sha1": reference_normalized_sha1,
+                "normalized_sha1": normalized_sha1,
                 "reference_normalized": reference_normalized,
                 "appears_on_page_id": page_id,
                 "appears_on_domain": domain,
             })
 
             citation_histories.append({
-                "record_sha1": record_sha1,
-                "reference_raw_sha1": reference_raw_sha1,
-                "reference_normalized_sha1": reference_normalized_sha1,
+                "page_id": page_id,
+                "raw_sha1": raw_sha1,
                 "revision_id": revision_id,
             })
 
@@ -224,7 +388,7 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
                     'domain_label': netloc,
                 })
                 ncwr_rows.append({
-                    'reference_normalized_sha1': reference_normalized_sha1,
+                    'normalized_sha1': normalized_sha1,
                     'url': url,
                 })
 
@@ -264,7 +428,7 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
                         template_data_rows.append({
                             'domain_label': domain,
                             'template_name': normalized_tpl_name,
-                            'reference_normalized_sha1': reference_normalized_sha1,
+                            'normalized_sha1': normalized_sha1,
                             'offset_start': tpl_offset,
                             'parameter_key': key,
                             'parameter_value': val,
@@ -275,7 +439,7 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
     staging.write_rows('domains', domains_rows, source_stem=source_stem)
     staging.write_rows('documents', documents_rows, source_stem=source_stem)
     staging.write_rows('web_resources', web_resources_rows, source_stem=source_stem)
-    staging.write_rows('citations', citations, source_stem=source_stem)
+    staging.write_rows('citation_instances', citation_instances, source_stem=source_stem)
     staging.write_rows('normalized_citations', normalized_citations, source_stem=source_stem)
     staging.write_rows('citation_histories', citation_histories, source_stem=source_stem)
     staging.write_rows('revisions', revisions_rows, source_stem=source_stem)
@@ -286,7 +450,7 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
     return {
         'revisions_committed': len(revisions_rows),
         'per_table_rows': {
-            'citations': len(citations),
+            'citation_instances': len(citation_instances),
             'normalized_citations': len(normalized_citations),
             'citation_histories': len(citation_histories),
             'revisions': len(revisions_rows),
@@ -300,14 +464,18 @@ def process_revisions(revisions, staging: StagingWriter, domain="en.wikipedia.or
 
 
 def parse_args(argv=None):
-    ap = argparse.ArgumentParser(description='Parse a single .mwrev.zst file and stage derived rows as JSONL.zst files')
+    ap = argparse.ArgumentParser(description='Parse a single .mwrev.zst file and stage derived rows as Parquet files')
     ap.add_argument('file', help='Single .mwrev.zst file to process')
     ap.add_argument('-o', '--staging-dir', required=True,
-                    help='Directory to write staged JSONL.zst files')
+                    help='Directory to write staged Parquet files')
     ap.add_argument('--domain', default='en.wikipedia.org',
                     help='Wiki domain for curid URLs (default: en.wikipedia.org)')
     ap.add_argument('--batch-size', type=int, default=1000,
                     help='Revisions per processing batch (default: 1000)')
+    ap.add_argument('--format', choices=['parquet', 'jsonl'], default='parquet',
+                    help='Output format (default: parquet)')
+    ap.add_argument('--worker-id', default='00',
+                    help='Worker ID for parallel runs (default: 00)')
     return ap.parse_args(argv)
 
 
@@ -318,7 +486,10 @@ if __name__ == '__main__':
     if source_stem.endswith('.mwrev.zst'):
         source_stem = source_stem[:-len('.mwrev.zst')]
 
-    staging = StagingWriter(args.staging_dir)
+    if args.format == 'parquet':
+        staging = ParquetStagingWriter(args.staging_dir, worker_id=args.worker_id)
+    else:
+        staging = StagingWriter(args.staging_dir)
 
     batch = []
     for revision in get_revisions_from_mwrev_zst(args.file):
