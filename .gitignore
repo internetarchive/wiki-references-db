@@ -7,3 +7,4 @@ sources/
 .env
 *.zst
 output/
+staging/
