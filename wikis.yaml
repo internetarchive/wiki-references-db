@@ -1,0 +1,16 @@
+en.wikipedia.org:
+  reference_sections:
+    - articles
+    - audiobooks
+    - bibliography
+    - books
+    - external links
+    - further reading
+    - references
+    - sources
+    - works cited
+  citation_templates:
+    prefixes:
+      - cite
+    exact:
+      - citation

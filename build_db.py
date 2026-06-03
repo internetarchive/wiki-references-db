@@ -329,7 +329,7 @@ def process_revisions(revisions, staging, domain="en.wikipedia.org", source_stem
             'page_id': page_id,
         })
 
-        references = extract_references(data["revision_text"], include_offsets=True)
+        references = extract_references(data["revision_text"], include_offsets=True, domain=domain)
 
         for ref in references:
             reference_raw = ref.get('raw_reference')
