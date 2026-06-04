@@ -29,5 +29,22 @@ it.wikipedia.org:
   citation_templates:
     prefixes:
       - cita
+      - cite
     exact:
       - citazione
+af.wikipedia.org:
+  reference_sections:
+    - verwysing
+    - verwysings
+    - bibliografie
+    - eksterne skakel
+    - eksterne skakels
+    - bronne
+    - bron
+    - notas
+    - notas en verwysings
+  citation_templates:
+    prefixes:
+      - cite
+    exact:
+      - verwysing
