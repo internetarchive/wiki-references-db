@@ -342,6 +342,10 @@ def load_revisions(session, staging_dir):
 
     count = 0
     for batch in read_parquet_batches(filepath):
+        # Ensure every row has parent_revision_id (even if None) so
+        # SQLAlchemy multi-row INSERT sees consistent columns.
+        for row in batch:
+            row.setdefault('parent_revision_id', None)
         stmt = insert(Revision).values(batch)
         stmt = stmt.on_conflict_do_update(
             index_elements=['revision_id'],
