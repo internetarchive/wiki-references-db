@@ -342,12 +342,13 @@ def load_revisions(session, staging_dir):
 
     count = 0
     for batch in read_parquet_batches(filepath):
-        stmt = insert(Revision).values(batch).on_conflict_do_update(
+        stmt = insert(Revision).values(batch)
+        stmt = stmt.on_conflict_do_update(
             index_elements=['revision_id'],
             set_={
-                'page_id': insert(Revision).excluded.page_id,
-                'parent_revision_id': insert(Revision).excluded.parent_revision_id,
-                'revision_timestamp': insert(Revision).excluded.revision_timestamp,
+                'page_id': stmt.excluded.page_id,
+                'parent_revision_id': stmt.excluded.parent_revision_id,
+                'revision_timestamp': stmt.excluded.revision_timestamp,
             }
         )
         session.execute(stmt)
