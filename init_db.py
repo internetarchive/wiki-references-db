@@ -6,6 +6,13 @@ from models import Base
 
 
 def _db_url() -> str:
+    required = ['DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASS']
+    missing = [v for v in required if not os.getenv(v)]
+    if missing:
+        raise RuntimeError(
+            f"Missing required environment variable(s): {', '.join(missing)}. "
+            f"Check your .env file (see example.env)."
+        )
     return (
         f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASS')}@"
         f"{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"

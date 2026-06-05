@@ -5,6 +5,15 @@ import os
 
 app = Flask(__name__)
 load_dotenv()
+
+_required_db_vars = ['DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASS']
+_missing = [v for v in _required_db_vars if not os.getenv(v)]
+if _missing:
+    raise RuntimeError(
+        f"Missing required environment variable(s): {', '.join(_missing)}. "
+        f"Check your .env file (see example.env)."
+    )
+
 engine = create_engine(
     f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASS')}@"
     f"{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
