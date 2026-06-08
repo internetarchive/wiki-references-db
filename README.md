@@ -48,6 +48,8 @@ STAGING_DIR=./staging
 python3 init_db.py
 ```
 
+For bulk loading, create tables without secondary indexes first, then add them after loading (see `init_db.py` flags below).
+
 ## Pipeline Overview
 
 The data pipeline has three phases that transform compressed revision bundles (`.mwrev.zst` files) into a populated PostgreSQL database:
@@ -144,9 +146,30 @@ Loads deduplicated Parquet files from the `deduped/` subdirectory into PostgreSQ
 
 | Script | Description |
 |--------|-------------|
-| `init_db.py` | Creates all database tables defined in `models.py` |
+| `init_db.py` | Creates all database tables defined in `models.py` (see index flags below) |
 | `purge.py` | Drops all database tables (destructive!) |
 | `app.py` | Runs the Flask web application (API + Explorer UI) on port 12121 |
+
+### `init_db.py`
+
+Creates database tables and manages secondary indexes. By default, creates all tables with indexes.
+
+| Flag | Description |
+|------|-------------|
+| `--table TABLE` | Create only the specified table |
+| `--no-indexes` | Create tables without secondary (non-unique) indexes, for faster bulk loading |
+| `--add-indexes` | Create secondary indexes on existing tables (run after bulk loading) |
+| `--drop-indexes` | Drop secondary (non-unique) indexes from existing tables |
+
+Optimized bulk-loading workflow:
+
+```
+python3 init_db.py --no-indexes          # 1. Create tables without secondary indexes
+python3 build_all.py -d /path/to/dumps -o ./staging --jobs 4
+python3 dedup_parquet.py -d ./staging
+python3 load_all.py -d ./staging          # 2. Bulk load data
+python3 init_db.py --add-indexes          # 3. Build indexes after loading
+```
 
 ## Environment Variables
 
