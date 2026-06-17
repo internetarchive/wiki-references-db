@@ -1,0 +1,52 @@
+{% extends "explorer_base.html" %}
+{% block title %}Citation History Report{% endblock %}
+
+{% block content %}
+<hgroup>
+  <h2>Citation History Report</h2>
+  <p><code>{{ normalized_sha1 }}</code></p>
+</hgroup>
+
+<p><code style="font-size:0.85em; word-break:break-all;">{{ reference_normalized }}</code></p>
+
+<p>
+  {{ total }} revision{{ 's' if total != 1 }}
+  {% if page_id %}
+  for page <code>{{ page_id }}</code>
+  {% else %}
+  across all pages
+  {% endif %}
+  .
+</p>
+
+{% if revisions|length == 0 %}
+<article>
+  <p>No revision history found.</p>
+</article>
+{% else %}
+<table role="grid">
+  <thead>
+    <tr>
+      <th>Revision ID</th>
+      <th>Timestamp</th>
+      <th>Page</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in revisions %}
+    <tr>
+      <td><code>{{ r.revision_id }}</code></td>
+      <td>{{ r.revision_timestamp }}</td>
+      <td>
+        {% if r.url %}
+        <a href="/explorer/article?url={{ r.url|urlencode }}">{{ r.title or r.url }}</a>
+        {% else %}
+        {{ r.title or r.page_id }}
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}
