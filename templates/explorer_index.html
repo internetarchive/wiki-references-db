@@ -1,0 +1,26 @@
+{% extends "explorer_base.html" %}
+{% block title %}Citation Explorer{% endblock %}
+
+{% block content %}
+<hgroup>
+  <h2>Citation Explorer</h2>
+  <p>Enter a Wikipedia article URL to explore its citation history over time.</p>
+  <p><a href="/api/v1/docs" target="_blank" rel="noopener">API documentation</a></p>
+</hgroup>
+
+<form action="/explorer/article" method="get">
+  <label for="url">Wikipedia Article URL</label>
+  <input type="url" id="url" name="url" placeholder="https://en.wikipedia.org/wiki/..." value="https://en.wikipedia.org/wiki/Siemens_scandal" required>
+  <label>
+    <input type="checkbox" name="follow_redirects" value="1" checked>
+    Follow redirects
+  </label>
+  <button type="submit">Explore</button>
+</form>
+
+{% if error %}
+<article>
+  <p>{{ error }}</p>
+</article>
+{% endif %}
+{% endblock %}

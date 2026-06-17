@@ -1,0 +1,523 @@
+openapi: 3.0.3
+info:
+  title: Wiki References DB API
+  description: >
+    API for querying Wikipedia article citation history, normalized citations,
+    template data, and web resources. Supports the timeline-based Citation
+    Explorer frontend as well as general programmatic access.
+  version: "1.0.0"
+  license:
+    name: MIT
+
+servers:
+  - url: /api/v1
+    description: Local development
+
+paths:
+  /article:
+    get:
+      operationId: getArticle
+      summary: Resolve a Wikipedia URL to article metadata and available revisions
+      parameters:
+        - name: url
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Full Wikipedia article URL
+      responses:
+        "200":
+          description: Article metadata with revision list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArticleResponse"
+        "404":
+          description: Article not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /article/{page_id}/revisions:
+    get:
+      operationId: getArticleRevisions
+      summary: List all tracked revisions for an article
+      parameters:
+        - name: page_id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/offset"
+      responses:
+        "200":
+          description: Paginated revision list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevisionsResponse"
+
+  /article/{page_id}/citations:
+    get:
+      operationId: getArticleCitations
+      summary: Get citations present at a specific revision (core timeline endpoint)
+      parameters:
+        - name: page_id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: revision_id
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Specific revision; defaults to latest tracked revision
+        - name: raw
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: If true, return raw (un-normalized) citations
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/offset"
+      responses:
+        "200":
+          description: Citations at the requested revision
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CitationsResponse"
+        "404":
+          description: Article or revision not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /citation/{record_sha1}:
+    get:
+      operationId: getCitation
+      summary: Get full details for a single normalized citation across all articles
+      parameters:
+        - name: record_sha1
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Citation details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CitationDetailResponse"
+        "404":
+          description: Citation not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /citation/{record_sha1}/history:
+    get:
+      operationId: getCitationHistory
+      summary: Full revision history for a citation, optionally filtered by article
+      parameters:
+        - name: record_sha1
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: page_id
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Filter to a specific article's page ID
+      responses:
+        "200":
+          description: Revision history for the citation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CitationHistoryResponse"
+        "404":
+          description: Citation not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /template/{wiki_template_id}/report:
+    get:
+      operationId: getTemplateReport
+      summary: Find all citations using a specific template parameter value
+      parameters:
+        - name: wiki_template_id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: parameter_key
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Template parameter name (e.g., url, doi)
+        - name: parameter_value
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Parameter value to match
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/offset"
+      responses:
+        "200":
+          description: Citations matching the template parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateReportResponse"
+        "404":
+          description: Template not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /web_resource:
+    get:
+      operationId: getWebResource
+      summary: Look up a web resource (URL) and find which citations reference it
+      parameters:
+        - name: url
+          in: query
+          required: true
+          schema:
+            type: string
+          description: The URL to look up
+      responses:
+        "200":
+          description: Web resource details with referencing citations
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebResourceResponse"
+        "404":
+          description: Web resource not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+components:
+  parameters:
+    limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        default: 100
+        maximum: 1000
+      description: Maximum number of results to return
+    offset:
+      name: offset
+      in: query
+      required: false
+      schema:
+        type: integer
+        default: 0
+      description: Pagination offset
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: integer
+
+    RevisionSummary:
+      type: object
+      properties:
+        revision_id:
+          type: integer
+        revision_timestamp:
+          type: string
+          description: ISO 8601 timestamp
+        parent_revision_id:
+          type: integer
+          nullable: true
+
+    RevisionWithCount:
+      allOf:
+        - $ref: "#/components/schemas/RevisionSummary"
+        - type: object
+          properties:
+            citation_count:
+              type: integer
+
+    ArticleResponse:
+      type: object
+      properties:
+        page_id:
+          type: integer
+        url:
+          type: string
+        document_id:
+          type: integer
+          nullable: true
+        revisions:
+          type: array
+          items:
+            $ref: "#/components/schemas/RevisionSummary"
+        revision_count:
+          type: integer
+        latest_revision_id:
+          type: integer
+          nullable: true
+
+    RevisionsResponse:
+      type: object
+      properties:
+        page_id:
+          type: integer
+        revisions:
+          type: array
+          items:
+            $ref: "#/components/schemas/RevisionWithCount"
+        total:
+          type: integer
+
+    RevisionRef:
+      type: object
+      properties:
+        revision_id:
+          type: integer
+        revision_timestamp:
+          type: string
+
+    TemplateParam:
+      type: object
+      properties:
+        wiki_template_id:
+          type: integer
+        template_name:
+          type: string
+        parameters:
+          type: object
+          additionalProperties:
+            type: string
+            nullable: true
+
+    ExtractedLink:
+      type: object
+      properties:
+        web_resource_id:
+          type: integer
+        url:
+          type: string
+
+    OtherArticle:
+      type: object
+      properties:
+        page_id:
+          type: integer
+        document_id:
+          type: integer
+          nullable: true
+
+    NormalizedCitationItem:
+      type: object
+      properties:
+        record_sha1:
+          type: string
+        reference_normalized_sha1:
+          type: string
+        reference_normalized:
+          type: string
+        reference_type:
+          type: string
+          enum: [other, inline, endnote]
+        reference_names:
+          type: array
+          items:
+            type: string
+        first_seen:
+          $ref: "#/components/schemas/RevisionRef"
+        last_seen:
+          $ref: "#/components/schemas/RevisionRef"
+        removed_at:
+          $ref: "#/components/schemas/RevisionRef"
+          nullable: true
+        currently_visible:
+          type: boolean
+        appearance_count:
+          type: integer
+        other_articles:
+          type: array
+          items:
+            $ref: "#/components/schemas/OtherArticle"
+        extracted_links:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtractedLink"
+        templates:
+          type: array
+          items:
+            $ref: "#/components/schemas/TemplateParam"
+
+    RawCitationItem:
+      type: object
+      properties:
+        record_sha1:
+          type: string
+        reference_raw_sha1:
+          type: string
+        offset_start:
+          type: integer
+          nullable: true
+        length:
+          type: integer
+          nullable: true
+        reference_type:
+          type: string
+          enum: [other, inline, endnote]
+        reference_name:
+          type: string
+          nullable: true
+        first_seen:
+          $ref: "#/components/schemas/RevisionRef"
+        last_seen:
+          $ref: "#/components/schemas/RevisionRef"
+        currently_visible:
+          type: boolean
+        appearance_count:
+          type: integer
+
+    CitationsResponse:
+      type: object
+      properties:
+        page_id:
+          type: integer
+        revision_id:
+          type: integer
+        revision_timestamp:
+          type: string
+        citation_count:
+          type: integer
+        citations:
+          type: array
+          items:
+            oneOf:
+              - $ref: "#/components/schemas/NormalizedCitationItem"
+              - $ref: "#/components/schemas/RawCitationItem"
+
+    CitationDetailResponse:
+      type: object
+      properties:
+        record_sha1:
+          type: string
+        reference_normalized_sha1:
+          type: string
+        reference_normalized:
+          type: string
+        appears_on_articles:
+          type: array
+          items:
+            $ref: "#/components/schemas/OtherArticle"
+        extracted_links:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtractedLink"
+        templates:
+          type: array
+          items:
+            $ref: "#/components/schemas/TemplateParam"
+        history:
+          type: array
+          items:
+            type: object
+            properties:
+              revision_id:
+                type: integer
+              revision_timestamp:
+                type: string
+              page_id:
+                type: integer
+
+    CitationHistoryResponse:
+      type: object
+      properties:
+        record_sha1:
+          type: string
+        revisions:
+          type: array
+          items:
+            type: object
+            properties:
+              revision_id:
+                type: integer
+              revision_timestamp:
+                type: string
+              page_id:
+                type: integer
+
+    TemplateReportResponse:
+      type: object
+      properties:
+        wiki_template_id:
+          type: integer
+        template_name:
+          type: string
+        parameter_key:
+          type: string
+        parameter_value:
+          type: string
+        citations:
+          type: array
+          items:
+            type: object
+            properties:
+              record_sha1:
+                type: string
+              reference_normalized_sha1:
+                type: string
+              reference_normalized:
+                type: string
+              appears_on_article:
+                type: integer
+        total:
+          type: integer
+
+    WebResourceResponse:
+      type: object
+      properties:
+        web_resource_id:
+          type: integer
+        url:
+          type: string
+        domain:
+          type: string
+          nullable: true
+        numeric_page_id:
+          type: integer
+          nullable: true
+        referenced_by:
+          type: array
+          items:
+            type: object
+            properties:
+              reference_normalized_sha1:
+                type: string
+              record_sha1:
+                type: string
+              appears_on_article:
+                type: integer

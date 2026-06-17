@@ -1,0 +1,48 @@
+{% extends "explorer_base.html" %}
+{% block title %}Citation Other Pages Report{% endblock %}
+
+{% block content %}
+<hgroup>
+  <h2>Citation Other Pages Report</h2>
+  <p><code>{{ normalized_sha1 }}</code></p>
+</hgroup>
+
+<p><code style="font-size:0.85em; word-break:break-all;">{{ reference_normalized }}</code></p>
+
+<p>
+  {{ total }} other page{{ 's' if total != 1 }}
+  {% if current_page_id %}
+  (excluding current page <code>{{ current_page_id }}</code>)
+  {% endif %}
+  .
+</p>
+
+{% if articles|length == 0 %}
+<article>
+  <p>No other pages found for this citation.</p>
+</article>
+{% else %}
+<table role="grid">
+  <thead>
+    <tr>
+      <th>Page</th>
+      <th>Title / URL</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for a in articles %}
+    <tr>
+      <td><code>{{ a.page_id }}</code></td>
+      <td>
+        {% if a.url %}
+        <a href="/explorer/article?url={{ a.url|urlencode }}">{{ a.title or a.url }}</a>
+        {% else %}
+        {{ a.title or 'unknown article' }}
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

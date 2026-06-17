@@ -1,0 +1,50 @@
+en.wikipedia.org:
+  reference_sections:
+    - articles
+    - audiobooks
+    - bibliography
+    - books
+    - external links
+    - further reading
+    - references
+    - sources
+    - works cited
+    - discography
+    - see also
+  citation_templates:
+    prefixes:
+      - cite
+    exact:
+      - citation
+it.wikipedia.org:
+  reference_sections:
+    - note
+    - bibliografia
+    - fonti
+    - collegamenti esterni
+    - opere
+    - discografia
+    - pagine correlate
+    - voci correlate
+  citation_templates:
+    prefixes:
+      - cita
+      - cite
+    exact:
+      - citazione
+af.wikipedia.org:
+  reference_sections:
+    - verwysing
+    - verwysings
+    - bibliografie
+    - eksterne skakel
+    - eksterne skakels
+    - bronne
+    - bron
+    - notas
+    - notas en verwysings
+  citation_templates:
+    prefixes:
+      - cite
+    exact:
+      - verwysing

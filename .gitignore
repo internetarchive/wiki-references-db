@@ -3,3 +3,8 @@ credentials.py
 venv/
 __pycache__/
 sources/
+.idea/
+.env
+*.zst
+output/
+staging/

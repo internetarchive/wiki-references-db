@@ -1,0 +1,34 @@
+{% extends "explorer_base.html" %}
+{% block title %}Template Report: {{ template_name }}{% endblock %}
+
+{% block content %}
+<hgroup>
+  <h2>Template Report</h2>
+  <p><strong>{{ template_name }}</strong> — <code>{{ parameter_key }}</code> = <code>{{ parameter_value }}</code></p>
+</hgroup>
+
+<p>{{ total }} citation{{ 's' if total != 1 }} use this template parameter value.</p>
+
+{% if citations|length == 0 %}
+<article>
+  <p>No citations found.</p>
+</article>
+{% else %}
+<table role="grid">
+  <thead>
+    <tr>
+      <th>Normalized Citation</th>
+      <th>Article (document ID)</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for c in citations %}
+    <tr>
+      <td><code style="font-size:0.8em; word-break:break-all;">{{ c.reference_normalized }}</code></td>
+      <td>{{ c.appears_on_article }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}
