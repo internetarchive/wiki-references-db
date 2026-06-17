@@ -150,6 +150,20 @@ Loads deduplicated Parquet files from the `deduped/` subdirectory into PostgreSQ
 | `purge.py` | Drops all database tables (destructive!) |
 | `app.py` | Runs the Flask web application (API + Explorer UI) on port 12121 |
 
+### Run Explorer with Gunicorn
+
+After installing dependencies and configuring your `.env`, you can run the app (including the `/explorer/` UI) with Gunicorn:
+
+```
+gunicorn --bind 0.0.0.0:12121 app:app
+```
+
+Then open:
+
+```
+http://localhost:12121/explorer/
+```
+
 ### `init_db.py`
 
 Creates database tables and manages secondary indexes. By default, creates all tables with indexes.

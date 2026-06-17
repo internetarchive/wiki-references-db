@@ -6,6 +6,7 @@ typing-extensions>=4.5.0
 sqlalchemy>=2.0.25
 asyncpg>=0.29.0
 Flask
+gunicorn
 Jinja2
 python-dotenv
 zstandard>=0.22.0
