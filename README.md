@@ -187,6 +187,9 @@ All environment variables are loaded from a `.env` file via `python-dotenv`. See
 | `BATCH_SIZE` | build_all → build_db | `1000` | Revisions per batch in build_db workers |
 | `METRICS_INTERVAL` | build_all | `10` | Seconds between status prints |
 | `LOAD_BATCH_SIZE` | load_all | `5000` | Rows per INSERT batch when loading into Postgres |
+| `WIKIPEDIA_API_USER_AGENT` | explorer | `WikiReferencesDB/1.0` | Primary product token used in MediaWiki API `User-Agent` headers |
+| `WIKIPEDIA_API_CONTACT_EMAIL` | explorer | — | Contact email appended in parentheses in MediaWiki API `User-Agent` headers |
+| `WIKIPEDIA_API_SECONDARY_USER_AGENT` | explorer | — | Optional secondary product token appended to the MediaWiki API `User-Agent` |
 
 ## Revision Bundles
 

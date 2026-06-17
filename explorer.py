@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from functools import lru_cache
 from urllib.parse import urlparse, parse_qs
@@ -17,6 +18,20 @@ explorer = Blueprint('explorer', __name__, url_prefix='/explorer')
 TYPE_LABELS = {0: "other", 1: "inline", 2: "endnote"}
 
 
+def _get_wikipedia_api_headers() -> dict[str, str]:
+    contact_email = (os.getenv("WIKIPEDIA_API_CONTACT_EMAIL") or "").strip()
+    primary_token = (os.getenv("WIKIPEDIA_API_USER_AGENT") or "WikiReferencesDB/1.0").strip()
+    secondary_token = (os.getenv("WIKIPEDIA_API_SECONDARY_USER_AGENT") or "").strip()
+
+    user_agent = primary_token
+    if contact_email:
+        user_agent = f"{user_agent} ({contact_email})"
+    if secondary_token:
+        user_agent = f"{user_agent} {secondary_token}"
+
+    return {"User-Agent": user_agent}
+
+
 @lru_cache(maxsize=1024)
 def _resolve_wikipedia_title_to_curid(domain: str, title: str, follow_redirects: bool) -> str | None:
     """Resolve a Wikipedia page title to a curid-based URL via the MediaWiki API.
@@ -32,7 +47,7 @@ def _resolve_wikipedia_title_to_curid(domain: str, title: str, follow_redirects:
     if follow_redirects:
         params["redirects"] = 1
     try:
-        resp = http_requests.get(api_url, params=params, timeout=10)
+        resp = http_requests.get(api_url, params=params, headers=_get_wikipedia_api_headers(), timeout=10)
         data = resp.json()
     except Exception:
         return None
