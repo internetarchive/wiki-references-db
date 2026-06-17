@@ -31,15 +31,20 @@
     {% if c.removed_at %}
     · <strong>Removed at:</strong> {{ c.removed_at.revision_timestamp }}
     {% endif %}
-    · Appeared in {{ c.appearance_count }} revision{{ 's' if c.appearance_count != 1 }}
+    · <a href="/explorer/citation/{{ c.normalized_sha1 }}/report?page_id={{ page_id }}" target="_blank" title="Show revision/page breakdown for this citation">
+      Appeared in {{ c.appearance_count }} revision{{ 's' if c.appearance_count != 1 }}
+    </a>
     {% if c.other_articles|length > 0 %}
-    · Also on {{ c.other_articles|length }} other article{{ 's' if c.other_articles|length != 1 }}
+    · Also on
+    {% for art in c.other_articles %}
+      <a href="/explorer/article?url={{ art.url|urlencode }}">{{ art.title or art.url or 'unknown article' }}</a>{{ ", " if not loop.last }}
+    {% endfor %}
     {% endif %}
   </div>
 
   {% if c.extracted_links or c.templates %}
   <details>
-    <summary>Details</summary>
+    <summary><strong>🔎 Details</strong></summary>
 
     {% if c.extracted_links %}
     <p><strong>Extracted links:</strong></p>
