@@ -17,6 +17,14 @@ explorer = Blueprint('explorer', __name__, url_prefix='/explorer')
 
 TYPE_LABELS = {0: "other", 1: "inline", 2: "endnote"}
 
+NAME_ONLY_REF_RE = re.compile(r'^<ref\s+name\s*=\s*(?:"[^"]+"|\'[^\']+\'|[^\s>/]+)\s*/\s*>$', re.IGNORECASE)
+
+
+def _is_name_only_reference(reference_normalized: str | None, reference_name: str | None) -> bool:
+    if not reference_name or not reference_normalized:
+        return False
+    return bool(NAME_ONLY_REF_RE.match(reference_normalized.strip()))
+
 
 def _get_wikipedia_api_headers() -> dict[str, str]:
     contact_email = (os.getenv("WIKIPEDIA_API_CONTACT_EMAIL") or "").strip()
@@ -308,6 +316,7 @@ def partials_citations():
         citations = []
         for r in instance_rows:
             hs = history_stats.get(r.ci_id)
+            is_name_only = _is_name_only_reference(r.reference_normalized, r.reference_name)
 
             # Other articles (exclude self)
             other_articles = [
@@ -319,7 +328,7 @@ def partials_citations():
                 }
                 for a in other_articles_map.get(r.nc_id, [])
                 if a.appears_on_article != current_doc_id  # exclude self using document ID
-            ]
+            ] if not is_name_only else []
 
             # Extracted links
             links = [
@@ -473,6 +482,26 @@ def citation_other_articles_report(normalized_sha1):
                 total=0,
             )
 
+        has_named_instance = session.execute(
+            select(CitationInstance.id)
+            .where(CitationInstance.normalized_id == nc.id)
+            .where(CitationInstance.reference_name.isnot(None))
+            .where(CitationInstance.reference_name != "")
+            .limit(1)
+        ).first() is not None
+        normalized_text = str(nc.reference_normalized or "")
+        is_name_only = has_named_instance and _is_name_only_reference(normalized_text, "name")
+
+        if is_name_only:
+            return render_template(
+                "explorer_citation_other_articles_report.html",
+                normalized_sha1=normalized_sha1,
+                reference_normalized=normalized_text,
+                current_page_id=current_page_id,
+                articles=[],
+                total=0,
+            )
+
         current_doc_id = None
         if current_page_id is not None:
             current_doc_id = session.execute(
@@ -522,7 +551,7 @@ def citation_other_articles_report(normalized_sha1):
     return render_template(
         "explorer_citation_other_articles_report.html",
         normalized_sha1=normalized_sha1,
-        reference_normalized=nc.reference_normalized,
+        reference_normalized=normalized_text,
         current_page_id=current_page_id,
         articles=articles,
         total=len(articles),
