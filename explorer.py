@@ -378,8 +378,80 @@ def partials_citations():
         "partials/citations.html",
         citations=citations,
         citation_count=len(citations),
+        page_id=page_id,
         revision_id=revision_id,
         revision_timestamp=rev_ts,
+    )
+
+
+@explorer.route("/citation/<normalized_sha1>/report", methods=["GET"])
+def citation_report(normalized_sha1):
+    page_id = request.args.get("page_id", type=int)
+
+    with Session(_get_engine()) as session:
+        nc = session.query(NormalizedCitation).filter(
+            NormalizedCitation.normalized_sha1 == normalized_sha1
+        ).first()
+        if not nc:
+            return render_template(
+                "explorer_citation_report.html",
+                normalized_sha1=normalized_sha1,
+                reference_normalized="Citation not found",
+                page_id=page_id,
+                revisions=[],
+                total=0,
+            )
+
+        article_wr = (
+            select(
+                WebResource.instance_of_document,
+                WebResource.url.label("article_url"),
+            )
+            .where(WebResource.instance_of_document.isnot(None))
+            .distinct(WebResource.instance_of_document)
+            .subquery()
+        )
+
+        stmt = (
+            select(
+                CitationHistory.revision_id,
+                Revision.revision_timestamp,
+                Revision.page_id,
+                Document.id.label("doc_id"),
+                Document.title.label("doc_title"),
+                article_wr.c.article_url,
+            )
+            .join(Revision, Revision.revision_id == CitationHistory.revision_id)
+            .join(CitationInstance, CitationInstance.id == CitationHistory.citation_instance_id)
+            .outerjoin(Document, Document.id == Revision.page_id)
+            .outerjoin(article_wr, article_wr.c.instance_of_document == Revision.page_id)
+            .where(CitationInstance.normalized_id == nc.id)
+        )
+        if page_id is not None:
+            stmt = stmt.where(Revision.page_id == page_id)
+        stmt = stmt.order_by(Revision.revision_timestamp)
+
+        rows = session.execute(stmt).all()
+
+    revisions = [
+        {
+            "revision_id": r.revision_id,
+            "revision_timestamp": r.revision_timestamp,
+            "page_id": r.page_id,
+            "document_id": r.doc_id,
+            "title": r.doc_title,
+            "url": r.article_url,
+        }
+        for r in rows
+    ]
+
+    return render_template(
+        "explorer_citation_report.html",
+        normalized_sha1=normalized_sha1,
+        reference_normalized=nc.reference_normalized,
+        page_id=page_id,
+        revisions=revisions,
+        total=len(revisions),
     )
 
 

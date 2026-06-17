@@ -15,7 +15,7 @@
 <div>
   <label for="revSlider"><strong>Revision timeline</strong></label>
   <input type="range" id="revSlider" name="revision_index" min="0" max="{{ revisions|length - 1 }}" value="{{ revisions|length - 1 }}">
-  <div class="slider-label" id="tsLabel">{{ revisions[-1].revision_timestamp }}</div>
+  <div class="slider-label" id="tsLabel"></div>
 </div>
 
 <div id="citations-area">
@@ -35,6 +35,20 @@
   const label = document.getElementById('tsLabel');
   const area = document.getElementById('citations-area');
 
+  function revisionTimestampMs(revision) {
+    return Date.parse(revision.revision_timestamp);
+  }
+
+  const firstTs = revisionTimestampMs(revisions[0]);
+  const lastTs = revisionTimestampMs(revisions[revisions.length - 1]);
+  const isAscending = Number.isFinite(firstTs) && Number.isFinite(lastTs)
+    ? firstTs <= lastTs
+    : revisions[0].revision_id <= revisions[revisions.length - 1].revision_id;
+
+  function revisionIndexForSliderValue(value) {
+    return isAscending ? value : (revisions.length - 1 - value);
+  }
+
   function loadCitations(revisionId) {
     area.innerHTML = '<p aria-busy="true">Loading citations…</p>';
     htmx.ajax('GET', '/explorer/partials/citations?page_id=' + pageId + '&revision_id=' + revisionId, {target: '#citations-area', swap: 'innerHTML'});
@@ -42,7 +56,7 @@
 
   let debounceTimer;
   slider.addEventListener('input', function() {
-    const idx = parseInt(this.value);
+    const idx = revisionIndexForSliderValue(parseInt(this.value, 10));
     label.textContent = revisions[idx].revision_timestamp;
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(function() {
@@ -50,8 +64,10 @@
     }, 250);
   });
 
-  // Load latest on page load
-  loadCitations(revisions[revisions.length - 1].revision_id);
+  // Start with the most recent revision on the right side of the slider.
+  const initialIdx = revisionIndexForSliderValue(parseInt(slider.value, 10));
+  label.textContent = revisions[initialIdx].revision_timestamp;
+  loadCitations(revisions[initialIdx].revision_id);
 </script>
 {% endif %}
 {% endblock %}
