@@ -1,5 +1,8 @@
-from flask import Blueprint, request, jsonify
-from sqlalchemy import func, and_, select
+from pathlib import Path
+
+import yaml
+from flask import Blueprint, request, jsonify, Response
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from models import (
     WebResource, Document, CitationInstance, CitationHistory, NormalizedCitation,
@@ -22,6 +25,44 @@ def _error(msg, code):
 
 def _paginate(q, limit, offset):
     return q.limit(limit).offset(offset)
+
+
+def _load_openapi_spec() -> dict:
+    spec_path = Path(__file__).with_name("openapi.yaml")
+    with spec_path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+@api_v1.route("/openapi.json", methods=["GET"])
+def openapi_spec():
+    return jsonify(_load_openapi_spec())
+
+
+@api_v1.route("/docs", methods=["GET"])
+def openapi_docs():
+    html = """<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"UTF-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>Wiki References DB API Docs</title>
+  <link rel=\"stylesheet\" href=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui.css\" />
+</head>
+<body>
+  <div id=\"swagger-ui\"></div>
+  <script src=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js\"></script>
+  <script>
+    window.ui = SwaggerUIBundle({
+      url: '/api/v1/openapi.json',
+      dom_id: '#swagger-ui',
+      deepLinking: true,
+      presets: [SwaggerUIBundle.presets.apis],
+    });
+  </script>
+</body>
+</html>
+"""
+    return Response(html, mimetype="text/html")
 
 
 @api_v1.route("/article", methods=["GET"])

@@ -1,4 +1,9 @@
 import json
+import re
+from functools import lru_cache
+from urllib.parse import urlparse, parse_qs
+
+import requests as http_requests
 from flask import Blueprint, request, render_template
 from sqlalchemy import func, and_, select
 from sqlalchemy.orm import Session
@@ -10,6 +15,60 @@ from models import (
 explorer = Blueprint('explorer', __name__, url_prefix='/explorer')
 
 TYPE_LABELS = {0: "other", 1: "inline", 2: "endnote"}
+
+
+@lru_cache(maxsize=1024)
+def _resolve_wikipedia_title_to_curid(domain: str, title: str, follow_redirects: bool) -> str | None:
+    """Resolve a Wikipedia page title to a curid-based URL via the MediaWiki API.
+
+    Results are cached (LRU, 1024 entries) to avoid repeated API calls.
+    """
+    api_url = f"https://{domain}/w/api.php"
+    params = {
+        "action": "query",
+        "titles": title,
+        "format": "json",
+    }
+    if follow_redirects:
+        params["redirects"] = 1
+    try:
+        resp = http_requests.get(api_url, params=params, timeout=10)
+        data = resp.json()
+    except Exception:
+        return None
+    pages = data.get("query", {}).get("pages", {})
+    for page_id, page_info in pages.items():
+        if page_id == "-1":
+            return None
+        return f"https://{domain}/w/index.php?curid={page_id}"
+    return None
+
+
+def resolve_wikipedia_url_to_curid(url: str, follow_redirects: bool = True) -> str | None:
+    """If *url* is a title-based Wikipedia URL, resolve it to the canonical
+    curid-based URL.  Returns ``None`` when the URL is not recognised or
+    resolution fails."""
+    parsed = urlparse(url)
+    domain = parsed.netloc
+    title = None
+
+    # /wiki/PageTitle
+    wiki_match = re.match(r'^/wiki/(.+)$', parsed.path)
+    if wiki_match:
+        title = wiki_match.group(1)
+
+    # /w/index.php?title=PageTitle  or  /wiki/index.php?title=PageTitle
+    if parsed.path in ('/w/index.php', '/wiki/index.php'):
+        qs = parse_qs(parsed.query)
+        if 'title' in qs:
+            title = qs['title'][0]
+        elif 'curid' in qs:
+            return url  # already in curid format
+
+    if not title or not domain:
+        return None
+
+    return _resolve_wikipedia_title_to_curid(domain, title, follow_redirects)
 
 
 def _get_engine():
@@ -25,8 +84,14 @@ def index():
 @explorer.route("/article", methods=["GET"])
 def article_view():
     url = request.args.get("url")
+    follow_redirects = "follow_redirects" in request.args
     if not url:
         return render_template("explorer_index.html", error="Please enter a URL.")
+
+    # Normalise title-based Wikipedia URLs to curid format
+    resolved = resolve_wikipedia_url_to_curid(url, follow_redirects=follow_redirects)
+    if resolved:
+        url = resolved
 
     with Session(_get_engine()) as session:
         wr = session.query(WebResource).filter(WebResource.url == url).first()
@@ -81,6 +146,13 @@ def partials_citations():
         ).scalar()
         if rev_ts is None:
             return "<p>Revision not found.</p>", 404
+
+        # Find the document_id for the current article so we can exclude it from "other articles"
+        current_doc_id = session.execute(
+            select(WebResource.instance_of_document)
+            .where(WebResource.numeric_page_id == page_id)
+            .limit(1)
+        ).scalar()
 
         latest_rev_id = session.execute(
             select(func.max(Revision.revision_id)).where(Revision.page_id == page_id)
@@ -140,15 +212,28 @@ def partials_citations():
             history_stats[hs.citation_instance_id] = hs
 
         # Batch: other articles sharing the same normalized citation
+        # Join through to WebResource to get the article URL and Document for the title
         other_articles_map = {}
         if nc_ids:
+            article_wr = (
+                select(
+                    WebResource.instance_of_document,
+                    WebResource.url.label('article_url'),
+                )
+                .where(WebResource.instance_of_document.isnot(None))
+                .distinct(WebResource.instance_of_document)
+                .subquery()
+            )
             oa_stmt = (
                 select(
                     NormalizedCitation.id.label('nc_id'),
                     NormalizedCitation.appears_on_article,
                     Document.id.label('doc_id'),
+                    Document.title.label('doc_title'),
+                    article_wr.c.article_url,
                 )
                 .outerjoin(Document, Document.id == NormalizedCitation.appears_on_article)
+                .outerjoin(article_wr, article_wr.c.instance_of_document == NormalizedCitation.appears_on_article)
                 .where(NormalizedCitation.id.in_(nc_ids))
             )
             for oa in session.execute(oa_stmt).all():
@@ -211,9 +296,14 @@ def partials_citations():
 
             # Other articles (exclude self)
             other_articles = [
-                {"page_id": a.appears_on_article, "document_id": a.doc_id}
+                {
+                    "page_id": a.appears_on_article,
+                    "document_id": a.doc_id,
+                    "title": a.doc_title,
+                    "url": a.article_url,
+                }
                 for a in other_articles_map.get(r.nc_id, [])
-                if a.nc_id != r.nc_id or a.appears_on_article != page_id  # exclude self
+                if a.appears_on_article != current_doc_id  # exclude self using document ID
             ]
 
             # Extracted links
