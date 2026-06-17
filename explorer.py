@@ -455,6 +455,80 @@ def citation_report(normalized_sha1):
     )
 
 
+@explorer.route("/citation/<normalized_sha1>/other-articles", methods=["GET"])
+def citation_other_articles_report(normalized_sha1):
+    current_page_id = request.args.get("page_id", type=int)
+
+    with Session(_get_engine()) as session:
+        nc = session.query(NormalizedCitation).filter(
+            NormalizedCitation.normalized_sha1 == normalized_sha1
+        ).first()
+        if not nc:
+            return render_template(
+                "explorer_citation_other_articles_report.html",
+                normalized_sha1=normalized_sha1,
+                reference_normalized="Citation not found",
+                current_page_id=current_page_id,
+                articles=[],
+                total=0,
+            )
+
+        current_doc_id = None
+        if current_page_id is not None:
+            current_doc_id = session.execute(
+                select(WebResource.instance_of_document)
+                .where(WebResource.numeric_page_id == current_page_id)
+                .limit(1)
+            ).scalar()
+
+        article_wr = (
+            select(
+                WebResource.instance_of_document,
+                WebResource.url.label("article_url"),
+            )
+            .where(WebResource.instance_of_document.isnot(None))
+            .distinct(WebResource.instance_of_document)
+            .subquery()
+        )
+
+        stmt = (
+            select(
+                Revision.page_id.label("doc_id"),
+                Document.title.label("doc_title"),
+                article_wr.c.article_url,
+            )
+            .join(CitationHistory, CitationHistory.revision_id == Revision.revision_id)
+            .join(CitationInstance, CitationInstance.id == CitationHistory.citation_instance_id)
+            .outerjoin(Document, Document.id == Revision.page_id)
+            .outerjoin(article_wr, article_wr.c.instance_of_document == Revision.page_id)
+            .where(CitationInstance.normalized_id == nc.id)
+            .distinct(Revision.page_id, Document.title, article_wr.c.article_url)
+            .order_by(Document.title, Revision.page_id)
+        )
+        if current_doc_id is not None:
+            stmt = stmt.where(Revision.page_id != current_doc_id)
+
+        rows = session.execute(stmt).all()
+
+    articles = [
+        {
+            "page_id": r.doc_id,
+            "title": r.doc_title,
+            "url": r.article_url,
+        }
+        for r in rows
+    ]
+
+    return render_template(
+        "explorer_citation_other_articles_report.html",
+        normalized_sha1=normalized_sha1,
+        reference_normalized=nc.reference_normalized,
+        current_page_id=current_page_id,
+        articles=articles,
+        total=len(articles),
+    )
+
+
 @explorer.route("/template/<int:wiki_template_id>/report", methods=["GET"])
 def template_report(wiki_template_id):
     parameter_key = request.args.get("parameter_key", "")

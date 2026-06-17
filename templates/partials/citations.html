@@ -35,10 +35,9 @@
       Appeared in {{ c.appearance_count }} revision{{ 's' if c.appearance_count != 1 }}
     </a>
     {% if c.other_articles|length > 0 %}
-    · Also on
-    {% for art in c.other_articles %}
-      <a href="/explorer/article?url={{ art.url|urlencode }}">{{ art.title or art.url or 'unknown article' }}</a>{{ ", " if not loop.last }}
-    {% endfor %}
+    · <a href="/explorer/citation/{{ c.normalized_sha1 }}/other-articles?page_id={{ page_id }}" target="_blank" title="Show all other pages where this citation appears">
+      Also on {{ c.other_articles|length }} page{{ 's' if c.other_articles|length != 1 }}
+    </a>
     {% endif %}
   </div>
 
