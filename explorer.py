@@ -421,19 +421,31 @@ def citation_report(normalized_sha1):
             .subquery()
         )
 
+        page_doc = (
+            select(
+                WebResource.numeric_page_id.label("page_id"),
+                WebResource.instance_of_document.label("doc_id"),
+            )
+            .where(WebResource.numeric_page_id.isnot(None))
+            .where(WebResource.instance_of_document.isnot(None))
+            .distinct(WebResource.numeric_page_id)
+            .subquery()
+        )
+
         stmt = (
             select(
                 CitationHistory.revision_id,
                 Revision.revision_timestamp,
                 Revision.page_id,
-                Document.id.label("doc_id"),
+                page_doc.c.doc_id,
                 Document.title.label("doc_title"),
                 article_wr.c.article_url,
             )
             .join(Revision, Revision.revision_id == CitationHistory.revision_id)
             .join(CitationInstance, CitationInstance.id == CitationHistory.citation_instance_id)
-            .outerjoin(Document, Document.id == Revision.page_id)
-            .outerjoin(article_wr, article_wr.c.instance_of_document == Revision.page_id)
+            .outerjoin(page_doc, page_doc.c.page_id == Revision.page_id)
+            .outerjoin(Document, Document.id == page_doc.c.doc_id)
+            .outerjoin(article_wr, article_wr.c.instance_of_document == page_doc.c.doc_id)
             .where(CitationInstance.normalized_id == nc.id)
         )
         if page_id is not None:
@@ -520,28 +532,42 @@ def citation_other_articles_report(normalized_sha1):
             .subquery()
         )
 
+        page_doc = (
+            select(
+                WebResource.numeric_page_id.label("page_id"),
+                WebResource.instance_of_document.label("doc_id"),
+            )
+            .where(WebResource.numeric_page_id.isnot(None))
+            .where(WebResource.instance_of_document.isnot(None))
+            .distinct(WebResource.numeric_page_id)
+            .subquery()
+        )
+
         stmt = (
             select(
-                Revision.page_id.label("doc_id"),
+                Revision.page_id.label("page_id"),
+                page_doc.c.doc_id,
                 Document.title.label("doc_title"),
                 article_wr.c.article_url,
             )
             .join(CitationHistory, CitationHistory.revision_id == Revision.revision_id)
             .join(CitationInstance, CitationInstance.id == CitationHistory.citation_instance_id)
-            .outerjoin(Document, Document.id == Revision.page_id)
-            .outerjoin(article_wr, article_wr.c.instance_of_document == Revision.page_id)
+            .outerjoin(page_doc, page_doc.c.page_id == Revision.page_id)
+            .outerjoin(Document, Document.id == page_doc.c.doc_id)
+            .outerjoin(article_wr, article_wr.c.instance_of_document == page_doc.c.doc_id)
             .where(CitationInstance.normalized_id == nc.id)
-            .distinct(Revision.page_id, Document.title, article_wr.c.article_url)
+            .distinct(Revision.page_id, page_doc.c.doc_id, Document.title, article_wr.c.article_url)
             .order_by(Document.title, Revision.page_id)
         )
         if current_doc_id is not None:
-            stmt = stmt.where(Revision.page_id != current_doc_id)
+            stmt = stmt.where(page_doc.c.doc_id != current_doc_id)
 
         rows = session.execute(stmt).all()
 
     articles = [
         {
-            "page_id": r.doc_id,
+            "page_id": r.page_id,
+            "document_id": r.doc_id,
             "title": r.doc_title,
             "url": r.article_url,
         }
