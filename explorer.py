@@ -223,13 +223,6 @@ def partials_citations():
         if rev_ts is None:
             return "<p>Revision not found.</p>", 404
 
-        # Find the document_id for the current article so we can exclude it from "other articles"
-        current_doc_id = session.execute(
-            select(WebResource.instance_of_document)
-            .where(WebResource.numeric_page_id == page_id)
-            .limit(1)
-        ).scalar()
-
         latest_rev_id = session.execute(
             select(func.max(Revision.revision_id)).where(Revision.page_id == page_id)
         ).scalar()
@@ -291,6 +284,16 @@ def partials_citations():
         # Join through to WebResource to get the article URL and Document for the title
         other_articles_map = {}
         if nc_ids:
+            page_doc = (
+                select(
+                    WebResource.numeric_page_id.label('page_id'),
+                    WebResource.instance_of_document.label('doc_id'),
+                )
+                .where(WebResource.numeric_page_id.isnot(None))
+                .where(WebResource.instance_of_document.isnot(None))
+                .distinct(WebResource.numeric_page_id)
+                .subquery()
+            )
             article_wr = (
                 select(
                     WebResource.instance_of_document,
@@ -302,15 +305,17 @@ def partials_citations():
             )
             oa_stmt = (
                 select(
-                    NormalizedCitation.id.label('nc_id'),
-                    NormalizedCitation.appears_on_article,
-                    Document.id.label('doc_id'),
+                    CitationInstance.normalized_id.label('nc_id'),
+                    CitationInstance.page_id,
+                    page_doc.c.doc_id,
                     Document.title.label('doc_title'),
                     article_wr.c.article_url,
                 )
-                .outerjoin(Document, Document.id == NormalizedCitation.appears_on_article)
-                .outerjoin(article_wr, article_wr.c.instance_of_document == NormalizedCitation.appears_on_article)
-                .where(NormalizedCitation.id.in_(nc_ids))
+                .outerjoin(page_doc, page_doc.c.page_id == CitationInstance.page_id)
+                .outerjoin(Document, Document.id == page_doc.c.doc_id)
+                .outerjoin(article_wr, article_wr.c.instance_of_document == page_doc.c.doc_id)
+                .where(CitationInstance.normalized_id.in_(nc_ids))
+                .distinct(CitationInstance.normalized_id, CitationInstance.page_id, page_doc.c.doc_id, Document.title, article_wr.c.article_url)
             )
             for oa in session.execute(oa_stmt).all():
                 other_articles_map.setdefault(oa.nc_id, []).append(oa)
@@ -374,13 +379,13 @@ def partials_citations():
             # Other articles (exclude self)
             other_articles = [
                 {
-                    "page_id": a.appears_on_article,
+                    "page_id": a.page_id,
                     "document_id": a.doc_id,
                     "title": a.doc_title,
                     "url": a.article_url,
                 }
                 for a in other_articles_map.get(r.nc_id, [])
-                if a.appears_on_article != current_doc_id  # exclude self using document ID
+                if a.page_id != page_id
             ] if not is_name_only else []
 
             # Extracted links
