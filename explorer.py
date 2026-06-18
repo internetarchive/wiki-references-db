@@ -10,7 +10,7 @@ from sqlalchemy import func, and_, select
 from sqlalchemy.orm import Session
 from models import (
     WebResource, Document, CitationInstance, CitationHistory, NormalizedCitation,
-    Revision, NormalizedCitationWebResource, WikiTemplate, TemplateData,
+    Revision, NormalizedCitationWebResource, WikiTemplate, TemplateData, Domain,
 )
 
 explorer = Blueprint('explorer', __name__, url_prefix='/explorer')
@@ -633,35 +633,72 @@ def citation_other_articles_report(normalized_sha1):
 
 @explorer.route("/template/<int:wiki_template_id>/report", methods=["GET"])
 def template_report(wiki_template_id):
-    parameter_key = request.args.get("parameter_key", "")
-    parameter_value = request.args.get("parameter_value", "")
+    parameter_key = request.args.get("parameter_key", "").strip()
+    parameter_value = request.args.get("parameter_value", "").strip()
 
     with Session(_get_engine()) as session:
         tmpl = session.query(WikiTemplate).filter(WikiTemplate.id == wiki_template_id).first()
         template_name = tmpl.name if tmpl else "Unknown"
+
+        article_wr = (
+            select(
+                WebResource.instance_of_document,
+                Document.title.label("doc_title"),
+                WebResource.numeric_page_id.label("page_id"),
+                Domain.value.label("domain"),
+                WebResource.url.label("article_url"),
+            )
+            .outerjoin(Document, Document.id == WebResource.instance_of_document)
+            .outerjoin(Domain, Domain.id == WebResource.domain_id)
+            .where(WebResource.instance_of_document.isnot(None))
+            .distinct(WebResource.instance_of_document)
+            .subquery()
+        )
 
         stmt = (
             select(
                 NormalizedCitation.reference_normalized,
                 NormalizedCitation.appears_on_article,
                 NormalizedCitation.normalized_sha1,
+                article_wr.c.doc_title,
+                article_wr.c.page_id,
+                article_wr.c.domain,
+                article_wr.c.article_url,
             )
             .join(TemplateData,
                   TemplateData.normalized_id == NormalizedCitation.id)
+            .outerjoin(
+                article_wr,
+                article_wr.c.instance_of_document == NormalizedCitation.appears_on_article,
+            )
             .where(TemplateData.wiki_template_id == wiki_template_id)
             .where(TemplateData.parameter_key == parameter_key)
-            .where(TemplateData.parameter_value == parameter_value)
+            .where(func.btrim(TemplateData.parameter_value) == parameter_value)
         )
         rows = session.execute(stmt).all()
 
-    citations = [
-        {
-            "reference_normalized": r.reference_normalized,
-            "appears_on_article": r.appears_on_article,
-            "normalized_sha1": r.normalized_sha1,
-        }
-        for r in rows
-    ]
+    citations = []
+    for r in rows:
+        title = (r.doc_title or "").strip()
+        if title:
+            article_label = title
+        elif r.domain and r.page_id is not None:
+            article_label = f"{r.domain}:{r.page_id}"
+        elif r.article_url:
+            article_label = r.article_url
+        elif r.appears_on_article is not None:
+            article_label = f"document:{r.appears_on_article}"
+        else:
+            article_label = "unknown article"
+
+        citations.append(
+            {
+                "reference_normalized": r.reference_normalized,
+                "normalized_sha1": r.normalized_sha1,
+                "article_label": article_label,
+                "article_url": r.article_url,
+            }
+        )
 
     return render_template(
         "explorer_template_report.html",
