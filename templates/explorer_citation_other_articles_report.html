@@ -10,16 +10,16 @@
 <p><code style="font-size:0.85em; word-break:break-all;">{{ reference_normalized }}</code></p>
 
 <p>
-  {{ total }} other page{{ 's' if total != 1 }}
+  {{ total }} page{{ 's' if total != 1 }}
   {% if current_page_id %}
-  (excluding current page <code>{{ current_page_id }}</code>)
+  (including current page <code>{{ current_page_id }}</code>)
   {% endif %}
   .
 </p>
 
 {% if articles|length == 0 %}
 <article>
-  <p>No other pages found for this citation.</p>
+  <p>No pages found for this citation.</p>
 </article>
 {% else %}
 <table role="grid">

@@ -567,14 +567,6 @@ def citation_other_articles_report(normalized_sha1):
                 total=0,
             )
 
-        current_doc_id = None
-        if current_page_id is not None:
-            current_doc_id = session.execute(
-                select(WebResource.instance_of_document)
-                .where(WebResource.numeric_page_id == current_page_id)
-                .limit(1)
-            ).scalar()
-
         article_wr = (
             select(
                 WebResource.instance_of_document,
@@ -612,9 +604,6 @@ def citation_other_articles_report(normalized_sha1):
             .distinct(Revision.page_id, page_doc.c.doc_id, Document.title, article_wr.c.article_url)
             .order_by(Document.title, Revision.page_id)
         )
-        if current_doc_id is not None:
-            stmt = stmt.where(page_doc.c.doc_id != current_doc_id)
-
         rows = session.execute(stmt).all()
 
     articles = [
