@@ -1,9 +1,9 @@
 {% extends "explorer_base.html" %}
-{% block title %}Citation Explorer: {{ url }}{% endblock %}
+{% block title %}Citation Explorer: {{ page_title or url }}{% endblock %}
 
 {% block content %}
 <hgroup>
-  <h2>Citation Explorer</h2>
+  <h2>Citation Explorer: {{ page_title or url }}</h2>
   <p><a href="{{ url }}" target="_blank">{{ url }}</a> &mdash; {{ revisions|length }} tracked revision{{ 's' if revisions|length != 1 }}</p>
 </hgroup>
 

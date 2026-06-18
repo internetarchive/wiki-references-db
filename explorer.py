@@ -2,7 +2,7 @@ import json
 import os
 import re
 from functools import lru_cache
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 import requests as http_requests
 from flask import Blueprint, request, render_template
@@ -67,6 +67,49 @@ def _resolve_wikipedia_title_to_curid(domain: str, title: str, follow_redirects:
     return None
 
 
+def _extract_wikipedia_title_from_url(url: str) -> str | None:
+    """Extract title from title-based Wikipedia URLs."""
+    parsed = urlparse(url)
+    title = None
+
+    wiki_match = re.match(r'^/wiki/(.+)$', parsed.path)
+    if wiki_match:
+        title = wiki_match.group(1)
+
+    if parsed.path in ('/w/index.php', '/wiki/index.php'):
+        qs = parse_qs(parsed.query)
+        if 'title' in qs:
+            title = qs['title'][0]
+
+    if not title:
+        return None
+
+    return unquote(title).replace('_', ' ')
+
+
+@lru_cache(maxsize=1024)
+def _resolve_wikipedia_page_id_to_title(domain: str, page_id: int, follow_redirects: bool) -> str | None:
+    """Resolve a Wikipedia numeric page ID to page title via the MediaWiki API."""
+    api_url = f"https://{domain}/w/api.php"
+    params = {
+        "action": "query",
+        "pageids": page_id,
+        "format": "json",
+    }
+    if follow_redirects:
+        params["redirects"] = 1
+    try:
+        resp = http_requests.get(api_url, params=params, headers=_get_wikipedia_api_headers(), timeout=10)
+        data = resp.json()
+    except Exception:
+        return None
+    pages = data.get("query", {}).get("pages", {})
+    page_info = pages.get(str(page_id))
+    if not page_info:
+        return None
+    return page_info.get("title")
+
+
 def resolve_wikipedia_url_to_curid(url: str, follow_redirects: bool = True) -> str | None:
     """If *url* is a title-based Wikipedia URL, resolve it to the canonical
     curid-based URL.  Returns ``None`` when the URL is not recognised or
@@ -111,9 +154,13 @@ def article_view():
     if not url:
         return render_template("explorer_index.html", error="Please enter a URL.")
 
+    original_url = url
+    page_title = None
+
     # Normalise title-based Wikipedia URLs to curid format
     resolved = resolve_wikipedia_url_to_curid(url, follow_redirects=follow_redirects)
     if resolved:
+        page_title = _extract_wikipedia_title_from_url(original_url)
         url = resolved
 
     with Session(_get_engine()) as session:
@@ -124,6 +171,11 @@ def article_view():
         page_id = wr.numeric_page_id
         if page_id is None:
             return render_template("explorer_index.html", error="Article has no page ID.")
+
+        if page_title is None:
+            domain = urlparse(url).netloc
+            if domain:
+                page_title = _resolve_wikipedia_page_id_to_title(domain, page_id, follow_redirects)
 
         revisions = session.execute(
             select(Revision.revision_id, Revision.revision_timestamp, Revision.parent_revision_id)
@@ -143,6 +195,7 @@ def article_view():
     return render_template(
         "explorer_article.html",
         url=url,
+        page_title=page_title,
         page_id=page_id,
         revisions=revisions_list,
         revisions_json=json.dumps(revisions_list),
