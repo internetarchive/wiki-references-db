@@ -534,7 +534,14 @@ class TemplateData(Base):
 
     __table_args__ = (
         PrimaryKeyConstraint('wiki_template_id', 'normalized_id', 'offset_start', 'parameter_key_md5', name='pk_template_param'),
-        Index('idx_template_lookup', 'wiki_template_id', 'parameter_key', 'parameter_value', 'normalized_id'),
+        Index(
+            'idx_template_lookup_md5',
+            'wiki_template_id',
+            'parameter_key',
+            func.md5(parameter_value),
+            'normalized_id',
+            postgresql_where=text('parameter_value IS NOT NULL'),
+        ),
         Index('idx_td_norm_offset_key', 'normalized_id', 'offset_start', 'parameter_key'),
     )
 
