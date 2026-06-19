@@ -54,6 +54,22 @@
     htmx.ajax('GET', '/explorer/partials/citations?page_id=' + pageId + '&revision_id=' + revisionId, {target: '#citations-area', swap: 'innerHTML'});
   }
 
+  function showCitationsLoadError() {
+    area.innerHTML = '<p role="alert">Error loading citations. Please try again.</p>';
+  }
+
+  document.body.addEventListener('htmx:responseError', function(evt) {
+    if (evt.detail.target === area) {
+      showCitationsLoadError();
+    }
+  });
+
+  document.body.addEventListener('htmx:sendError', function(evt) {
+    if (evt.detail.target === area) {
+      showCitationsLoadError();
+    }
+  });
+
   let debounceTimer;
   slider.addEventListener('input', function() {
     const idx = revisionIndexForSliderValue(parseInt(this.value, 10));
