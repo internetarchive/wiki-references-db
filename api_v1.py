@@ -72,7 +72,8 @@ def get_article():
         return _error("url parameter is required", 400)
 
     with Session(_get_engine()) as session:
-        wr = session.query(WebResource).filter(WebResource.url == url).first()
+        url_hash = WebResource.compute_url_hash(url)
+        wr = session.query(WebResource).filter(WebResource.url_hash == url_hash).first()
         if not wr:
             return _error("Article not found", 404)
 
@@ -535,7 +536,8 @@ def get_web_resource():
         return _error("url parameter is required", 400)
 
     with Session(_get_engine()) as session:
-        wr = session.query(WebResource).filter(WebResource.url == url).first()
+        url_hash = WebResource.compute_url_hash(url)
+        wr = session.query(WebResource).filter(WebResource.url_hash == url_hash).first()
         if not wr:
             return _error("Web resource not found", 404)
 

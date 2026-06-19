@@ -1,5 +1,5 @@
 import hashlib
-from sqlalchemy import Column, Index, Integer, BigInteger, String, CHAR, ForeignKey, Text, UniqueConstraint, PrimaryKeyConstraint, select, func
+from sqlalchemy import Column, Index, Integer, BigInteger, String, CHAR, ForeignKey, Text, UniqueConstraint, PrimaryKeyConstraint, select, func, text
 from sqlalchemy.types import SmallInteger
 from sqlalchemy.orm import relationship, Session
 from sqlalchemy.ext.declarative import declarative_base
@@ -53,6 +53,11 @@ class WebResource(Base):
     document                   =  relationship("Document", foreign_keys=[instance_of_document])
     original_resource          =  relationship("WebResource", foreign_keys=[is_archive_of])
     domain                     =  relationship("Domain", foreign_keys=[domain_id])
+
+    __table_args__             =  (
+        Index('idx_wr_instance_doc', 'instance_of_document', postgresql_where=text('instance_of_document IS NOT NULL')),
+        Index('idx_wr_numeric_page', 'numeric_page_id', postgresql_where=text('numeric_page_id IS NOT NULL')),
+    )
 
     @staticmethod
     def compute_url_hash(url: str) -> str:
@@ -296,6 +301,7 @@ class CitationInstance(Base):
         UniqueConstraint('page_id', 'raw_sha1', name='uix_ci_page_raw'),
         Index('idx_ci_page', 'page_id'),
         Index('idx_ci_normalized', 'normalized_id'),
+        Index('idx_ci_norm_named', 'normalized_id', postgresql_where=text("reference_name IS NOT NULL AND reference_name <> ''")),
     )
 
     @staticmethod
@@ -349,6 +355,7 @@ class CitationHistory(Base):
     revision = relationship("Revision", foreign_keys=[revision_id])
 
     __table_args__ = (
+        Index('idx_ch_citation_instance', 'citation_instance_id'),
         Index('idx_ch_revision', 'revision_id'),
     )
 
@@ -394,6 +401,8 @@ class Revision(Base):
 
     __table_args__ = (
         UniqueConstraint('revision_id', name='uix_revision_id'),
+        Index('idx_revisions_page_ts', 'page_id', 'revision_timestamp'),
+        Index('idx_revisions_page_revid', 'page_id', 'revision_id'),
     )
 
     @staticmethod
@@ -525,6 +534,8 @@ class TemplateData(Base):
 
     __table_args__ = (
         PrimaryKeyConstraint('wiki_template_id', 'normalized_id', 'offset_start', 'parameter_key_md5', name='pk_template_param'),
+        Index('idx_template_lookup', 'wiki_template_id', 'parameter_key', 'parameter_value', 'normalized_id'),
+        Index('idx_td_norm_offset_key', 'normalized_id', 'offset_start', 'parameter_key'),
     )
 
     @staticmethod
