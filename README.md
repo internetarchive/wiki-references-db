@@ -125,11 +125,20 @@ Parses a single `.mwrev.zst` file and writes derived rows as Parquet files into 
 
 Consolidates and deduplicates staged Parquet files across all shards using DuckDB. Writes one deduplicated Parquet file per table into the `deduped/` subdirectory. Skips tables that already have a done marker.
 
+Resume-safety markers:
+- `.done-<table>` indicates a completed table and is used for skipping on rerun.
+- `.running-<table>` is written while a table is in progress; if found on restart, a stale-marker warning is logged and processing resumes.
+
+`citation_histories` is handled as consolidation (pass-through) rather than global `DISTINCT` dedup. This avoids high-memory global dedup and relies on load-time conflict handling.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-d, --staging-dir` | `STAGING_DIR` env or `./staging` | Staging directory containing raw Parquet files |
-| `--memory-limit` | `8GB` | DuckDB memory limit |
-| `--temp-dir` | *(auto)* | DuckDB temp/spill directory |
+| `--memory-limit` | `DEDUP_MEMORY_LIMIT` env or `8GB` | DuckDB memory limit |
+| `--temp-dir` | `DEDUP_TEMP_DIR` env or *(auto)* | DuckDB temp/spill directory |
+| `--threads` | `DEDUP_THREADS` env or DuckDB default | DuckDB execution threads |
+| `--preserve-insertion-order` | `DEDUP_PRESERVE_INSERTION_ORDER` env or `false` | DuckDB insertion-order preservation |
+| `--max-temp-dir-size` | `DEDUP_MAX_TEMP_DIRECTORY_SIZE` env or DuckDB default | DuckDB max temp spill size |
 | `--tables` | all tables | Only dedup these tables (space-separated) |
 
 ### `load_all.py`
@@ -200,6 +209,11 @@ All environment variables are loaded from a `.env` file via `python-dotenv`. See
 | `STAGING_DIR` | build_all, dedup_parquet, load_all | `./staging` | Directory for staged Parquet files |
 | `BATCH_SIZE` | build_all → build_db | `1000` | Revisions per batch in build_db workers |
 | `METRICS_INTERVAL` | build_all | `10` | Seconds between status prints |
+| `DEDUP_MEMORY_LIMIT` | dedup_parquet | `8GB` | DuckDB memory limit for dedup |
+| `DEDUP_TEMP_DIR` | dedup_parquet | — | DuckDB temp/spill directory |
+| `DEDUP_THREADS` | dedup_parquet | DuckDB default | DuckDB execution threads |
+| `DEDUP_PRESERVE_INSERTION_ORDER` | dedup_parquet | `false` | DuckDB insertion-order preservation |
+| `DEDUP_MAX_TEMP_DIRECTORY_SIZE` | dedup_parquet | DuckDB default | DuckDB max temp spill size |
 | `LOAD_BATCH_SIZE` | load_all | `5000` | Rows per INSERT batch when loading into Postgres |
 | `WIKIPEDIA_API_USER_AGENT` | explorer | `WikiReferencesDB/1.0` | Primary product token used in MediaWiki API `User-Agent` headers |
 | `WIKIPEDIA_API_CONTACT_EMAIL` | explorer | — | Contact email appended in parentheses in MediaWiki API `User-Agent` headers |
