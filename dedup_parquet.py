@@ -244,11 +244,11 @@ def dedup_template_data(con, staging_dir, deduped_dir):
         return
     con.execute(f"""
         COPY (
-            SELECT DISTINCT ON (domain_label, template_name, normalized_sha1, offset_start, parameter_key)
-                domain_label, template_name, normalized_sha1, offset_start,
-                parameter_key, parameter_value
+            SELECT domain_label, template_name, normalized_sha1, offset_start,
+                   parameter_key, MIN(parameter_value) AS parameter_value
             FROM '{glob}'
             WHERE domain_label IS NOT NULL AND template_name IS NOT NULL
+            GROUP BY domain_label, template_name, normalized_sha1, offset_start, parameter_key
         ) TO '{_out(deduped_dir, "template_data")}'
         (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)
     """)
