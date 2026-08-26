@@ -111,10 +111,10 @@ def dedup_domains(con, staging_dir, deduped_dir):
         return
     con.execute(f"""
         COPY (
-            SELECT DISTINCT ON (value)
-                value, for_container_label
+            SELECT value, MIN(for_container_label) AS for_container_label
             FROM '{glob}'
             WHERE value IS NOT NULL
+            GROUP BY value
         ) TO '{_out(deduped_dir, "domains")}'
         (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)
     """)
@@ -126,10 +126,10 @@ def dedup_documents(con, staging_dir, deduped_dir):
         return
     con.execute(f"""
         COPY (
-            SELECT DISTINCT ON (has_container_label, page_id)
-                language_code, has_container_label, page_id
+            SELECT MIN(language_code) AS language_code, has_container_label, page_id
             FROM '{glob}'
             WHERE page_id IS NOT NULL
+            GROUP BY has_container_label, page_id
         ) TO '{_out(deduped_dir, "documents")}'
         (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)
     """)
@@ -141,10 +141,14 @@ def dedup_web_resources(con, staging_dir, deduped_dir):
         return
     con.execute(f"""
         COPY (
-            SELECT DISTINCT ON (url)
-                url, domain_label, numeric_page_id, numeric_namespace_id, page_id
+            SELECT url,
+                   MIN(domain_label) AS domain_label,
+                   MIN(numeric_page_id) AS numeric_page_id,
+                   MIN(numeric_namespace_id) AS numeric_namespace_id,
+                   MIN(page_id) AS page_id
             FROM '{glob}'
             WHERE url IS NOT NULL
+            GROUP BY url
         ) TO '{_out(deduped_dir, "web_resources")}'
         (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)
     """)
@@ -156,10 +160,13 @@ def dedup_citation_instances(con, staging_dir, deduped_dir):
         return
     con.execute(f"""
         COPY (
-            SELECT DISTINCT ON (page_id, raw_sha1)
-                page_id, raw_sha1, normalized_sha1, reference_type, reference_name
+            SELECT page_id, raw_sha1,
+                   MIN(normalized_sha1) AS normalized_sha1,
+                   MIN(reference_type) AS reference_type,
+                   MIN(reference_name) AS reference_name
             FROM '{glob}'
             WHERE page_id IS NOT NULL AND raw_sha1 IS NOT NULL
+            GROUP BY page_id, raw_sha1
         ) TO '{_out(deduped_dir, "citation_instances")}'
         (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)
     """)
@@ -171,10 +178,13 @@ def dedup_normalized_citations(con, staging_dir, deduped_dir):
         return
     con.execute(f"""
         COPY (
-            SELECT DISTINCT ON (normalized_sha1)
-                normalized_sha1, reference_normalized, appears_on_page_id, appears_on_domain
+            SELECT normalized_sha1,
+                   MIN(reference_normalized) AS reference_normalized,
+                   MIN(appears_on_page_id) AS appears_on_page_id,
+                   MIN(appears_on_domain) AS appears_on_domain
             FROM '{glob}'
             WHERE normalized_sha1 IS NOT NULL
+            GROUP BY normalized_sha1
         ) TO '{_out(deduped_dir, "normalized_citations")}'
         (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)
     """)
@@ -201,10 +211,13 @@ def dedup_revisions(con, staging_dir, deduped_dir):
         return
     con.execute(f"""
         COPY (
-            SELECT DISTINCT ON (revision_id)
-                revision_id, page_id, parent_revision_id, revision_timestamp
+            SELECT revision_id,
+                   MIN(page_id) AS page_id,
+                   MIN(parent_revision_id) AS parent_revision_id,
+                   MIN(revision_timestamp) AS revision_timestamp
             FROM '{glob}'
             WHERE revision_id IS NOT NULL
+            GROUP BY revision_id
         ) TO '{_out(deduped_dir, "revisions")}'
         (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)
     """)
