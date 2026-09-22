@@ -120,9 +120,9 @@ def load_containers(session, staging_dir):
     count = 0
     for batch in read_parquet_batches(filepath):
         Container.bulk_upsert(session, batch)
+        session.commit()
         count += len(batch)
     log(f"containers: {count} rows loaded")
-    session.commit()
 
 
 def load_domains(session, staging_dir):
@@ -150,10 +150,11 @@ def load_domains(session, staging_dir):
                 d['for_container'] = label_to_id[fcl]
             cleaned.append(d)
 
-        Domain.bulk_upsert(session, cleaned)
+        if cleaned:
+            Domain.bulk_upsert(session, cleaned)
+            session.commit()
         count += len(cleaned)
     log(f"domains: {count} rows loaded")
-    session.commit()
 
 
 def load_documents(session, staging_dir):
@@ -185,9 +186,9 @@ def load_documents(session, staging_dir):
             )
             page_to_doc_id[(container_label or '', r['page_id'])] = doc_id
             count += 1
+        session.commit()
 
     log(f"documents: {count} rows loaded")
-    session.commit()
     return page_to_doc_id
 
 
@@ -197,11 +198,11 @@ def load_web_resources(session, staging_dir, page_to_doc_id):
         return
     log(f"web_resources: loading from {filepath}")
 
-    # Defer foreign key constraint checks until commit for faster inserts
-    session.execute(text("SET CONSTRAINTS ALL DEFERRED"))
-
     count = 0
     for batch in read_parquet_batches(filepath):
+        # Defer foreign key constraint checks until commit for faster inserts
+        session.execute(text("SET CONSTRAINTS ALL DEFERRED"))
+
         # Resolve domain labels to ids
         domain_labels = set(r.get('domain_label') for r in batch if r.get('domain_label'))
         domain_to_id = {}
@@ -231,10 +232,10 @@ def load_web_resources(session, staging_dir, page_to_doc_id):
             cleaned.append(wr)
 
         WebResource.bulk_upsert(session, cleaned)
+        session.commit()
         count += len(cleaned)
 
     log(f"web_resources: {count} rows loaded")
-    session.commit()
 
 
 def load_wiki_templates(session, staging_dir):
@@ -260,10 +261,11 @@ def load_wiki_templates(session, staging_dir):
             if dom_id is not None:
                 cleaned.append({'domain': dom_id, 'name': r['name']})
 
-        WikiTemplate.bulk_upsert(session, cleaned)
+        if cleaned:
+            WikiTemplate.bulk_upsert(session, cleaned)
+            session.commit()
         count += len(cleaned)
     log(f"wiki_templates: {count} rows loaded")
-    session.commit()
 
 
 def load_normalized_citations(session, staging_dir, page_to_doc_id):
@@ -296,9 +298,9 @@ def load_normalized_citations(session, staging_dir, page_to_doc_id):
                 }
             )
             session.execute(stmt)
+            session.commit()
             count += len(cleaned)
     log(f"normalized_citations: {count} rows loaded")
-    session.commit()
 
 
 def load_citation_instances(session, staging_dir):
@@ -337,9 +339,9 @@ def load_citation_instances(session, staging_dir):
 
         if cleaned:
             CitationInstance.bulk_upsert(session, cleaned)
+            session.commit()
             count += len(cleaned)
     log(f"citation_instances: {count} rows loaded")
-    session.commit()
 
 
 def load_revisions(session, staging_dir):
@@ -364,9 +366,9 @@ def load_revisions(session, staging_dir):
             }
         )
         session.execute(stmt)
+        session.commit()
         count += len(batch)
     log(f"revisions: {count} rows loaded")
-    session.commit()
 
 
 def load_citation_histories(session, staging_dir):
@@ -405,12 +407,12 @@ def load_citation_histories(session, staging_dir):
         if cleaned:
             stmt = insert(CitationHistory).values(cleaned).on_conflict_do_nothing()
             session.execute(stmt)
+            session.commit()
             count += len(cleaned)
 
     if skipped:
         log(f"citation_histories: warning: {skipped} rows skipped (no matching citation_instance)")
     log(f"citation_histories: {count} rows loaded")
-    session.commit()
 
 
 def load_ncwr(session, staging_dir):
@@ -452,9 +454,9 @@ def load_ncwr(session, staging_dir):
                 })
         if cleaned:
             NormalizedCitationWebResource.bulk_upsert(session, cleaned)
+            session.commit()
             count += len(cleaned)
     log(f"ncwr: {count} rows loaded")
-    session.commit()
 
 
 def load_template_data(session, staging_dir):
@@ -521,9 +523,9 @@ def load_template_data(session, staging_dir):
 
         if cleaned:
             TemplateData.bulk_upsert(session, cleaned)
+            session.commit()
             count += len(cleaned)
     log(f"template_data: {count} rows loaded")
-    session.commit()
 
 
 # ---------------------------------------------------------------------------
