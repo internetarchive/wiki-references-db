@@ -1,9 +1,9 @@
 {% extends "explorer_base.html" %}
-{% block title %}Citation Explorer: {{ url }}{% endblock %}
+{% block title %}Citation Explorer: {{ page_title or url }}{% endblock %}
 
 {% block content %}
 <hgroup>
-  <h2>Citation Explorer</h2>
+  <h2>Citation Explorer: {{ page_title or url }}</h2>
   <p><a href="{{ url }}" target="_blank">{{ url }}</a> &mdash; {{ revisions|length }} tracked revision{{ 's' if revisions|length != 1 }}</p>
 </hgroup>
 
@@ -53,6 +53,22 @@
     area.innerHTML = '<p aria-busy="true">Loading citations…</p>';
     htmx.ajax('GET', '/explorer/partials/citations?page_id=' + pageId + '&revision_id=' + revisionId, {target: '#citations-area', swap: 'innerHTML'});
   }
+
+  function showCitationsLoadError() {
+    area.innerHTML = '<p role="alert">Error loading citations. Please try again.</p>';
+  }
+
+  document.body.addEventListener('htmx:responseError', function(evt) {
+    if (evt.detail.target === area) {
+      showCitationsLoadError();
+    }
+  });
+
+  document.body.addEventListener('htmx:sendError', function(evt) {
+    if (evt.detail.target === area) {
+      showCitationsLoadError();
+    }
+  });
 
   let debounceTimer;
   slider.addEventListener('input', function() {

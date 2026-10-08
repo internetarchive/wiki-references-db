@@ -36,7 +36,7 @@
     </a>
     {% if c.other_articles|length > 0 %}
     · <a href="/explorer/citation/{{ c.normalized_sha1 }}/other-articles?page_id={{ page_id }}" target="_blank" title="Show all other pages where this citation appears">
-      Also on {{ c.other_articles|length }} page{{ 's' if c.other_articles|length != 1 }}
+      Found on {{ c.other_articles|length }} other page{{ 's' if c.other_articles|length != 1 }}
     </a>
     {% endif %}
   </div>

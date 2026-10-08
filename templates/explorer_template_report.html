@@ -18,14 +18,20 @@
   <thead>
     <tr>
       <th>Normalized Citation</th>
-      <th>Article (document ID)</th>
+      <th>Article</th>
     </tr>
   </thead>
   <tbody>
     {% for c in citations %}
     <tr>
       <td><code style="font-size:0.8em; word-break:break-all;">{{ c.reference_normalized }}</code></td>
-      <td>{{ c.appears_on_article }}</td>
+      <td>
+        {% if c.article_url %}
+          <a href="/explorer/article?url={{ c.article_url|urlencode }}">{{ c.article_label }}</a>
+        {% else %}
+          {{ c.article_label }}
+        {% endif %}
+      </td>
     </tr>
     {% endfor %}
   </tbody>

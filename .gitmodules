@@ -7,3 +7,6 @@
 [submodule "refs_extractor"]
 	path = refs_extractor
 	url = https://github.com/internetarchive/wiki-references-extractor
+[submodule "refs_normalizer"]
+	path = refs_normalizer
+	url = https://github.com/internetarchive/wiki-references-normalizer
