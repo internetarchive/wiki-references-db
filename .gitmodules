@@ -10,3 +10,9 @@
 [submodule "refs_normalizer"]
 	path = refs_normalizer
 	url = https://github.com/internetarchive/wiki-references-normalizer
+[submodule "UVAWikipediaCitationsDatabase"]
+	path = UVAWikipediaCitationsDatabase
+	url = https://github.com/scatter-llc/UVAWikipediaCitationsDatabase
+[submodule "RevisionChest"]
+	path = RevisionChest
+	url = https://github.com/internetarchive/RevisionChest
