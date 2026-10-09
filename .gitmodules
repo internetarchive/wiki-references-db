@@ -7,6 +7,3 @@
 [submodule "RevisionChest"]
 	path = rust/revisionchest
 	url = https://github.com/internetarchive/RevisionChest
-[submodule "UVAWikipediaCitationsDatabase"]
-	path = upstream/uva
-	url = https://github.com/scatter-llc/UVAWikipediaCitationsDatabase

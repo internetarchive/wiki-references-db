@@ -23,22 +23,24 @@ packages/
                 external links) in wikitext; per-wiki config in wikis.yaml.
   schema/       `wcd_schema`: Postgres models and staging Parquet schemas —
                 the single definition of every table and dataset.
+  semantic/     `wcd_semantic`: citation classification, bibliographic-field
+                and identifier extraction, per-page / cross-page source
+                matching, reliability scoring. Pure functions, vendored from
+                the UVA Wikipedia Citations Database (see its NOTICE).
   pipeline/     `wcd_pipeline` and the `wcd` CLI: the build stages.
 rust/
   revisionchest/  git submodule → internetarchive/RevisionChest
                   Stage 0: XML dumps → .mwrev.zst revision bundles + metadata.
-upstream/
-  uva/          git submodule → scatter-llc/UVAWikipediaCitationsDatabase
-                Reference checkout of the UVA pipeline while its normalizers,
-                matchers and scorer are ported into packages/semantic (removed after).
 legacy/         the v1 Flask API and explorer, frozen; served until v2 cutover.
 fixtures/       committed test inputs and golden outputs (see fixtures/README.md).
 docs/design/    the plan: proposed_*.md, decisions, executive summary.
+docs/uva/       the UVA project's documentation, kept as the reference for packages/semantic.
 scripts/        one-off tooling (fixture page selection).
 ```
 
-Planned, not yet present: `packages/semantic` (ported UVA logic), `apps/api`
-(FastAPI v2), `apps/frontend` (the dashboard). See the implementation plan.
+Planned, not yet present: `apps/api` (FastAPI v2), `apps/frontend` (the
+dashboard), and pipeline Stages 4–8 wiring `wcd_semantic` to the data. See
+the implementation plan.
 
 ## Setup
 

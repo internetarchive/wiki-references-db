@@ -1,8 +1,11 @@
 """Generate fixtures/golden/semantic/expected.json from the UPSTREAM UVA code.
 
-Run once (and only re-run deliberately):
+Run once (and only re-run deliberately). The UVA repository is no longer a
+submodule; check it out at the commit recorded in packages/semantic/NOTICE:
 
-    uv run python packages/semantic/tests/gen_golden.py upstream/uva/src
+    git clone https://github.com/scatter-llc/UVAWikipediaCitationsDatabase /tmp/uva
+    git -C /tmp/uva checkout <commit from NOTICE>
+    uv run --with orjson --with zstandard python packages/semantic/tests/gen_golden.py /tmp/uva/src
 
 The upstream modules insert their own directory on sys.path and import
 ``pipeline_log``, so the ``src`` directory must be passed. duckdb/pandas must
