@@ -1,18 +1,12 @@
-[submodule "iari"]
-	path = iari
-	url = https://github.com/internetarchive/iari
-[submodule "wiki-references-extractor"]
-	path = wiki-references-extractor
-	url = https://github.com/internetarchive/wiki-references-extractor
-[submodule "refs_extractor"]
-	path = refs_extractor
-	url = https://github.com/internetarchive/wiki-references-extractor
 [submodule "refs_normalizer"]
-	path = refs_normalizer
+	path = packages/normalizer
 	url = https://github.com/internetarchive/wiki-references-normalizer
-[submodule "UVAWikipediaCitationsDatabase"]
-	path = UVAWikipediaCitationsDatabase
-	url = https://github.com/scatter-llc/UVAWikipediaCitationsDatabase
+[submodule "refs_extractor"]
+	path = packages/extractor
+	url = https://github.com/internetarchive/wiki-references-extractor
 [submodule "RevisionChest"]
-	path = RevisionChest
+	path = rust/revisionchest
 	url = https://github.com/internetarchive/RevisionChest
+[submodule "UVAWikipediaCitationsDatabase"]
+	path = upstream/uva
+	url = https://github.com/scatter-llc/UVAWikipediaCitationsDatabase

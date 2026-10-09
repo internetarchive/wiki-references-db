@@ -1,10 +1,19 @@
 .DS_Store
-credentials.py
-venv/
-__pycache__/
-sources/
 .idea/
+__pycache__/
+*.egg-info/
+.venv/
+venv/
 .env
+.pytest_cache/
+
+# pipeline data (never committed; fixtures/ holds the small committed inputs)
 *.zst
+!fixtures/**/*.zst
 output/
 staging/
+sources/
+data/
+
+# legacy flask app
+credentials.py

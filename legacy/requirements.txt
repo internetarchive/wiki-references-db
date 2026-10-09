@@ -1,0 +1,10 @@
+# Frozen dependencies for the v1 Flask API + explorer. This directory is not a
+# workspace member; run it with its own virtualenv against the v1 database.
+psycopg2-binary>=2.9.9
+sqlalchemy>=2.0.25
+Flask
+gunicorn
+Jinja2
+python-dotenv
+pyyaml>=6.0
+requests>=2.31.0

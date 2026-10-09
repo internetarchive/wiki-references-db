@@ -1,0 +1,16 @@
+[project]
+name = "wcd-schema"
+version = "0.1.0"
+description = "Wikipedia Citations Database: table, dataset and view definitions shared by the pipeline and the API"
+requires-python = ">=3.10"
+dependencies = [
+    "sqlalchemy>=2.0.25",
+    "pyarrow>=15.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
