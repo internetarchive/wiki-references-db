@@ -2,6 +2,8 @@
 
 *2026-10-08 · Review of the `notes/` plan against the `wrdb-v3` working tree. Companion to `claude/codebase_gap_assessment.md` (2026-09-09) and `claude/decisions_2026-09-10.md`. This document does not re-litigate data-model or pipeline-semantics findings already settled there; it is about where the code lives, how the pieces depend on each other, and in what order the plan should be executed.*
 
+> **Status (2026-10-08, later the same day).** The §4 decisions were taken and Phase R was executed; see §5 at the end for what was decided, what landed, and what is still open. §2 and §3 are left as written; where the executed layout differs from §2 (directory names, which pieces are submodules), §5 is authoritative.
+
 Tree examined: `wrdb-v3` root (wiki-references-db `v2` branch @ `1b047a4`), `refs_extractor` (wiki-references-extractor `v3` @ `1f3efb0`), `refs_normalizer` (wiki-references-normalizer `main` @ `1692198`), `UVAWikipediaCitationsDatabase` (`main` @ `29f3ae3`), `RevisionChest` (`main` @ `c6cabb3`). Note the extractor pin has moved from the `v2` commit the gap assessment examined to the `v3` branch head; nothing in the findings below changes because of that.
 
 ---
