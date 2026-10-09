@@ -16,6 +16,22 @@ import pandas as pd
 
 from corpus import CONTENTS, PAGES, REVISION_TEXTS
 
+# Output fields wcd_semantic ADDS over upstream (identifier set extension,
+# docs/design/decisions_2026_09_10.md item 7). They are stripped before the
+# golden comparison and covered by test_additions.py instead.
+ADDED_FIELDS = ("extracted_arxiv", "extracted_wikidata_qid")
+ADDED_MATCHER_FIELDS = ("extracted_pmc", "extracted_arxiv", "extracted_wikidata_qid")
+
+
+def strip_added(obj):
+    """Remove ADDED keys recursively (dicts in lists in dicts …)."""
+    if isinstance(obj, dict):
+        return {k: strip_added(v) for k, v in obj.items()
+                if k not in ADDED_FIELDS and k not in ADDED_MATCHER_FIELDS}
+    if isinstance(obj, list):
+        return [strip_added(x) for x in obj]
+    return obj
+
 
 @dataclass
 class Backend:
@@ -89,6 +105,7 @@ def build_page_frames(b: Backend, page_id: int) -> tuple[pd.DataFrame, pd.DataFr
         if parsed["citation_type"] == "template":
             t = b.extract_template(parsed["raw"], parsed["template_name"], parsed["params"])
             tm_rows.append({
+                **{k: t[k] for k in ADDED_FIELDS if k in t},
                 "content_sha1": t["content_sha1"], "raw_content": parsed["raw"],
                 "template_name": t["template_name"], "template_subtype": t["template_subtype"],
                 "author_last": t["author_last"], "author_key": t["author_key"], "title": t["title"],
@@ -103,7 +120,8 @@ def build_page_frames(b: Backend, page_id: int) -> tuple[pd.DataFrame, pd.DataFr
             rt_rows.append({k: r[k] for k in (
                 "content_sha1", "content", "norm_content", "norm_subtype", "id_tier", "id_tier_label",
                 "extracted_url", "extracted_isbn", "extracted_doi", "extracted_pmid", "extracted_pmc",
-                "anchor_key", "author_key", "year", "year_reliable", "page_ref", "title")} | extra)
+                "anchor_key", "author_key", "year", "year_reliable", "page_ref", "title",
+                *[k for k in ADDED_FIELDS if k in r])} | extra)
     rt = pd.DataFrame(rt_rows)
     tm = pd.DataFrame(tm_rows)
     if not rt.empty:

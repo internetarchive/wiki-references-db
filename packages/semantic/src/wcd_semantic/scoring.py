@@ -28,6 +28,7 @@ def _compute_score(row: dict) -> tuple[float, str]:
         15 if year_reliable                       else 0,
         5  if year                                else 0,
         {'doi': 10, 'isbn': 10, 'pmid': 10,
+         'pmc': 10, 'arxiv': 10, 'wikidata_qid': 10,   # ADDED (wcd)
          'url': 8, 'author_year': 5,
          'title_fuzzy': 3, 'strong_author_fuzzy': 3,
          'author_title_fuzzy': 3}.get(match_type, 0),

@@ -35,6 +35,9 @@ CONFIDENCE = {
     'doi':               1.00,
     'isbn':              0.95,
     'pmid':              0.95,
+    'pmc':               0.95,   # ADDED (wcd)
+    'arxiv':             0.95,   # ADDED (wcd)
+    'wikidata_qid':      0.95,   # ADDED (wcd)
     'ref_name':          0.90,
     'url':               0.85,
     'cite_isbn':         0.88,
@@ -163,6 +166,9 @@ def build_source_map(
         ('doi',         'extracted_doi'),
         ('isbn',        'extracted_isbn'),
         ('pmid',        'extracted_pmid'),
+        ('pmc',         'extracted_pmc'),          # ADDED (wcd)
+        ('arxiv',       'extracted_arxiv'),        # ADDED (wcd)
+        ('wikidata_qid','extracted_wikidata_qid'), # ADDED (wcd)
         ('ref_name',    'ref_name'),
         ('url',         'extracted_url'),
         ('anchor_key',  'anchor_key'),
@@ -348,6 +354,9 @@ def build_source_map(
             'extracted_doi':     can.get('extracted_doi'),
             'extracted_isbn':    can.get('extracted_isbn'),
             'extracted_pmid':    can.get('extracted_pmid'),
+            'extracted_pmc':     can.get('extracted_pmc'),          # ADDED (wcd)
+            'extracted_arxiv':   can.get('extracted_arxiv'),        # ADDED (wcd)
+            'extracted_wikidata_qid': can.get('extracted_wikidata_qid'),  # ADDED (wcd)
             'extracted_url':     can.get('extracted_url'),
             'anchor_key':        can.get('anchor_key'),
             'author_key':        can.get('author_key'),
@@ -527,6 +536,9 @@ def merge_fuzzy(
             'extracted_doi':     can.get('extracted_doi'),
             'extracted_isbn':    can.get('extracted_isbn'),
             'extracted_pmid':    can.get('extracted_pmid'),
+            'extracted_pmc':     can.get('extracted_pmc'),          # ADDED (wcd)
+            'extracted_arxiv':   can.get('extracted_arxiv'),        # ADDED (wcd)
+            'extracted_wikidata_qid': can.get('extracted_wikidata_qid'),  # ADDED (wcd)
             'extracted_url':     can.get('extracted_url'),
             'anchor_key':        can.get('anchor_key'),
             'author_key':        can.get('author_key'),
@@ -565,6 +577,7 @@ def merge_fuzzy(
 INPUT_COLUMNS = [
     "content_sha1", "content", "norm_content", "norm_subtype", "id_tier", "id_tier_label",
     "extracted_url", "extracted_isbn", "extracted_doi", "extracted_pmid", "extracted_pmc",
+    "extracted_arxiv", "extracted_wikidata_qid",   # ADDED (wcd)
     "anchor_key", "author_key", "year", "year_reliable", "page_ref", "title",
     "n_revisions", "first_rev_id", "ref_name",
     # optional (BERT enrichment): "ml_author", "ml_year", "ml_title"

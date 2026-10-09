@@ -27,3 +27,16 @@ Documented deviations from upstream logic:
      set; upstream's set iteration made the extracted URL of a cite template
      inside a ref depend on the Python hash seed. The golden generator applies
      the same tuple to upstream before recording.
+
+Additions over upstream (all marked "ADDED (wcd)" in the source and covered
+by tests/test_additions.py; the golden comparison strips their output keys):
+  * template.py extracts `extracted_arxiv` (|arxiv= on any template, |eprint=
+    on {{cite arXiv}}; version suffix stripped) and `extracted_wikidata_qid`
+    ({{Cite Q}} first positional parameter).
+  * reftag.py extracts `extracted_arxiv` from arxiv.org URLs / "arXiv:ID"
+    text; `extracted_wikidata_qid` is always None in the ref-tag path.
+    id_tier semantics are unchanged.
+  * The matchers treat PMC, arXiv and Wikidata QID as hard identifiers at
+    confidence 0.95 (per-page, cross-type and cross-page), exclude them from
+    the cross-page fuzzy pass, and carry all three columns on their outputs.
+  * scoring.py gives the 10-point match-type bonus to pmc / arxiv / wikidata_qid.

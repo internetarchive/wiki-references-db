@@ -717,6 +717,8 @@ _ID_DOI_RE = re.compile(r'\b(10\.\d{4,9}/[^\s\]|<>"\']+)', re.IGNORECASE)
 _ID_PMID_RE = re.compile(r'\bPMID[:\s=]?\s*(\d+)', re.IGNORECASE)
 _ID_PMC_RE = re.compile(r'\bPMC[:\s=]?\s*(\d+)', re.IGNORECASE)
 _ID_COMMENT_RE = re.compile(r'<!--.*?-->', re.DOTALL)
+# ADDED (wcd): arXiv ids from arxiv.org URLs or 'arXiv:ID' text in prose refs
+_ID_ARXIV_RE = re.compile(r'(?:arxiv\.org/(?:abs|pdf)/|\barXiv:\s*)((?:\d{4}\.\d{4,5})|(?:[a-z\-]+(?:\.[A-Z]{2})?/\d{7}))(?:v\d+)?', re.IGNORECASE)
 _ID_CITE_PREFIX_RE = re.compile(r'^\{\{\s*(cite\s+\w|citation\b)', re.IGNORECASE)
 # DEVIATION FROM UPSTREAM (determinism): upstream iterates a *set* of parameter
 # names here, so which URL a {{cite}} inside a ref yields depends on the hash
@@ -758,7 +760,7 @@ def _parse_template_ids(content: str) -> Optional[dict]:
         return None
 
 
-def _extract_identifiers(content: str) -> dict:
+def _extract_identifiers_upstream(content: str) -> dict:
     """
     Extract hard identifiers from a ref_tag content string.
     Returns tier (0-5), tier_label, and extracted identifier fields.
@@ -890,6 +892,21 @@ def _extract_identifiers(content: str) -> dict:
 
 # Priority order matters: wikilink and bare_url are syntactically unambiguous,
 # shorthand templates next, then structured author-date, then prose catch-all.
+def _extract_identifiers(content: str) -> dict:
+    """Upstream identifier extraction plus the ADDED (wcd) identifiers.
+
+    arXiv: from an arxiv.org URL or 'arXiv:ID' text anywhere in the content
+    (the template-wrapped case is handled by template.py when the content is
+    routed there; here it is a best-effort scan). Wikidata QID: model-only in
+    the ref-tag path (always None). Neither changes id_tier.
+    """
+    ids = _extract_identifiers_upstream(content)
+    m = _ID_ARXIV_RE.search(_ID_COMMENT_RE.sub("", content))
+    ids["extracted_arxiv"] = m.group(1) if m else None
+    ids["extracted_wikidata_qid"] = None
+    return ids
+
+
 _CLASSIFIERS = [
     _classify_noise,
     _classify_wikilink,
@@ -969,6 +986,8 @@ _SCHEMA = {
     "extracted_doi":      "VARCHAR",
     "extracted_pmid":     "VARCHAR",
     "extracted_pmc":      "VARCHAR",
+    "extracted_arxiv":    "VARCHAR",   # ADDED
+    "extracted_wikidata_qid": "VARCHAR",  # ADDED
     "is_archive_url":     "BOOLEAN",
 }
 

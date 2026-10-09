@@ -101,6 +101,26 @@ _DOI_PARAMS = ['doi', 'DOI']
 # PMID/PMC
 _PMID_PARAMS = ['pmid', 'PMID']
 _PMC_PARAMS = ['pmc', 'PMC']
+# ADDED (wcd): arXiv and Wikidata QID — see docs/design/decisions_2026_09_10.md item 7
+_ARXIV_PARAMS = ['arxiv', 'arXiv', 'eprint']
+_ARXIV_RE = re.compile(r'^(?:arxiv:\s*)?((?:\d{4}\.\d{4,5})|(?:[a-z\-]+(?:\.[A-Z]{2})?/\d{7}))(?:v\d+)?$', re.IGNORECASE)
+_QID_RE = re.compile(r'^\s*(Q\d+)\s*$', re.IGNORECASE)
+
+
+def _norm_arxiv(raw: str) -> Optional[str]:
+    """arXiv identifier without the 'arXiv:' prefix or a version suffix (ADDED)."""
+    if not raw:
+        return None
+    m = _ARXIV_RE.match(raw.strip())
+    return m.group(1) if m else None
+
+
+def _norm_qid(raw: str) -> Optional[str]:
+    """Wikidata item id, upper-cased (ADDED)."""
+    if not raw:
+        return None
+    m = _QID_RE.match(raw)
+    return m.group(1).upper() if m else None
 # Location aliases
 _LOCATION_PARAMS = ['location', 'place', 'publication-place', 'city']
 # Pages aliases
@@ -253,6 +273,21 @@ def extract_template(
             isbn = _norm_isbn(v)
             if isbn:
                 break
+    # ADDED (wcd): arXiv — |arxiv= on any template, |eprint= only on {{cite arXiv}}
+    arxiv = None
+    for k in _ARXIV_PARAMS:
+        if k == 'eprint' and not tn.startswith('cite arxiv'):
+            continue
+        v = params.get(k, '')
+        if v:
+            arxiv = _norm_arxiv(v)
+            if arxiv:
+                break
+    # ADDED (wcd): Wikidata QID — {{Cite Q}} first positional parameter
+    qid = None
+    if tn in ('cite q', 'citeq'):
+        qid = _norm_qid(params.get('1', '') or '')
+
     # Also check id= field
     id_field = params.get('id', '')
     if not isbn and id_field and re.match(r'(?i)isbn', id_field):
@@ -317,6 +352,8 @@ def extract_template(
         'extracted_doi':    doi,
         'extracted_pmid':   pmid,
         'extracted_pmc':    pmc,
+        'extracted_arxiv':  arxiv,            # ADDED
+        'extracted_wikidata_qid': qid,      # ADDED
         'is_archive_url':   _is_archive_url(url) if url else False,
         'id_tier':          id_tier,
         'id_tier_label':    id_tier_label,
@@ -348,6 +385,8 @@ _SCHEMA = {
     'extracted_doi':      'VARCHAR',
     'extracted_pmid':     'VARCHAR',
     'extracted_pmc':      'VARCHAR',
+    'extracted_arxiv':    'VARCHAR',   # ADDED
+    'extracted_wikidata_qid': 'VARCHAR',  # ADDED
     'is_archive_url':     'BOOLEAN',
     'id_tier':            'INTEGER',
     'id_tier_label':      'VARCHAR',

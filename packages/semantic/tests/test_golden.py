@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from assemble import Backend, _clean, dumps, run_contents, run_flags, run_global, run_pages, run_scores
+from assemble import Backend, dumps, run_contents, run_flags, run_global, run_pages, run_scores, strip_added
 from wcd_semantic import content, match_global, match_reftag, match_template, merge_types, reftag, scoring, signals, template
 
 GOLDEN = json.loads((Path(__file__).resolve().parents[3] / "fixtures" / "golden" / "semantic" / "expected.json").read_text())
@@ -42,6 +42,8 @@ def pages(b):
 
 
 def _assert_same(actual, expected, label):
+    actual = strip_added(actual)
+    expected = strip_added(expected)   # upstream never had pmc on matcher outputs either way
     if actual != expected:
         a, e = dumps(actual).splitlines(), dumps(expected).splitlines()
         diff = [f"-{x}" if x not in a else f"+{x}" for x in e + a if (x not in a) or (x not in e)]

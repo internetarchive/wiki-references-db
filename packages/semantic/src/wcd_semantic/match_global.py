@@ -70,6 +70,9 @@ def hard_identifier_pass(
         ('doi',  'extracted_doi',  1.00),
         ('isbn', 'extracted_isbn', 0.95),
         ('pmid', 'extracted_pmid', 0.95),
+        ('pmc',  'extracted_pmc',  0.95),          # ADDED (wcd)
+        ('arxiv', 'extracted_arxiv', 0.95),        # ADDED (wcd)
+        ('wikidata_qid', 'extracted_wikidata_qid', 0.95),  # ADDED (wcd)
         # ('url', 'extracted_url', 0.85),
     ]:
         if col not in df.columns:
@@ -105,10 +108,16 @@ def author_year_fuzzy_pass(
 
     Returns count of merges made.
     """
+    # ADDED (wcd): the extra hard identifiers also exclude a source from the fuzzy pass
+    _no_extra = pd.Series(True, index=df.index)
+    for _col in ('extracted_pmc', 'extracted_arxiv', 'extracted_wikidata_qid'):
+        if _col in df.columns:
+            _no_extra &= df[_col].isna()
     no_hard = df[
         df['extracted_doi'].isna()  &
         df['extracted_isbn'].isna() &
         df['extracted_pmid'].isna() &
+        _no_extra &
         df['author_key'].notna()    &
         df['year'].notna() &
         df['title'].notna()
@@ -266,6 +275,9 @@ def build_global_sources(
             'extracted_doi':     canonical.get('extracted_doi'),
             'extracted_isbn':    canonical.get('extracted_isbn'),
             'extracted_pmid':    canonical.get('extracted_pmid'),
+            'extracted_pmc':     canonical.get('extracted_pmc'),          # ADDED (wcd)
+            'extracted_arxiv':   canonical.get('extracted_arxiv'),        # ADDED (wcd)
+            'extracted_wikidata_qid': canonical.get('extracted_wikidata_qid'),  # ADDED (wcd)
             'extracted_url':     canonical.get('extracted_url'),
             'n_total_citations': int(n_total),
             'reliability_score': score,
@@ -289,6 +301,7 @@ INPUT_COLUMNS = [
     "merged_source_id", "page_id", "author_key", "year", "title", "extracted_doi",
     "extracted_isbn", "extracted_pmid", "extracted_url", "n_total_citations", "match_type",
     "confidence", "canonical_sha1", "source_type", "id_tier", "year_reliable", "norm_subtype",
+    # optional, ADDED (wcd): "extracted_pmc", "extracted_arxiv", "extracted_wikidata_qid"
 ]
 
 

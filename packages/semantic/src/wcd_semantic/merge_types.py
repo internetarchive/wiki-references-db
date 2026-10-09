@@ -28,6 +28,9 @@ CONFIDENCE = {
     'doi':         1.00,
     'isbn':        0.95,
     'pmid':        0.95,
+    'pmc':         0.95,   # ADDED (wcd)
+    'arxiv':       0.95,   # ADDED (wcd)
+    'wikidata_qid': 0.95,  # ADDED (wcd)
     'url':         0.85,
     'author_year': 0.65,
     'title_fuzzy': 0.60, 
@@ -113,6 +116,9 @@ def build_merged_sources(
         ('doi',  'extracted_doi'),
         ('isbn', 'extracted_isbn'),
         ('pmid', 'extracted_pmid'),
+        ('pmc',  'extracted_pmc'),          # ADDED (wcd)
+        ('arxiv', 'extracted_arxiv'),       # ADDED (wcd)
+        ('wikidata_qid', 'extracted_wikidata_qid'),  # ADDED (wcd)
         ('url',  'extracted_url'),
     ]:
         rt_idx = _build_identifier_index(rt, 'rt', col)
@@ -388,6 +394,9 @@ def build_merged_sources(
             'extracted_doi':     _best_field(ordered_rows, 'extracted_doi'),
             'extracted_isbn':    _best_field(ordered_rows, 'extracted_isbn'),
             'extracted_pmid':    _best_field(ordered_rows, 'extracted_pmid'),
+            'extracted_pmc':     _best_field(ordered_rows, 'extracted_pmc'),          # ADDED (wcd)
+            'extracted_arxiv':   _best_field(ordered_rows, 'extracted_arxiv'),        # ADDED (wcd)
+            'extracted_wikidata_qid': _best_field(ordered_rows, 'extracted_wikidata_qid'),  # ADDED (wcd)
             'extracted_url':     _best_field(ordered_rows, 'extracted_url'),
             'n_ref_citations':   int(n_rt),
             'n_tmpl_citations':  int(n_tm),
@@ -406,6 +415,7 @@ RT_COLUMNS = [
     "source_id", "canonical_sha1", "norm_subtype", "author_key", "year", "extracted_doi",
     "extracted_isbn", "extracted_pmid", "extracted_url", "n_citations", "match_type",
     "confidence", "norm_content", "ref_title",
+    # optional, ADDED (wcd): "extracted_pmc", "extracted_arxiv", "extracted_wikidata_qid"
 ]
 TM_COLUMNS = [
     "source_id", "canonical_sha1", "template_subtype", "author_key", "year", "title",

@@ -26,6 +26,9 @@ CONFIDENCE = {
     'doi':        1.00,
     'isbn':       0.95,
     'pmid':       0.95,
+    'pmc':        0.95,   # ADDED (wcd)
+    'arxiv':      0.95,   # ADDED (wcd)
+    'wikidata_qid': 0.95, # ADDED (wcd)
     'ref_name':   0.90,
     'url':        0.85,
     'title_year': 0.70,
@@ -149,6 +152,9 @@ def build_source_map(
         ('doi',      'extracted_doi'),
         ('isbn',     'extracted_isbn'),
         ('pmid',     'extracted_pmid'),
+        ('pmc',      'extracted_pmc'),          # ADDED (wcd)
+        ('arxiv',    'extracted_arxiv'),        # ADDED (wcd)
+        ('wikidata_qid', 'extracted_wikidata_qid'),  # ADDED (wcd)
         ('ref_name', 'ref_name'),
         ('url',      'extracted_url'),
     ]:
@@ -237,6 +243,9 @@ def build_source_map(
             'extracted_doi':    canonical.get('extracted_doi'),
             'extracted_isbn':   canonical.get('extracted_isbn'),
             'extracted_pmid':   canonical.get('extracted_pmid'),
+            'extracted_pmc':    canonical.get('extracted_pmc'),          # ADDED (wcd)
+            'extracted_arxiv':  canonical.get('extracted_arxiv'),        # ADDED (wcd)
+            'extracted_wikidata_qid': canonical.get('extracted_wikidata_qid'),  # ADDED (wcd)
             'extracted_url':    canonical.get('extracted_url'),
             'id_tier':          canonical.get('id_tier'),
             'n_citations':      len(members),
@@ -262,7 +271,8 @@ def build_source_map(
 INPUT_COLUMNS = [
     "content_sha1", "raw_content", "template_name", "template_subtype", "author_last",
     "author_key", "title", "year", "journal", "pages", "extracted_url", "extracted_isbn",
-    "extracted_doi", "extracted_pmid", "extracted_pmc", "id_tier", "id_tier_label",
+    "extracted_doi", "extracted_pmid", "extracted_pmc", "extracted_arxiv", "extracted_wikidata_qid",  # last two ADDED (wcd)
+    "id_tier", "id_tier_label",
     "n_revisions", "first_rev_id", "ref_name",
     # optional (BERT enrichment): "ml_author", "ml_year", "ml_title"
 ]
