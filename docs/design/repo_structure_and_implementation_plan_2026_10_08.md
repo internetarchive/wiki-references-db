@@ -229,3 +229,51 @@ These are repository questions the notes do not settle and that change the layou
 3. **Whether v1 code enters the monorepo at all.** Recommendation: it does not; it keeps running from the existing deployment until v2 cutover, and the monorepo starts clean.
 4. **The fixture shard.** Which pages, and whether it is built by running RevisionChest over a filtered XML dump or by splitting an existing `.mwrev.zst` (UVA's `notebooks/split_mwrev.ipynb` does the latter). It needs to exist before anything else in Phase R can be gated.
 5. **Rust scope.** `rust/` is laid out as a workspace so that the wikitext-scanner rewrite you have considered has a home next to RevisionChest if it happens; nothing in this plan depends on it.
+
+---
+
+## 5. Decisions and Phase R outcome (2026-10-08)
+
+### Decisions
+
+1. **Home.** The monorepo is `internetarchive/wiki-references-db`, branch `v3` — the `wrdb-v3` checkout itself, history preserved. `internetarchive` is the organisation for every repository; the `scatter-llc` UVA fork is the exception.
+2. **Submodules, not subtrees.** Anything that is a module in its own right stays its own repository and is consumed as a submodule. The normalizer is explicitly meant to be usable by other projects, not just the extractor. So: `packages/normalizer` → `wiki-references-normalizer`, `packages/extractor` → `wiki-references-extractor`, `rust/revisionchest` → `RevisionChest`, and `upstream/uva` → the UVA fork, kept only until Phase S has ported its logic. Everything else (`wcd_schema`, `wcd_pipeline`, the future `wcd_semantic`, `apps/`) is in-tree.
+3. **Explorer.** Replaced by the UVA dashboard; not carried forward.
+4. **v1.** Frozen in `legacy/` with its own `requirements.txt` and a copy of the v1 models; served until v2 cutover, then deleted.
+5. **Naming.** `wcd-*` distribution names, `wcd_*` import names, `wcd` CLI. Existing import names (`citation_normalizer`, `refs_extractor`) unchanged.
+6. **Rust scope** as proposed: `rust/` is a workspace home for RevisionChest and, if it happens, the wikitext-scanner rewrite.
+7. **Fixture sampling.** A sampling strategy for the test-article subset was agreed in an earlier conversation that is not accessible from this one; `scripts/select_fixture_pages.py` is a stub with the input/output contract and awaits those criteria. `wcd fixture-dump` (the XML-dump filter that feeds RevisionChest) is implemented and tested.
+
+### What landed (commit `7cf66f9` on `v3`, plus `10f7384` in the extractor and `088a460` in the normalizer — all local, not pushed)
+
+```
+wiki-references-db (v3)
+├── pyproject.toml, uv.lock         uv workspace: members packages/*, apps/*
+├── README.md, example.env          rewritten for the layout; DATABASE_URL added (DB_* still accepted)
+├── .github/workflows/ci.yml        uv sync + pytest; cargo build of RevisionChest
+├── packages/
+│   ├── normalizer/   (submodule)   unchanged API; egg-info untracked
+│   ├── extractor/    (submodule)   src/refs_extractor/ + pyproject; wikis.yaml, wiki_config.py, wikis.py moved in;
+│   │                               syntax.py shim removed; tests moved in; console script refs-extractor
+│   ├── schema/       wcd_schema    postgres.py (← models.py), staging.py (← build_db.SCHEMAS)
+│   └── pipeline/     wcd_pipeline  extract (← build_db), extract_all (← build_all), dedup (← dedup_parquet),
+│                                   load (← load_all), init_db, purge, config, cli (`wcd`), fixture_dump
+│       └── tests/                  synthetic_bundle.py, test_stage1_golden.py, test_fixture_dump.py
+├── rust/revisionchest/ (submodule) unchanged
+├── upstream/uva/       (submodule) unchanged; reference for Phase S
+├── legacy/                         app.py, api_v1.py, explorer.py, templates/, openapi.yaml, models.py (frozen copy), requirements.txt
+├── fixtures/                       README; golden/synthetic/ (11 Parquet tables from the unmodified pipeline)
+├── docs/design/                    the former notes/ (now tracked)
+└── scripts/select_fixture_pages.py stub
+```
+
+**Gate R passed.** The unmodified `build_db.py` + `dedup_parquet.py` were run on the synthetic bundle before any move (12 citation instances, 28 history rows, 33 template-data rows across two pages and five revisions); after the restructure `wcd extract` + `wcd dedup` reproduce all eleven tables exactly (DuckDB `EXCEPT` in both directions, zero rows). That comparison is now the permanent test `test_stage1_golden.py`. All 39 tests pass (`uv run pytest`): 15 normalizer, 11 extractor, 13 pipeline.
+
+Behaviour-preserving edits that were unavoidable: `build_db` imports `citation_normalizer` directly instead of through the removed shim and takes `SCHEMAS` from `wcd_schema.staging`; `load_all` no longer validates database variables at import time (it calls `wcd_pipeline.config.database_url()` instead, so `wcd extract` works without a database configured); `build_all` launches `python -m wcd_pipeline.extract` rather than `build_db.py` by filename; every stage exposes `main(argv)`.
+
+### Still open after Phase R
+
+- **Sampling criteria** for `select_fixture_pages.py`, then the fixture shard itself (`fixtures/shards/`) built via `wcd fixture-dump` → RevisionChest. Until it exists, the golden tests run on the synthetic bundle only.
+- **Push.** Three local commits (monorepo `v3`; extractor `v3`; normalizer `v3`) are unpushed. The extractor's `v3` restructure changes its layout, so its README's standalone-install instructions should be checked against a fresh clone after pushing.
+- **Python version.** The workspace says `>=3.10` because that is what ran the gate; CI uses 3.12. Pin higher once the UVA port (which was developed on 3.12) lands if anything needs it.
+- **Phase S** is next: `packages/semantic` with the vendored UVA pure functions and golden tests generated from `upstream/uva`; then `upstream/uva` is removed.
