@@ -13,6 +13,7 @@ requires-python = ">=3.10"
 dependencies = [
     "wcd-pipeline",
     "wcd-schema",
+    "wcd-semantic",
     "wiki-references-extractor",
     "wiki-citation-normalizer",
 ]
@@ -31,6 +32,7 @@ members = ["packages/*", "apps/*"]
 [tool.uv.sources]
 wcd-pipeline = { workspace = true }
 wcd-schema = { workspace = true }
+wcd-semantic = { workspace = true }
 wiki-references-extractor = { workspace = true }
 wiki-citation-normalizer = { workspace = true }
 
@@ -39,5 +41,6 @@ testpaths = [
     "packages/normalizer/tests",
     "packages/extractor/tests",
     "packages/schema/tests",
+    "packages/semantic/tests",
     "packages/pipeline/tests",
 ]

@@ -1,0 +1,24 @@
+[project]
+name = "wcd-semantic"
+version = "0.1.0"
+description = "Wikipedia Citations Database: citation classification, normalization, source matching and scoring (pure functions)"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "rapidfuzz>=3.0",
+    "mwparserfromhell>=0.6.4",
+]
+
+[project.optional-dependencies]
+# The optional BERT passes in the matchers read enrichment tables that are
+# produced by an external model-inference step; nothing here runs a model.
+# Kept as an extra so the dependency surface of the default install stays small.
+bert = ["torch", "transformers"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
