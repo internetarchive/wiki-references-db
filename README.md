@@ -29,8 +29,11 @@ packages/
                 the UVA Wikipedia Citations Database (see its NOTICE).
   pipeline/     `wcd_pipeline` and the `wcd` CLI: the build stages.
 rust/
-  revisionchest/  git submodule → internetarchive/RevisionChest
-                  Stage 0: XML dumps → .mwrev.zst revision bundles + metadata.
+  revisionchest/  git submodule → internetarchive/RevisionChest, a Cargo workspace:
+                  `mwdump` (streaming XML dump reader), `mwrev` (the .mwrev.zst
+                  bundle format), `revisionchest-meta` (Parquet / Postgres
+                  metadata sinks) and the `RevisionChest` binary (build, sync).
+                  Stage 0: XML dumps → bundles + revisions / page_metadata.
 legacy/         the v1 Flask API and explorer, frozen; served until v2 cutover.
 fixtures/       committed test inputs and golden outputs (see fixtures/README.md).
 docs/design/    the plan: proposed_*.md, decisions, executive summary.
@@ -44,8 +47,9 @@ the implementation plan.
 
 ## Setup
 
-Requires Python ≥ 3.10 and [uv](https://docs.astral.sh/uv/). Rust/cargo only
-if you build RevisionChest.
+Requires Python ≥ 3.10 and [uv](https://docs.astral.sh/uv/). Rust ≥ 1.85
+only if you build RevisionChest (`cargo build --release` inside
+`rust/revisionchest`).
 
 ```
 git clone --recurse-submodules https://github.com/internetarchive/wiki-references-db

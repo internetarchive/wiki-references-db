@@ -19,4 +19,13 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --manifest-path rust/revisionchest/Cargo.toml
+        with:
+          components: clippy, rustfmt
+      - run: cargo build --release --workspace
+        working-directory: rust/revisionchest
+      - run: cargo test --workspace
+        working-directory: rust/revisionchest
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: rust/revisionchest
+      - run: cargo fmt --all -- --check
+        working-directory: rust/revisionchest
