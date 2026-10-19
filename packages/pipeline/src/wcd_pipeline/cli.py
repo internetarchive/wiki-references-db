@@ -21,7 +21,8 @@ COMMANDS = {
     "parts":       ("wcd_pipeline.stage4",      "Stage 4: split normalized citations into semantic parts (normalized_citation_parts)"),
     "denorm-export": ("wcd_pipeline.materialize", "Stage 4.6 / 7c: export citation_instances_denorm Parquet for a domain"),
     "ref-name-links": ("wcd_pipeline.stage5",   "Stage 5: resolve <ref name> reuse to defining instances per revision range"),
-    "gate":        ("wcd_pipeline.gates",       "Run an inter-stage validation gate (0, 3, 4, 5) for a domain"),
+    "match":       ("wcd_pipeline.stage6",      "Stage 6: per-page (6a-6c) and cross-page (6d) source matching for a domain"),
+    "gate":        ("wcd_pipeline.gates",       "Run an inter-stage validation gate (0, 3, 4, 5, 6) for a domain"),
     "fixture-dump": ("wcd_pipeline.fixture_dump", "Filter XML history dumps down to a page list (fixture input for RevisionChest)"),
 }
 

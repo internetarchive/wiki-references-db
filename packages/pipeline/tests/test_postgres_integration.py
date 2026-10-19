@@ -20,7 +20,7 @@ import pytest
 import zstandard as zstd
 from sqlalchemy import create_engine, text
 
-from wcd_pipeline import dedup, extract, gates, init_db, load, materialize, stage0, stage4, stage5
+from wcd_pipeline import dedup, extract, gates, init_db, load, materialize, stage0, stage4, stage5, stage6
 from wcd_pipeline.config import database_url
 from wcd_schema import parquet as layout
 from wcd_schema.ids import instance_id
@@ -334,3 +334,55 @@ def test_stage5_gate_detects_overlap(db, staged: Path):
         failures = gates.stage5(Session(con_pg), DOMAIN)
         assert any("overlapping" in f for f in failures), failures
         con_pg.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Stage 6 (matching) on the Stage-4.6 export
+# ---------------------------------------------------------------------------
+
+def _read(con, work: Path, dataset: str, order: str):
+    pattern = layout.partition_glob(work / "parquet", "matching_intermediate/" + dataset, DOMAIN)
+    return con.execute(f"SELECT * FROM read_parquet('{pattern}', hive_partitioning=true) ORDER BY {order}").df()
+
+
+def test_stage6_matching(db, staged: Path, work: Path):
+    parquet = str(work / "parquet")
+    # (denorm export ran in test_stage4_denorm_export; ref_name_links in test_stage5)
+    assert stage6.main(["--domain", DOMAIN, "--parquet-dir", parquet, "--jobs", "1"]) == 0
+    con = duckdb.connect()
+    sources = _read(con, work, "sources", "page_id, source_id")
+    tsources = _read(con, work, "template_sources", "page_id, source_id")
+    merged = _read(con, work, "merged_sources", "page_id, merged_source_id")
+    mmap = _read(con, work, "merged_citation_source_map", "page_id, part_sha1")
+    gmap = _read(con, work, "global_source_map", "merged_source_id")
+    gstage = _read(con, work, "global_sources_stage", "global_source_id")
+
+    # 6b: the two editions of the Diamond book on page 101 share an ISBN → one template source of 2
+    diamond_101 = tsources[(tsources.page_id == PAGE_A) & (tsources.extracted_isbn == "9780143036555")]
+    assert len(diamond_101) == 1 and diamond_101.iloc[0].n_citations == 2 and diamond_101.iloc[0].match_type == "isbn"
+    # 6a: the ref-tag parts of page 101 are all singletons (prose, sfn, bare urls)
+    assert set(sources[sources.page_id == PAGE_A].match_type) == {"singleton"}
+    # 6c: {{sfn|Routledge|1919}} merges with the Routledge {{cite book}} endnote on author+year
+    both = merged[(merged.page_id == PAGE_A) & (merged.source_type == "both")]
+    assert len(both) == 1 and both.iloc[0].author_key == "routledge" and both.iloc[0].year == "1919"
+    assert both.iloc[0].match_type == "author_year" and both.iloc[0].n_total_citations == 2
+    # every part of the bucket is mapped to exactly one merged source, with the per-page match values
+    n_parts = con.execute(f"SELECT count(DISTINCT (page_id, part_sha1)) FROM read_parquet("
+                          f"'{layout.partition_glob(work / 'parquet', 'citation_instances_denorm', DOMAIN)}', hive_partitioning=true)").fetchone()[0]
+    assert len(mmap) == n_parts and mmap.duplicated(["page_id", "part_sha1"]).sum() == 0
+    assert set(mmap.source_type) == {"ref_tag", "template"}
+    assert mmap[mmap.merged_source_id == both.iloc[0].merged_source_id].shape[0] == 2
+    # 6d: the Diamond book cited on both pages collapses to one global source (isbn), n_pages 2
+    g_isbn = gstage[gstage.extracted_isbn == "9780143036555"]
+    assert len(g_isbn) == 1 and g_isbn.iloc[0].n_pages == 2 and g_isbn.iloc[0].match_type == "isbn"
+    assert g_isbn.iloc[0].source_type == "template" and g_isbn.iloc[0].n_total_citations == 3
+    assert set(gmap[gmap.global_source_id == g_isbn.iloc[0].global_source_id].page_id) == {PAGE_A, PAGE_B}
+    # every merged source has a map row; singletons carry no confidence
+    assert set(gmap.merged_source_id) == set(merged.merged_source_id)
+    assert gstage[gstage.match_type == "singleton"].confidence.isna().all()
+    assert stage6.gate(parquet, DOMAIN) == []
+    # re-run: markers skip done buckets; --force rebuilds identically
+    before = merged.copy()
+    assert stage6.main(["--domain", DOMAIN, "--parquet-dir", parquet, "--jobs", "1", "--force"]) == 0
+    after = _read(con, work, "merged_sources", "page_id, merged_source_id")
+    assert after.equals(before)

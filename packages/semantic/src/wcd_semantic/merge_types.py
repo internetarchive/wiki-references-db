@@ -387,6 +387,10 @@ def build_merged_sources(
             'source_type':       src_type,
             'ref_source_id':     rt_members[0].replace('rt:', '') if rt_members else None,
             'tmpl_source_id':    tm_members[0].replace('tm:', '') if tm_members else None,
+            # ADDED (wcd): every member, so the per-page citation maps can be joined to
+            # merged sources (upstream exposes only the first member of each side)
+            'rt_source_ids':     [m[3:] for m in rt_members],
+            'tm_source_ids':     [m[3:] for m in tm_members],
             'canonical_sha1':    canonical_row.get('canonical_sha1'),
             'author_key':        _best_field(ordered_rows, 'author_key'),
             'year':              _best_field(ordered_rows, 'year'),

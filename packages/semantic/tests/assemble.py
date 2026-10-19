@@ -19,7 +19,7 @@ from corpus import CONTENTS, PAGES, REVISION_TEXTS
 # Output fields wcd_semantic ADDS over upstream (identifier set extension,
 # docs/design/decisions_2026_09_10.md item 7). They are stripped before the
 # golden comparison and covered by test_additions.py instead.
-ADDED_FIELDS = ("extracted_arxiv", "extracted_wikidata_qid")
+ADDED_FIELDS = ("extracted_arxiv", "extracted_wikidata_qid", "rt_source_ids", "tm_source_ids")
 ADDED_MATCHER_FIELDS = ("extracted_pmc", "extracted_arxiv", "extracted_wikidata_qid")
 
 

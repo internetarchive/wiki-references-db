@@ -72,6 +72,7 @@ Stage 3  wcd load                 deduped   → Postgres;  wcd gate 3
 Stage 4  wcd parts                normalized_citations → normalized_citation_parts (UVA normalizers); gate
 Stage 4.6 wcd denorm-export       Postgres  → citation_instances_denorm Parquet (unresolved)
 Stage 5  wcd ref-name-links       history × revisions × named instances → ref_name_links (Postgres + Parquet); gate
+Stage 6  wcd match                 denorm + history → matching_intermediate/* (6a-6c per bucket, 6d per domain); gate
 ```
 
 ```
@@ -86,6 +87,7 @@ uv run wcd init-db --add-indexes
 uv run wcd parts --domain en.wikipedia.org
 uv run wcd denorm-export --domain en.wikipedia.org --parquet-dir ./parquet
 uv run wcd ref-name-links --domain en.wikipedia.org --parquet-dir ./parquet
+uv run wcd match --domain en.wikipedia.org --parquet-dir ./parquet --jobs 8
 ```
 
 One bundle directory per domain: the bundle format carries no domain, and
@@ -94,8 +96,12 @@ row. `wcd stage0-load` is idempotent (`ON CONFLICT DO NOTHING` on `revisions`,
 upserts elsewhere) and rebuilds the domain's `revisions` Parquet from
 everything under `--metadata` — point it at the directory holding all of the
 domain's metadata files, overlapping `sync` batches included. Each stage ends
-with its gate from `docs/design/proposed_data_integrity.md`; `wcd gate <0|3|4|5>`
-re-runs one.
+with its gate from `docs/design/proposed_data_integrity.md`; `wcd gate <0|3|4|5|6>`
+re-runs one. `wcd match` runs the vendored UVA matchers (`wcd_semantic`)
+unchanged, one process per page bucket, and writes only Parquet
+(`matching_intermediate/<name>/domain=/page_bucket=/`, plus the per-domain
+`global_source_map` / `global_sources_stage`); a bucket with a `_SUCCESS`
+marker is skipped unless `--force`.
 
 Two tiers hold the data: Postgres for the serving tables, and a Parquet
 directory (`PARQUET_DIR`) laid out `<dataset>/domain=<d>/page_bucket=<n>/`

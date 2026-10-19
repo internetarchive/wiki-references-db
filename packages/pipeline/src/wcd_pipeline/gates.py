@@ -215,7 +215,7 @@ def stage5(session: Session, domain: str, parquet_base: str | None = None) -> li
 # CLI
 # ---------------------------------------------------------------------------
 
-STAGES = ("0", "3", "4", "5")
+STAGES = ("0", "3", "4", "5", "6")
 
 
 def run(stage: str, session: Session, domain: str, parquet_base: str | None, **kw) -> list[str]:
@@ -227,6 +227,9 @@ def run(stage: str, session: Session, domain: str, parquet_base: str | None, **k
         return stage4(session, domain)
     if stage == "5":
         return stage5(session, domain, parquet_base)
+    if stage == "6":
+        from .stage6 import gate as stage6
+        return stage6(parquet_base, domain)
     raise ValueError(stage)
 
 
@@ -246,14 +249,15 @@ def main(argv=None) -> int:
     ap.add_argument("--parquet-dir", default=os.environ.get("PARQUET_DIR"), help="Parquet tier base directory (default: PARQUET_DIR)")
     ap.add_argument("--all-buckets", action="store_true", help="Stage 3: check every bucket instead of a sample of 16")
     args = ap.parse_args(argv)
-    if args.stage in ("3",) and not args.parquet_dir:
+    if args.stage in ("3", "6") and not args.parquet_dir:
         ap.error("--parquet-dir (or PARQUET_DIR) is required for this gate")
-    session = make_session()
+    session = make_session() if args.stage != "6" else None
     try:
         kw = {"sample_buckets": None} if (args.stage == "3" and args.all_buckets) else {}
         return report(args.stage, run(args.stage, session, args.domain, args.parquet_dir, **kw))
     finally:
-        session.close()
+        if session is not None:
+            session.close()
 
 
 if __name__ == "__main__":

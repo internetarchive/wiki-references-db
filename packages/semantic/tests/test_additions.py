@@ -92,3 +92,24 @@ def test_scoring_bonus_for_added_match_types():
     base = {"source_type": "ref_tag", "id_tier": 0, "author_key": None, "year": None, "year_reliable": False, "norm_subtype": None}
     for mt in ("pmc", "arxiv", "wikidata_qid"):
         assert scoring.compute_score({**base, "match_type": mt})[0] == 10
+
+
+def test_merged_sources_list_every_member():
+    # two ref-tag sources and one template source sharing a URL become one merged
+    # source; upstream exposes only the first member of each side
+    rt = pd.DataFrame([
+        {**{k: None for k in merge_types.RT_COLUMNS}, "source_id": "r1", "canonical_sha1": "1" * 40, "n_citations": 1,
+         "match_type": "singleton", "extracted_url": "https://e.org/x"},
+        {**{k: None for k in merge_types.RT_COLUMNS}, "source_id": "r2", "canonical_sha1": "2" * 40, "n_citations": 1,
+         "match_type": "singleton", "extracted_url": "https://e.org/x"},
+        {**{k: None for k in merge_types.RT_COLUMNS}, "source_id": "r3", "canonical_sha1": "3" * 40, "n_citations": 1,
+         "match_type": "singleton"},
+    ])
+    tm = pd.DataFrame([{**{k: None for k in merge_types.TM_COLUMNS}, "source_id": "t1", "canonical_sha1": "4" * 40,
+                        "n_citations": 1, "match_type": "singleton", "extracted_url": "https://e.org/x"}])
+    merged = merge_types.merge_page(rt, tm, 7).set_index("ref_source_id")
+    both = merged[merged["source_type"] == "both"].iloc[0]
+    assert sorted(both["rt_source_ids"]) == ["r1", "r2"] and both["tm_source_ids"] == ["t1"]
+    assert both.name in ("r1", "r2")
+    alone = merged.loc["r3"]
+    assert alone["rt_source_ids"] == ["r3"] and alone["tm_source_ids"] == [] and alone["tmpl_source_id"] is None
