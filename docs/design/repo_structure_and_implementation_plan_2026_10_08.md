@@ -277,3 +277,20 @@ Behaviour-preserving edits that were unavoidable: `build_db` imports `citation_n
 - **Push.** Three local commits (monorepo `v3`; extractor `v3`; normalizer `v3`) are unpushed. The extractor's `v3` restructure changes its layout, so its README's standalone-install instructions should be checked against a fresh clone after pushing.
 - **Python version.** The workspace says `>=3.10` because that is what ran the gate; CI uses 3.12. Pin higher once the UVA port (which was developed on 3.12) lands if anything needs it.
 - **Phase S** is next: `packages/semantic` with the vendored UVA pure functions and golden tests generated from `upstream/uva`; then `upstream/uva` is removed.
+
+## 6. Phase S outcome (2026-10-08)
+
+Three commits on `v3`: `cbd6891` (the package), `03cf2f2` (identifier additions), `21511ef` (UVA submodule removed). Still local, not pushed.
+
+**`packages/semantic` (`wcd_semantic`)** holds the logic half of the UVA modules, sliced out by line range from `scatter-llc/UVAWikipediaCitationsDatabase @ 29f3ae3` with the DuckDB loaders/writers, `sys.path` hacks and `pipeline_log` imports left behind: `content` (template-vs-ref_tag parsing, embedded templates, bullet-block split, footnote filter), `reftag` and `template` (the two normalizers), `signals` (the seven revision flags), one `unionfind`, `match_reftag` (6a), `match_template` (6b), `merge_types` (6c), `match_global` (6d), `scoring` (7f). Each matcher gained a database-free entry point (`match_page`, `merge_page`, `match_global`) reproducing upstream `run_page`/`main`. Dependencies are pandas, numpy, rapidfuzz and mwparserfromhell; torch/transformers are an uninstalled extra. `NOTICE` records provenance per file.
+
+**Gate S passed.** A fixed corpus (52 ref contents across every ref-tag subtype and five template subtypes, four revision texts, a three-page citation corpus, nine scorer rows) is run through one assembly — which mirrors upstream's `load_*` SQL in pandas — against both the upstream modules (`gen_golden.py` → `fixtures/golden/semantic/expected.json`) and `wcd_semantic`. 77 comparisons are equal, deterministic across hash seeds. The corpus exercises the anchor_key / ref_name / fuzzy per-page signals, isbn / url / doi / author_year cross-type merges, and doi / isbn / author_year_fuzzy cross-page matches, and a coverage test keeps it that way.
+
+**Additions** (decisions item 7), marked `ADDED (wcd)` in the source and tested in `test_additions.py` while the golden comparison strips their output keys: arXiv (`|arxiv=`, `|eprint=` on `{{cite arXiv}}`, arxiv.org URLs and `arXiv:` text in prose; version suffix dropped) and Wikidata QID (`{{Cite Q}}` first positional) extraction; PMC / arXiv / QID as 0.95 hard-identifier signals in all four matchers, excluded from the cross-page fuzzy pass and carried on every output; the 10-point scorer bonus for those match types.
+
+**Two things learned about the upstream code while building the golden corpus**, both worth remembering in Phase 2:
+
+1. `reftag._ID_URL_PARAMS` was a Python *set*, so which URL a `{{cite …}}` inside a `<ref>` yielded depended on the hash seed. Fixed in the vendored copy (ordered tuple, original URL first) and applied to upstream during golden generation — the one deviation from upstream logic.
+2. `build_merged_sources` leaves `title` NULL on ref-tag-only merged sources (it takes `title` from the template side; the ref-tag side's italicised title arrives as `ref_title` and is not copied). Since `author_year_fuzzy_pass` requires `title`, **prose-only sources never match across pages**, whatever their author/year/title. That is upstream behaviour and the golden preserves it; whether to carry `ref_title` into `title` for ref-only sources is a matching-quality decision for Phase 2, not a port question.
+
+**Open after Phase S:** the sampling criteria for `scripts/select_fixture_pages.py` (unchanged); Phase 0 (schema and RevisionChest) and Phase 1 (Stages 1–5) are next, and Stage 4's driver is where `wcd_semantic.content` + `reftag`/`template` get wired to `normalized_citations`.
