@@ -294,8 +294,8 @@ class NormalizedCitation(Base):
     reference_normalized = Column(Text, nullable=False)
     appears_on_domain_id = Column(Integer, ForeignKey('domains.id'), nullable=False)
     appears_on_page_id = Column(Integer, nullable=False)
-    # NULL until Stage 1 emits it (Phase 1); the Stage-3 gate then requires it.
-    citation_type = Column(String)
+    # ref_tag | template | bare_url | endnote | shorthand | external_link (Stage 1)
+    citation_type = Column(String, nullable=False)
 
     @staticmethod
     def bulk_upsert(session: Session, rows):
@@ -308,7 +308,7 @@ class NormalizedCitation(Base):
             set_={'reference_normalized': excluded.reference_normalized,
                   'appears_on_domain_id': excluded.appears_on_domain_id,
                   'appears_on_page_id': excluded.appears_on_page_id,
-                  'citation_type': func.coalesce(excluded.citation_type, NormalizedCitation.citation_type)},
+                  'citation_type': excluded.citation_type},
         )
         session.execute(stmt)
 

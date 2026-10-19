@@ -25,12 +25,12 @@ import os
 import time
 
 import duckdb
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
 from wcd_schema import parquet as layout
-from wcd_schema.postgres import Domain, PageMetadata, Revision, RevisionBundle, WebResource
+from wcd_schema.postgres import Domain, PageMetadata, RevisionBundle, WebResource
 
 from .config import database_url, load_dotenv  # noqa: F401
 
@@ -186,39 +186,9 @@ def write_revisions_parquet(path: str, domain: str, parquet_base: str) -> int:
 # ---------------------------------------------------------------------------
 
 def gate(session: Session | None, domain: str, parquet_base: str | None) -> list[str]:
-    """Returns the list of failures (empty = pass)."""
-    failures = []
-    pg_count = None
-    if session is not None:
-        domain_id = session.execute(select(Domain.id).where(Domain.value == domain)).scalar_one_or_none()
-        if domain_id is None:
-            return [f"domain {domain!r} is not in domains"]
-        pg_count = session.execute(select(func.count()).select_from(Revision).where(Revision.domain_id == domain_id)).scalar_one()
-        if pg_count == 0:
-            failures.append("revisions has no rows for the domain")
-        missing = session.execute(text(
-            "SELECT count(*) FROM (SELECT DISTINCT page_id FROM revisions WHERE domain_id = :d) r "
-            "LEFT JOIN page_metadata p ON p.domain_id = :d AND p.page_id = r.page_id WHERE p.page_id IS NULL"
-        ), {"d": domain_id}).scalar_one()
-        if missing:
-            failures.append(f"{missing} page(s) in revisions have no page_metadata row")
-        ts_type = session.execute(text(
-            "SELECT data_type FROM information_schema.columns WHERE table_name = 'revisions' AND column_name = 'revision_timestamp'"
-        )).scalar_one_or_none()
-        if ts_type not in ("timestamp without time zone", "timestamp with time zone"):
-            failures.append(f"revisions.revision_timestamp is {ts_type!r}, not TIMESTAMP")
-    if parquet_base is not None:
-        pattern = layout.partition_glob(parquet_base, "revisions", domain)
-        con = duckdb.connect()
-        try:
-            pq_count = con.execute(f"SELECT count(*) FROM read_parquet('{pattern}', hive_partitioning=true)").fetchone()[0]
-        except duckdb.IOException:
-            pq_count = 0
-        if pq_count == 0:
-            failures.append(f"no revisions Parquet for domain {domain} under {parquet_base}")
-        elif pg_count is not None and pq_count != pg_count:
-            failures.append(f"revisions Parquet has {pq_count} rows but Postgres has {pg_count} for the domain")
-    return failures
+    """The Stage-0 gate (``wcd_pipeline.gates.stage0``); returns failures."""
+    from .gates import stage0
+    return stage0(session, domain, parquet_base)
 
 
 # ---------------------------------------------------------------------------

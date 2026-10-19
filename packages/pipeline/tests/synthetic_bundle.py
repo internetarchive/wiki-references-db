@@ -5,7 +5,7 @@ The bundle is deterministic and exercises every reference kind the extractor
 knows about (<ref> with a citation template, prose <ref>, bare-URL <ref>,
 named-ref definition and self-closing reuse, a bullet-block <ref>, a standalone
 {{sfn}}, reference-section list items, and loose external links) across a
-short revision history that adds, edits and removes references.
+short revision history that adds, edits, removes and redefines references.
 
 Used by the pipeline test-suite and as the Gate-R regression input; it is NOT
 a substitute for the sampled test-article fixture (see fixtures/README.md).
@@ -47,11 +47,15 @@ REV_A2 = REV_A1.replace(
     "== Trade ==\nTrade is documented.<ref name=\"diamond\" /><ref>\n* {{cite journal |last=Lee |first=A |year=2001 |title=Trade A |journal=J1}}\n* {{cite journal |last=Lee |first=B |year=2002 |title=Trade B |journal=J2}}\n</ref>\n\n== Bibliography ==",
 )
 
-# Third revision removes the prose ref and the bare-url ref.
+# Third revision removes the prose ref and the bare-url ref, and redefines
+# the "diamond" named ref (a new edition) so its ref_name_links range splits.
 REV_A3 = REV_A2.replace(
     '<ref>Fischer, Steven Roger (1995). "Preliminary Evidence". \'\'Journal of the Polynesian Society\'\' 104: 303–21.</ref>',
     "",
-).replace("<ref>[https://example.org/visits Visits]</ref>", "")
+).replace("<ref>[https://example.org/visits Visits]</ref>", "").replace(
+    "|title=Collapse |publisher=Viking |isbn=978-0-14-303655-5}}</ref>\nIt was",
+    "|title=Collapse |edition=2nd |publisher=Viking |isbn=978-0-14-303655-5}}</ref>\nIt was",
+)
 
 REV_B1 = """'''Second Page''' cites the same book.<ref>{{cite book |last=Diamond |first=Jared |year=2005 |title=Collapse |publisher=Viking |isbn=978-0-14-303655-5}}</ref>
 And a web page.<ref name="web1">{{cite web |url=https://example.org/page |title=A page |access-date=2020-01-01}}</ref>

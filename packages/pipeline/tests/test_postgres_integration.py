@@ -19,7 +19,7 @@ import pytest
 import zstandard as zstd
 from sqlalchemy import create_engine, text
 
-from wcd_pipeline import dedup, extract, init_db, load, stage0
+from wcd_pipeline import dedup, extract, gates, init_db, load, stage0
 from wcd_pipeline.config import database_url
 from wcd_schema import parquet as layout
 from wcd_schema.ids import instance_id
@@ -169,12 +169,12 @@ def staged(work: Path) -> Path:
     bundle = work / "synthetic.mwrev.zst"
     bundle.write_bytes(zstd.ZstdCompressor(level=3).compress(render()))
     staging = work / "staging"
-    extract.main([str(bundle), "-o", str(staging / "synthetic"), "--domain", DOMAIN])
+    extract.main([str(bundle), "-o", str(staging / "synthetic"), "--domain", DOMAIN, "--parquet-dir", str(work / "parquet")])
     dedup.main(["-d", str(staging)])
     return staging
 
 
-def test_load_synthetic(db, staged: Path):
+def test_load_synthetic(db, staged: Path, work: Path):
     load.main(["-d", str(staged)])
     con = duckdb.connect()
     n_inst = con.execute(f"SELECT count(*) FROM read_parquet('{staged / 'deduped' / 'citation_instances.parquet'}')").fetchone()[0]
@@ -196,6 +196,17 @@ def test_load_synthetic(db, staged: Path):
     assert scalar(db, "SELECT count(*) FROM template_data") > 0
     # Stage-0 rows untouched
     assert scalar(db, "SELECT count(*) FROM revisions") == len(FIXTURE_REVISIONS)
+    # citation_type arrived from Stage 1 and the Stage-3 gate passes
+    assert scalar(db, "SELECT count(*) FROM normalized_citations WHERE citation_type IS NULL") == 0
+    assert set(r[0] for r in q(db, "SELECT DISTINCT citation_type FROM normalized_citations")) >= {"template", "ref_tag", "shorthand", "endnote"}
+    from sqlalchemy.orm import Session
+    with db.connect() as con_pg:
+        assert gates.stage3(Session(con_pg), DOMAIN, str(work / "parquet"), sample_buckets=None) == []
+        # a history id without an instance is caught
+        con_pg.execute(text("DELETE FROM citation_instances WHERE id = (SELECT min(id) FROM citation_instances)"))
+        failures = gates.stage3(Session(con_pg), DOMAIN, str(work / "parquet"), sample_buckets=None)
+        assert any("have no citation_instances row" in f for f in failures), failures
+        con_pg.rollback()
 
 
 def test_load_is_idempotent(db, staged: Path):

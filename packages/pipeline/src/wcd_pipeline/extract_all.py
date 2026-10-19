@@ -54,11 +54,17 @@ def main(argv=None):
     parser.add_argument("-d", "--directory", required=True, help="Directory containing .mwrev.zst files")
     parser.add_argument("-o", "--staging-dir", default=os.environ.get('STAGING_DIR', './staging'),
                         help="Directory to write staged Parquet files (default: STAGING_DIR env or ./staging)")
+    parser.add_argument("--domain", required=True,
+                        help="Site domain of every bundle in the directory (one directory per domain)")
+    parser.add_argument("--parquet-dir", default=os.environ.get("PARQUET_DIR"),
+                        help="Parquet tier base directory (default: PARQUET_DIR)")
     parser.add_argument("-j", "--jobs", type=int, default=max_jobs,
                         help="Number of concurrent jobs/files to process (default: 8)")
     parser.add_argument("--metrics-interval", type=float, default=float(os.environ.get("METRICS_INTERVAL", "10")),
                         help="Seconds between aggregated metrics prints (default: 10 or METRICS_INTERVAL env)")
     args = parser.parse_args(argv)
+    if not args.parquet_dir:
+        parser.error("--parquet-dir (or PARQUET_DIR) is required")
 
     directory = args.directory
     if not os.path.isdir(directory):
@@ -124,6 +130,8 @@ def main(argv=None):
         process = subprocess.Popen([
             sys.executable, "-m", "wcd_pipeline.extract", file,
             "-o", job_staging_dir,
+            "--domain", args.domain,
+            "--parquet-dir", args.parquet_dir,
             "--batch-size", os.environ.get("BATCH_SIZE", "1000"),
         ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 

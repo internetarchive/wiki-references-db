@@ -1,14 +1,19 @@
-"""Deduplicate staged Parquet files using DuckDB.
+"""Stage 3 (first half): consolidate and deduplicate the staged Parquet tables.
 
-DuckDB handles out-of-core dedup automatically (spills to disk when RAM is tight).
+DuckDB handles out-of-core dedup automatically (spills to disk when RAM is
+tight). Only the staging tables of ``wcd_schema.staging`` pass through here;
+the per-revision datasets (citation_history, named_ref_uses,
+revision_signals) are written by Stage 1 in their final layout.
 
-Pipeline:
-    build_db.py (Parquet output)  →  dedup_parquet.py  →  load_all.py
+The **instance-id collision gate** runs with ``citation_instances``: the
+deterministic ``citation_instance_id`` must be unique per distinct
+``(domain, page_id, raw_sha1)`` over the whole staging set; a collision
+aborts the stage (the data model would then have to move to a wider id).
 
 Usage:
-    python3 dedup_parquet.py -d ./staging
-    python3 dedup_parquet.py -d ./staging --memory-limit 8GB
-    python3 dedup_parquet.py -d ./staging --tables citation_instances citation_histories
+    wcd dedup -d ./staging
+    wcd dedup -d ./staging --memory-limit 8GB
+    wcd dedup -d ./staging --tables citation_instances normalized_citations
 """
 
 import argparse
@@ -23,7 +28,7 @@ from .config import load_dotenv  # noqa: F401  (loads .env on import)
 
 def log(msg):
     ts = time.strftime('%Y-%m-%d %H:%M:%S')
-    print(f"{ts} [dedup_parquet] {msg}", flush=True)
+    print(f"{ts} [dedup] {msg}", flush=True)
 
 
 def _glob(staging_dir, table_name):
@@ -119,32 +124,13 @@ def dedup_domains(con, staging_dir, deduped_dir):
     """)
 
 
-def dedup_documents(con, staging_dir, deduped_dir):
-    glob = _glob(staging_dir, 'documents')
-    if not _has_files(con, glob):
-        return
-    con.execute(f"""
-        COPY (
-            SELECT MIN(language_code) AS language_code, has_container_label, page_id
-            FROM '{glob}'
-            WHERE page_id IS NOT NULL
-            GROUP BY has_container_label, page_id
-        ) TO '{_out(deduped_dir, "documents")}'
-        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)
-    """)
-
-
 def dedup_web_resources(con, staging_dir, deduped_dir):
     glob = _glob(staging_dir, 'web_resources')
     if not _has_files(con, glob):
         return
     con.execute(f"""
         COPY (
-            SELECT url,
-                   MIN(domain_label) AS domain_label,
-                   MIN(numeric_page_id) AS numeric_page_id,
-                   MIN(numeric_namespace_id) AS numeric_namespace_id,
-                   MIN(page_id) AS page_id
+            SELECT url, MIN(domain_label) AS domain_label
             FROM '{glob}'
             WHERE url IS NOT NULL
             GROUP BY url
@@ -153,22 +139,39 @@ def dedup_web_resources(con, staging_dir, deduped_dir):
     """)
 
 
+class InstanceIdCollision(RuntimeError):
+    """Two distinct (domain, page_id, raw_sha1) keys produced the same instance id."""
+
+
 def dedup_citation_instances(con, staging_dir, deduped_dir):
     glob = _glob(staging_dir, 'citation_instances')
     if not _has_files(con, glob):
         return
+    out = _out(deduped_dir, "citation_instances")
     con.execute(f"""
         COPY (
-            SELECT page_id, raw_sha1,
+            SELECT citation_instance_id, domain, page_id, raw_sha1,
                    MIN(normalized_sha1) AS normalized_sha1,
                    MIN(reference_type) AS reference_type,
                    MIN(reference_name) AS reference_name
             FROM '{glob}'
-            WHERE page_id IS NOT NULL AND raw_sha1 IS NOT NULL
-            GROUP BY page_id, raw_sha1
-        ) TO '{_out(deduped_dir, "citation_instances")}'
+            WHERE domain IS NOT NULL AND page_id IS NOT NULL AND raw_sha1 IS NOT NULL
+            GROUP BY citation_instance_id, domain, page_id, raw_sha1
+        ) TO '{out}'
         (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)
     """)
+    n_ids, n_keys = con.execute(f"""
+        SELECT count(DISTINCT citation_instance_id), count(*) FROM '{out}'
+    """).fetchone()
+    if n_ids != n_keys:
+        collided = con.execute(f"""
+            SELECT citation_instance_id, list((domain, page_id, raw_sha1))
+            FROM '{out}' GROUP BY citation_instance_id HAVING count(*) > 1 LIMIT 5
+        """).fetchall()
+        raise InstanceIdCollision(
+            f"citation_instance_id collision gate failed: {n_keys} distinct (domain, page_id, raw_sha1) "
+            f"keys but {n_ids} distinct ids; e.g. {collided}")
+    log(f"citation_instances: {n_keys} instances, instance-id collision gate passed")
 
 
 def dedup_normalized_citations(con, staging_dir, deduped_dir):
@@ -180,44 +183,12 @@ def dedup_normalized_citations(con, staging_dir, deduped_dir):
             SELECT normalized_sha1,
                    MIN(reference_normalized) AS reference_normalized,
                    MIN(appears_on_page_id) AS appears_on_page_id,
-                   MIN(appears_on_domain) AS appears_on_domain
+                   MIN(appears_on_domain) AS appears_on_domain,
+                   MIN(citation_type) AS citation_type
             FROM '{glob}'
             WHERE normalized_sha1 IS NOT NULL
             GROUP BY normalized_sha1
         ) TO '{_out(deduped_dir, "normalized_citations")}'
-        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)
-    """)
-
-
-def dedup_citation_histories(con, staging_dir, deduped_dir):
-    glob = _glob(staging_dir, 'citation_histories')
-    if not _has_files(con, glob):
-        return
-    log('citation_histories: consolidating without global dedup (load-time conflict handling applies)')
-    con.execute(f"""
-        COPY (
-            SELECT page_id, raw_sha1, revision_id
-            FROM '{glob}'
-            WHERE page_id IS NOT NULL AND raw_sha1 IS NOT NULL AND revision_id IS NOT NULL
-        ) TO '{_out(deduped_dir, "citation_histories")}'
-        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 1000000)
-    """)
-
-
-def dedup_revisions(con, staging_dir, deduped_dir):
-    glob = _glob(staging_dir, 'revisions')
-    if not _has_files(con, glob):
-        return
-    con.execute(f"""
-        COPY (
-            SELECT revision_id,
-                   MIN(page_id) AS page_id,
-                   MIN(parent_revision_id) AS parent_revision_id,
-                   MIN(revision_timestamp) AS revision_timestamp
-            FROM '{glob}'
-            WHERE revision_id IS NOT NULL
-            GROUP BY revision_id
-        ) TO '{_out(deduped_dir, "revisions")}'
         (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)
     """)
 
@@ -269,12 +240,9 @@ def dedup_template_data(con, staging_dir, deduped_dir):
 ALL_TABLES = [
     ('containers',          dedup_containers),
     ('domains',             dedup_domains),
-    ('documents',           dedup_documents),
     ('web_resources',       dedup_web_resources),
     ('citation_instances',  dedup_citation_instances),
     ('normalized_citations', dedup_normalized_citations),
-    ('citation_histories',  dedup_citation_histories),
-    ('revisions',           dedup_revisions),
     ('ncwr',                dedup_ncwr),
     ('wiki_templates',      dedup_wiki_templates),
     ('template_data',       dedup_template_data),

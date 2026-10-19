@@ -1,7 +1,10 @@
 """Parquet schemas for the Stage-1 staging tables written by ``wcd_pipeline.extract``.
 
-One pyarrow schema per staging table. ``wcd_pipeline.dedup`` and
-``wcd_pipeline.load`` consume files written with these schemas.
+One pyarrow schema per staging table. ``wcd_pipeline.dedup`` consolidates
+files written with these schemas and ``wcd_pipeline.load`` puts the result in
+Postgres. The per-revision datasets (``citation_history``, ``named_ref_uses``,
+``revision_signals``) are not staging tables: the extractor writes them in the
+final Parquet-tier layout (``wcd_schema.parquet``) and nothing loads them.
 """
 import pyarrow as pa
 
@@ -16,19 +19,14 @@ SCHEMAS = {
         ('value', pa.string()),
         ('for_container_label', pa.string()),
     ]),
-    'documents': pa.schema([
-        ('language_code', pa.string()),
-        ('has_container_label', pa.string()),
-        ('page_id', pa.int32()),
-    ]),
+    # cited URLs only; article web_resources are written at Stage 0
     'web_resources': pa.schema([
         ('url', pa.string()),
         ('domain_label', pa.string()),
-        ('numeric_page_id', pa.int32()),
-        ('numeric_namespace_id', pa.int32()),
-        ('page_id', pa.int32()),
     ]),
     'citation_instances': pa.schema([
+        ('citation_instance_id', pa.int64()),   # wcd_schema.ids.instance_id(domain, page_id, raw_sha1)
+        ('domain', pa.string()),
         ('page_id', pa.int32()),
         ('raw_sha1', pa.string()),
         ('normalized_sha1', pa.string()),
@@ -40,17 +38,7 @@ SCHEMAS = {
         ('reference_normalized', pa.string()),
         ('appears_on_page_id', pa.int32()),
         ('appears_on_domain', pa.string()),
-    ]),
-    'citation_histories': pa.schema([
-        ('page_id', pa.int32()),
-        ('raw_sha1', pa.string()),
-        ('revision_id', pa.int64()),
-    ]),
-    'revisions': pa.schema([
-        ('revision_id', pa.int64()),
-        ('page_id', pa.int32()),
-        ('parent_revision_id', pa.int64()),
-        ('revision_timestamp', pa.string()),
+        ('citation_type', pa.string()),
     ]),
     'ncwr': pa.schema([
         ('normalized_sha1', pa.string()),

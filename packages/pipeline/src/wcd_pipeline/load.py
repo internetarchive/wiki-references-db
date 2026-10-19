@@ -20,19 +20,15 @@ Usage:
     wcd load --tables containers domains
 """
 
-import hashlib
 import itertools
 import os
-import sys
 import time
-import glob
 import argparse
 from collections import OrderedDict
 
 
 import duckdb
-from sqlalchemy import create_engine, text, select as sa_select, func as sa_func
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import create_engine, select as sa_select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 from wcd_schema.ids import instance_id
@@ -155,22 +151,17 @@ def load_domains(session, staging_dir):
 
 
 def load_web_resources(session, staging_dir):
-    """Cited URLs. Article curid rows (those carrying ``numeric_page_id``) are
-    skipped: RevisionChest owns them (Stage 0)."""
+    """Cited URLs (article curid rows are written at Stage 0)."""
     filepath = find_deduped_parquet(staging_dir, 'web_resources')
     if not filepath:
         return
     log(f"web_resources: loading from {filepath}")
 
     count = 0
-    skipped_articles = 0
     for batch in read_parquet_batches(filepath):
         domain_to_id = _domain_ids(session, (r.get('domain_label') for r in batch))
         cleaned = []
         for r in batch:
-            if r.get('numeric_page_id') is not None or r.get('page_id') is not None:
-                skipped_articles += 1
-                continue
             wr = {'url': r['url']}
             dl = r.get('domain_label')
             if dl and dl in domain_to_id:
@@ -180,8 +171,6 @@ def load_web_resources(session, staging_dir):
             WebResource.bulk_upsert(session, cleaned)
             session.commit()
         count += len(cleaned)
-    if skipped_articles:
-        log(f"web_resources: {skipped_articles} article curid rows skipped (RevisionChest writes those)")
     log(f"web_resources: {count} rows loaded")
 
 
@@ -237,7 +226,7 @@ def load_normalized_citations(session, staging_dir):
         for r in batch:
             domain_id = domain_to_id.get(r.get('appears_on_domain'))
             page_id = r.get('appears_on_page_id')
-            if domain_id is None or page_id is None:
+            if domain_id is None or page_id is None or not r.get('citation_type'):
                 skipped += 1
                 continue
             cleaned.append({
@@ -245,27 +234,27 @@ def load_normalized_citations(session, staging_dir):
                 'reference_normalized': r['reference_normalized'],
                 'appears_on_domain_id': domain_id,
                 'appears_on_page_id': page_id,
-                'citation_type': r.get('citation_type'),   # None until Stage 1 emits it
+                'citation_type': r['citation_type'],
             })
         if cleaned:
             NormalizedCitation.bulk_upsert(session, cleaned)
             session.commit()
             count += len(cleaned)
     if skipped:
-        log(f"normalized_citations: warning: {skipped} rows skipped (unknown domain or missing page id)")
+        log(f"normalized_citations: warning: {skipped} rows skipped (unknown domain, missing page id or citation_type)")
     log(f"normalized_citations: {count} rows loaded")
 
 
 def load_citation_instances(session, staging_dir):
-    """Resolves ``normalized_sha1`` → ``normalized_id`` (and the page's domain,
-    from the normalized citation it belongs to, until Stage 1 stages the
-    domain itself) and assigns the deterministic instance id."""
+    """Resolves ``normalized_sha1`` → ``normalized_id`` and the staged domain
+    → ``domain_id``. The id is the staged ``citation_instance_id`` (which
+    Stage 1 computed and wrote into ``citation_history``); it is re-derived
+    here and must agree."""
     filepath = find_deduped_parquet(staging_dir, 'citation_instances')
     if not filepath:
         return
     log(f"citation_instances: loading from {filepath}")
 
-    domain_values = {i: v for v, i in session.execute(sa_select(Domain.value, Domain.id)).all()}
     count = 0
     skipped = 0
     for batch in read_parquet_batches(filepath):
@@ -273,27 +262,27 @@ def load_citation_instances(session, staging_dir):
         sha1_to_norm = {}
         for chunk in chunked_iterable(sha1s, 1000):
             result = session.execute(
-                sa_select(NormalizedCitation.normalized_sha1, NormalizedCitation.id, NormalizedCitation.appears_on_domain_id)
+                sa_select(NormalizedCitation.normalized_sha1, NormalizedCitation.id)
                 .where(NormalizedCitation.normalized_sha1.in_(chunk))
             ).all()
-            sha1_to_norm.update({s: (i, d) for s, i, d in result})
+            sha1_to_norm.update(dict(result))
+        domain_to_id = _domain_ids(session, (r.get('domain') for r in batch))
 
         cleaned = []
         for r in batch:
-            norm = sha1_to_norm.get(r.get('normalized_sha1'))
-            if norm is None:
+            norm_id = sha1_to_norm.get(r.get('normalized_sha1'))
+            domain_id = domain_to_id.get(r.get('domain'))
+            if norm_id is None or domain_id is None:
                 skipped += 1
                 continue
-            norm_id, domain_id = norm
-            domain = r.get('domain') or domain_values.get(domain_id)
-            if domain is None:
-                skipped += 1
-                continue
-            if r.get('domain') and r['domain'] != domain_values.get(domain_id):
-                # staged domain wins once Stage 1 provides it
-                domain_id = next((i for i, v in domain_values.items() if v == r['domain']), domain_id)
+            expected = instance_id(r['domain'], r['page_id'], r['raw_sha1'])
+            staged = r.get('citation_instance_id')
+            if staged is not None and staged != expected:
+                raise RuntimeError(
+                    f"citation_instance_id mismatch for ({r['domain']}, {r['page_id']}, {r['raw_sha1']}): "
+                    f"staged {staged}, computed {expected}")
             cleaned.append({
-                'id': instance_id(domain, r['page_id'], r['raw_sha1']),
+                'id': expected,
                 'domain_id': domain_id,
                 'page_id': r['page_id'],
                 'raw_sha1': r['raw_sha1'],
@@ -307,7 +296,7 @@ def load_citation_instances(session, staging_dir):
             session.commit()
             count += len(cleaned)
     if skipped:
-        log(f"citation_instances: warning: {skipped} rows skipped (no matching normalized citation)")
+        log(f"citation_instances: warning: {skipped} rows skipped (no matching normalized citation or unknown domain)")
     log(f"citation_instances: {count} rows loaded")
 
 

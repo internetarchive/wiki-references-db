@@ -18,6 +18,7 @@ COMMANDS = {
     "init-db":     ("wcd_pipeline.init_db",     "Create Postgres tables / manage secondary indexes"),
     "purge":       ("wcd_pipeline.purge",       "Drop or truncate Postgres tables"),
     "stage0-load": ("wcd_pipeline.stage0",      "Stage 0: load RevisionChest --parquet metadata into Postgres and the revisions Parquet tier"),
+    "gate":        ("wcd_pipeline.gates",       "Run an inter-stage validation gate (0, 3, 4, 5) for a domain"),
     "fixture-dump": ("wcd_pipeline.fixture_dump", "Filter XML history dumps down to a page list (fixture input for RevisionChest)"),
 }
 
