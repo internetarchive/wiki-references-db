@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Wikipedia Citations Database: citation classification, normalization, source matching and scoring (pure functions)"
 requires-python = ">=3.10"
 dependencies = [
-    "pandas>=2.2",
+    "pandas>=2.2,<3",  # the vendored UVA logic relies on pandas-2 missing-value semantics (None stays None in object columns)
     "numpy>=1.26",
     "rapidfuzz>=3.0",
     "mwparserfromhell>=0.6.4",
