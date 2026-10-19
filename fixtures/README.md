@@ -14,6 +14,17 @@ files. After an intentional pipeline change, regenerate with
 `UPDATE_GOLDEN=1 uv run pytest packages/pipeline/tests/test_stage1_golden.py`
 and review the diff before committing.
 
+## golden/stage0/
+
+`fixture.parquet` is the metadata RevisionChest writes (`--parquet`) for the
+mwdump test dump `rust/revisionchest/crates/mwdump/tests/fixtures/fixture.xml.bz2`
+(4 pages, 9 revisions). `packages/pipeline/tests/test_postgres_integration.py`
+feeds it to `wcd stage0-load` and checks the Postgres rows, the `revisions`
+Parquet partitions and the Stage-0 gate; with `REVISIONCHEST_BIN` set it also
+regenerates the file from the dump and requires equality. Regenerate after an
+intentional metadata change with
+`RevisionChest build …/fixture.xml.bz2 -o /tmp/rc --parquet fixtures/golden/stage0/fixture.parquet`.
+
 ## shards/ (to be added)
 
 The sampled test-article subset of English Wikipedia: a `.mwrev.zst` bundle

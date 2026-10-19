@@ -1,17 +1,23 @@
-"""Load pre-deduplicated staged Parquet files into PostgreSQL.
+"""Stage 3 load: deduplicated staging Parquet → Postgres.
 
-Reads the deduped/ subdirectory produced by dedup_parquet.py and
-bulk-inserts into Postgres. ON CONFLICT upserts are kept as a
-safety net for residual duplicates or re-runs.
+Reads the deduped/ subdirectory produced by ``wcd dedup`` and bulk-inserts
+into the citation tables. ON CONFLICT upserts are kept as a safety net for
+residual duplicates or re-runs.
 
-Pipeline:
-    build_db.py (Parquet)  →  dedup_parquet.py  →  load_all.py
+What this stage no longer writes (rebuild model, docs/design/proposed_data_model.md):
+
+- ``documents`` — not used for page identity; populated in the citation-graph phase
+- ``revisions`` and article ``web_resources`` — RevisionChest writes them
+  (Stage 0), or ``wcd stage0-load`` from its Parquet metadata
+- ``citation_history`` — Parquet only (``citation_history/`` under the
+  Parquet base), never a Postgres table
+
+Page identity is ``(domain_id, page_id)``; ``citation_instances.id`` is the
+deterministic ``wcd_schema.ids.instance_id(domain, page_id, raw_sha1)``.
 
 Usage:
-    python3 load_all.py -d ./staging
-    python3 load_all.py  # uses STAGING_DIR from .env or default ./staging
-    python3 load_all.py --tables containers domains documents
-    python3 load_all.py --tables citation_histories  # load only citation_histories
+    wcd load -d ./staging
+    wcd load --tables containers domains
 """
 
 import hashlib
@@ -29,17 +35,20 @@ from sqlalchemy import create_engine, text, select as sa_select, func as sa_func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
+from wcd_schema.ids import instance_id
 from wcd_schema.postgres import (
-    Base, Container, Domain, Document, WebResource, CitationInstance,
-    CitationHistory, Revision, NormalizedCitation,
-    NormalizedCitationWebResource, WikiTemplate, TemplateData,
+    CitationInstance, Container, Domain, NormalizedCitation,
+    NormalizedCitationWebResource, TemplateData, WebResource, WikiTemplate,
 )
 
 from .config import database_url
 
-DB = database_url()
-Engine = create_engine(DB, poolclass=NullPool, hide_parameters=True)
-Session = sessionmaker(bind=Engine)
+def make_session():
+    """A session on the configured database (connection details are read when
+    the loader runs, not when the module is imported)."""
+    engine = create_engine(database_url(), poolclass=NullPool, hide_parameters=True)
+    return sessionmaker(bind=engine)()
+
 
 BATCH_SIZE = int(os.getenv('LOAD_BATCH_SIZE', '5000'))
 
@@ -50,7 +59,7 @@ BATCH_SIZE = int(os.getenv('LOAD_BATCH_SIZE', '5000'))
 
 def log(msg):
     ts = time.strftime('%Y-%m-%d %H:%M:%S')
-    print(f"{ts} [load_all] {msg}", flush=True)
+    print(f"{ts} [load] {msg}", flush=True)
 
 
 def find_deduped_parquet(staging_dir, table_name):
@@ -145,85 +154,43 @@ def load_domains(session, staging_dir):
     log(f"domains: {count} rows loaded")
 
 
-def load_documents(session, staging_dir):
-    """Load documents. Returns a mapping of (domain, page_id) -> document_id."""
-    filepath = find_deduped_parquet(staging_dir, 'documents')
-    if not filepath:
-        return {}
-    log(f"documents: loading from {filepath}")
-
-    page_to_doc_id = {}
-    count = 0
-    for batch in read_parquet_batches(filepath):
-        # Resolve container labels
-        labels = set(r.get('has_container_label') for r in batch if r.get('has_container_label'))
-        label_to_id = {}
-        if labels:
-            result = session.execute(
-                sa_select(Container.label, Container.id).where(Container.label.in_(list(labels)))
-            ).all()
-            label_to_id = {l: i for l, i in result}
-
-        for r in batch:
-            container_label = r.get('has_container_label')
-            container_id = label_to_id.get(container_label)
-            doc_id = Document.upsert(
-                session,
-                language_code=r.get('language_code'),
-                has_container=container_id,
-            )
-            page_to_doc_id[(container_label or '', r['page_id'])] = doc_id
-            count += 1
-        session.commit()
-
-    log(f"documents: {count} rows loaded")
-    return page_to_doc_id
-
-
-def load_web_resources(session, staging_dir, page_to_doc_id):
+def load_web_resources(session, staging_dir):
+    """Cited URLs. Article curid rows (those carrying ``numeric_page_id``) are
+    skipped: RevisionChest owns them (Stage 0)."""
     filepath = find_deduped_parquet(staging_dir, 'web_resources')
     if not filepath:
         return
     log(f"web_resources: loading from {filepath}")
 
     count = 0
+    skipped_articles = 0
     for batch in read_parquet_batches(filepath):
-        # Defer foreign key constraint checks until commit for faster inserts
-        session.execute(text("SET CONSTRAINTS ALL DEFERRED"))
-
-        # Resolve domain labels to ids
-        domain_labels = set(r.get('domain_label') for r in batch if r.get('domain_label'))
-        domain_to_id = {}
-        if domain_labels:
-            result = session.execute(
-                sa_select(Domain.value, Domain.id).where(Domain.value.in_(list(domain_labels)))
-            ).all()
-            domain_to_id = {v: i for v, i in result}
-
+        domain_to_id = _domain_ids(session, (r.get('domain_label') for r in batch))
         cleaned = []
         for r in batch:
+            if r.get('numeric_page_id') is not None or r.get('page_id') is not None:
+                skipped_articles += 1
+                continue
             wr = {'url': r['url']}
             dl = r.get('domain_label')
             if dl and dl in domain_to_id:
                 wr['domain_id'] = domain_to_id[dl]
-            if r.get('numeric_page_id') is not None:
-                wr['numeric_page_id'] = r['numeric_page_id']
-            if r.get('numeric_namespace_id') is not None:
-                wr['numeric_namespace_id'] = r['numeric_namespace_id']
-            # Resolve document id from page_id
-            page_id = r.get('page_id')
-            domain_label = r.get('domain_label', '')
-            if page_id is not None:
-                doc_id = page_to_doc_id.get((domain_label, page_id))
-                if doc_id is not None:
-                    wr['instance_of_document'] = doc_id
             cleaned.append(wr)
-
-        WebResource.bulk_upsert(session, cleaned)
-        session.commit()
+        if cleaned:
+            WebResource.bulk_upsert(session, cleaned)
+            session.commit()
         count += len(cleaned)
-
+    if skipped_articles:
+        log(f"web_resources: {skipped_articles} article curid rows skipped (RevisionChest writes those)")
     log(f"web_resources: {count} rows loaded")
+
+
+def _domain_ids(session, labels):
+    labels = {l for l in labels if l}
+    if not labels:
+        return {}
+    result = session.execute(sa_select(Domain.value, Domain.id).where(Domain.value.in_(list(labels)))).all()
+    return {v: i for v, i in result}
 
 
 def load_wiki_templates(session, staging_dir):
@@ -256,68 +223,78 @@ def load_wiki_templates(session, staging_dir):
     log(f"wiki_templates: {count} rows loaded")
 
 
-def load_normalized_citations(session, staging_dir, page_to_doc_id):
+def load_normalized_citations(session, staging_dir):
     filepath = find_deduped_parquet(staging_dir, 'normalized_citations')
     if not filepath:
         return
     log(f"normalized_citations: loading from {filepath}")
 
     count = 0
+    skipped = 0
     for batch in read_parquet_batches(filepath):
+        domain_to_id = _domain_ids(session, (r.get('appears_on_domain') for r in batch))
         cleaned = []
         for r in batch:
-            domain = r.get('appears_on_domain', '')
+            domain_id = domain_to_id.get(r.get('appears_on_domain'))
             page_id = r.get('appears_on_page_id')
-            doc_id = page_to_doc_id.get((domain, page_id))
-            if doc_id is None:
+            if domain_id is None or page_id is None:
+                skipped += 1
                 continue
             cleaned.append({
                 'normalized_sha1': r['normalized_sha1'],
                 'reference_normalized': r['reference_normalized'],
-                'appears_on_article': doc_id,
+                'appears_on_domain_id': domain_id,
+                'appears_on_page_id': page_id,
+                'citation_type': r.get('citation_type'),   # None until Stage 1 emits it
             })
-
         if cleaned:
-            stmt = insert(NormalizedCitation).values(cleaned).on_conflict_do_update(
-                index_elements=['normalized_sha1'],
-                set_={
-                    'reference_normalized': insert(NormalizedCitation).excluded.reference_normalized,
-                    'appears_on_article': insert(NormalizedCitation).excluded.appears_on_article,
-                }
-            )
-            session.execute(stmt)
+            NormalizedCitation.bulk_upsert(session, cleaned)
             session.commit()
             count += len(cleaned)
+    if skipped:
+        log(f"normalized_citations: warning: {skipped} rows skipped (unknown domain or missing page id)")
     log(f"normalized_citations: {count} rows loaded")
 
 
 def load_citation_instances(session, staging_dir):
-    """Load citation instances. Resolves normalized_sha1 -> normalized_id via DB lookup."""
+    """Resolves ``normalized_sha1`` → ``normalized_id`` (and the page's domain,
+    from the normalized citation it belongs to, until Stage 1 stages the
+    domain itself) and assigns the deterministic instance id."""
     filepath = find_deduped_parquet(staging_dir, 'citation_instances')
     if not filepath:
         return
     log(f"citation_instances: loading from {filepath}")
 
+    domain_values = {i: v for v, i in session.execute(sa_select(Domain.value, Domain.id)).all()}
     count = 0
+    skipped = 0
     for batch in read_parquet_batches(filepath):
-        # Resolve normalized_sha1 -> normalized_id
-        sha1s = list(set(r['normalized_sha1'] for r in batch if r.get('normalized_sha1')))
-        sha1_to_id = {}
-        if sha1s:
-            # Query in chunks to avoid overly large IN clauses
-            for chunk in chunked_iterable(sha1s, 1000):
-                result = session.execute(
-                    sa_select(NormalizedCitation.normalized_sha1, NormalizedCitation.id)
-                    .where(NormalizedCitation.normalized_sha1.in_(chunk))
-                ).all()
-                sha1_to_id.update({s: i for s, i in result})
+        sha1s = list({r['normalized_sha1'] for r in batch if r.get('normalized_sha1')})
+        sha1_to_norm = {}
+        for chunk in chunked_iterable(sha1s, 1000):
+            result = session.execute(
+                sa_select(NormalizedCitation.normalized_sha1, NormalizedCitation.id, NormalizedCitation.appears_on_domain_id)
+                .where(NormalizedCitation.normalized_sha1.in_(chunk))
+            ).all()
+            sha1_to_norm.update({s: (i, d) for s, i, d in result})
 
         cleaned = []
         for r in batch:
-            norm_id = sha1_to_id.get(r.get('normalized_sha1'))
-            if norm_id is None:
+            norm = sha1_to_norm.get(r.get('normalized_sha1'))
+            if norm is None:
+                skipped += 1
                 continue
+            norm_id, domain_id = norm
+            domain = r.get('domain') or domain_values.get(domain_id)
+            if domain is None:
+                skipped += 1
+                continue
+            if r.get('domain') and r['domain'] != domain_values.get(domain_id):
+                # staged domain wins once Stage 1 provides it
+                domain_id = next((i for i, v in domain_values.items() if v == r['domain']), domain_id)
             cleaned.append({
+                'id': instance_id(domain, r['page_id'], r['raw_sha1']),
+                'domain_id': domain_id,
                 'page_id': r['page_id'],
                 'raw_sha1': r['raw_sha1'],
                 'normalized_id': norm_id,
@@ -329,78 +306,9 @@ def load_citation_instances(session, staging_dir):
             CitationInstance.bulk_upsert(session, cleaned)
             session.commit()
             count += len(cleaned)
-    log(f"citation_instances: {count} rows loaded")
-
-
-def load_revisions(session, staging_dir):
-    filepath = find_deduped_parquet(staging_dir, 'revisions')
-    if not filepath:
-        return
-    log(f"revisions: loading from {filepath}")
-
-    count = 0
-    for batch in read_parquet_batches(filepath):
-        # Ensure every row has parent_revision_id (even if None) so
-        # SQLAlchemy multi-row INSERT sees consistent columns.
-        for row in batch:
-            row.setdefault('parent_revision_id', None)
-        stmt = insert(Revision).values(batch)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=['revision_id'],
-            set_={
-                'page_id': stmt.excluded.page_id,
-                'parent_revision_id': stmt.excluded.parent_revision_id,
-                'revision_timestamp': stmt.excluded.revision_timestamp,
-            }
-        )
-        session.execute(stmt)
-        session.commit()
-        count += len(batch)
-    log(f"revisions: {count} rows loaded")
-
-
-def load_citation_histories(session, staging_dir):
-    """Load citation histories. Resolves (page_id, raw_sha1) -> citation_instance_id."""
-    filepath = find_deduped_parquet(staging_dir, 'citation_histories')
-    if not filepath:
-        return
-    log(f"citation_histories: loading from {filepath}")
-
-    count = 0
-    skipped = 0
-    for batch in read_parquet_batches(filepath):
-        # Resolve (page_id, raw_sha1) -> citation_instance_id
-        keys = list(set((r['page_id'], r['raw_sha1']) for r in batch))
-        key_to_id = {}
-        if keys:
-            from sqlalchemy import tuple_
-            for chunk in chunked_iterable(keys, 1000):
-                result = session.execute(
-                    sa_select(CitationInstance.page_id, CitationInstance.raw_sha1, CitationInstance.id)
-                    .where(tuple_(CitationInstance.page_id, CitationInstance.raw_sha1).in_(chunk))
-                ).all()
-                key_to_id.update({(p, s): i for p, s, i in result})
-
-        cleaned = []
-        for r in batch:
-            ci_id = key_to_id.get((r['page_id'], r['raw_sha1']))
-            if ci_id is None:
-                skipped += 1
-                continue
-            cleaned.append({
-                'citation_instance_id': ci_id,
-                'revision_id': r['revision_id'],
-            })
-
-        if cleaned:
-            stmt = insert(CitationHistory).values(cleaned).on_conflict_do_nothing()
-            session.execute(stmt)
-            session.commit()
-            count += len(cleaned)
-
     if skipped:
-        log(f"citation_histories: warning: {skipped} rows skipped (no matching citation_instance)")
-    log(f"citation_histories: {count} rows loaded")
+        log(f"citation_instances: warning: {skipped} rows skipped (no matching normalized citation)")
+    log(f"citation_instances: {count} rows loaded")
 
 
 def load_ncwr(session, staging_dir):
@@ -529,17 +437,14 @@ def main(argv=None):
                         help=f'Rows per INSERT batch (default: {BATCH_SIZE})')
 
     all_phases = OrderedDict([
-        ('containers',          ('Phase 1:  containers',          lambda s, d, ctx: load_containers(s, d))),
-        ('domains',             ('Phase 2:  domains',             lambda s, d, ctx: load_domains(s, d))),
-        ('documents',           ('Phase 3:  documents',           lambda s, d, ctx: ctx.update(page_to_doc_id=load_documents(s, d)))),
-        ('web_resources',       ('Phase 4:  web_resources',       lambda s, d, ctx: load_web_resources(s, d, ctx.get('page_to_doc_id', {})))),
-        ('wiki_templates',      ('Phase 5:  wiki_templates',      lambda s, d, ctx: load_wiki_templates(s, d))),
-        ('normalized_citations',('Phase 6:  normalized_citations', lambda s, d, ctx: load_normalized_citations(s, d, ctx.get('page_to_doc_id', {})))),
-        ('citation_instances',  ('Phase 7:  citation_instances',  lambda s, d, ctx: load_citation_instances(s, d))),
-        ('revisions',           ('Phase 8:  revisions',           lambda s, d, ctx: load_revisions(s, d))),
-        ('citation_histories',  ('Phase 9:  citation_histories',  lambda s, d, ctx: load_citation_histories(s, d))),
-        ('ncwr',                ('Phase 10: ncwr',                lambda s, d, ctx: load_ncwr(s, d))),
-        ('template_data',       ('Phase 11: template_data',       lambda s, d, ctx: load_template_data(s, d))),
+        ('containers',           ('Phase 1: containers',            lambda s, d, ctx: load_containers(s, d))),
+        ('domains',              ('Phase 2: domains',               lambda s, d, ctx: load_domains(s, d))),
+        ('web_resources',        ('Phase 3: web_resources (cited)', lambda s, d, ctx: load_web_resources(s, d))),
+        ('wiki_templates',       ('Phase 4: wiki_templates',        lambda s, d, ctx: load_wiki_templates(s, d))),
+        ('normalized_citations', ('Phase 5: normalized_citations',  lambda s, d, ctx: load_normalized_citations(s, d))),
+        ('citation_instances',   ('Phase 6: citation_instances',    lambda s, d, ctx: load_citation_instances(s, d))),
+        ('ncwr',                 ('Phase 7: ncwr',                  lambda s, d, ctx: load_ncwr(s, d))),
+        ('template_data',        ('Phase 8: template_data',         lambda s, d, ctx: load_template_data(s, d))),
     ])
 
     parser.add_argument('--tables', nargs='+', metavar='TABLE',
@@ -554,7 +459,7 @@ def main(argv=None):
 
     BATCH_SIZE = args.batch_size
 
-    session = Session()
+    session = make_session()
     t0 = time.time()
 
     phases_to_run = OrderedDict(
@@ -562,7 +467,7 @@ def main(argv=None):
     )
 
     try:
-        ctx = {}  # shared context (e.g. page_to_doc_id) between phases
+        ctx = {}  # shared context between phases
         for name, (label, loader) in phases_to_run.items():
             log(label)
             loader(session, staging_dir, ctx)

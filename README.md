@@ -62,7 +62,9 @@ uv run pytest           # tests across the workspace
 ## Pipeline
 
 ```
-Stage 0  RevisionChest            XML dump  → .mwrev.zst bundles + page/revision metadata
+Stage 0  RevisionChest build      XML dump  → .mwrev.zst bundles + page/revision metadata
+                                              (--parquet file, and/or --postgres straight into the schema)
+Stage 0  wcd stage0-load          metadata  → Postgres revisions/page_metadata + revisions Parquet tier, gate
 Stage 1  wcd extract-all          bundles   → staging Parquet (references, normalized text, history)
 Stage 3  wcd dedup                staging   → deduped Parquet
 Stage 3  wcd load                 deduped   → Postgres
@@ -70,11 +72,28 @@ Stage 3  wcd load                 deduped   → Postgres
 
 ```
 uv run wcd init-db --no-indexes
+RevisionChest build -d /path/to/dumps -o /path/to/bundles --parquet /path/to/meta.parquet
+uv run wcd stage0-load --domain en.wikipedia.org --metadata /path/to/meta.parquet --parquet-dir ./parquet
 uv run wcd extract-all -d /path/to/bundles -o ./staging --jobs 4
 uv run wcd dedup -d ./staging
 uv run wcd load -d ./staging
 uv run wcd init-db --add-indexes
 ```
+
+`wcd stage0-load` is idempotent (`ON CONFLICT DO NOTHING` on `revisions`,
+upserts elsewhere) and ends with the Stage-0 gate: every revision's page has a
+`page_metadata` row, `revision_timestamp` is a real `TIMESTAMP`, and the
+`revisions` Parquet partition for the domain has the same row count as
+Postgres. If RevisionChest already wrote Postgres (`--postgres`), the command
+only adds the Parquet copy.
+
+Two tiers hold the data: Postgres for the serving tables, and a Parquet
+directory (`PARQUET_DIR`) laid out `<dataset>/domain=<d>/page_bucket=<n>/`
+with `page_bucket = page_id % 512`. `wcd_schema.parquet` defines the datasets
+and schemas, `wcd_schema.duckdb.register_views` opens them (and, ATTACHed,
+the Postgres tables) in one DuckDB connection, and `wcd_schema.ids` holds the
+deterministic identifiers (`citation_instances.id` is the first 8 bytes of
+`SHA1("{domain}|{page_id}|{raw_sha1}")`, so every engine can compute it).
 
 `wcd <command> --help` lists each stage's options; they are unchanged from
 the former `build_all.py` / `build_db.py` / `dedup_parquet.py` /
@@ -84,18 +103,26 @@ documented in `example.env`.
 `wcd fixture-dump` filters full-history XML dumps down to a page list, to
 produce the input for the fixture bundle (`fixtures/README.md`).
 
+The end-to-end Postgres test (`packages/pipeline/tests/test_postgres_integration.py`)
+runs when `WCD_TEST_DATABASE_URL` points at a scratch database (its `public`
+schema is dropped); add `REVISIONCHEST_BIN=…/RevisionChest` to also check the
+committed Stage-0 metadata fixture against the binary.
+
 ## Data model (current)
 
 * Articles are identified by domain and page id. Reference strings are
   normalized (`citation_normalizer`) before hashing; `normalized_sha1`
   identifies a reference's content, `raw_sha1` the exact text on a page.
-* `normalized_citations` holds one row per distinct normalized reference;
-  `citation_instances` one per (page, raw text); `citation_history` records
-  which revisions each instance appears in; `template_data` stores template
+* `revisions` (every revision, written at Stage 0) and `page_metadata` carry
+  the page's domain; `normalized_citations` holds one row per distinct
+  normalized reference; `citation_instances` one per (domain, page, raw text)
+  with a deterministic id; `citation_history` (Parquet only) records which
+  revisions each instance appears in; `template_data` stores template
   parameters for search; `web_resources` the cited URLs.
-* The semantic layer (citation parts, source matching, reliability scores,
-  per-page summaries) is specified in `docs/design/proposed_data_model.md`
-  and is being built on top of this.
+* The semantic layer (`normalized_citation_parts`, `global_sources`,
+  `citation_source_resolution`, `page_source_summary`, `page_summary_cache`,
+  `ref_name_links`) is defined in `wcd_schema.postgres` per
+  `docs/design/proposed_data_model.md`; Stages 4–8 fill it.
 
 ## Working with the submodules
 

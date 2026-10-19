@@ -19,10 +19,20 @@ load_dotenv()
 _DB_PARTS = ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASS")
 
 
+def _with_driver(url: str) -> str:
+    """Pin the psycopg2 driver: the loaders use its ``copy_expert`` and
+    SQLAlchemy >= 2.1 resolves a bare ``postgresql://`` to psycopg 3."""
+    for prefix in ("postgresql://", "postgres://"):
+        if url.startswith(prefix):
+            return "postgresql+psycopg2://" + url[len(prefix):]
+    return url
+
+
 def database_url() -> str:
+    """The SQLAlchemy URL for Postgres (always ``postgresql+psycopg2://``)."""
     url = os.getenv("DATABASE_URL")
     if url:
-        return url
+        return _with_driver(url)
     missing = [v for v in _DB_PARTS if not os.getenv(v)]
     if missing:
         raise RuntimeError(
@@ -31,7 +41,7 @@ def database_url() -> str:
             "Check your .env file (see example.env)."
         )
     return (
-        f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASS')}@"
+        f"postgresql+psycopg2://{os.getenv('DB_USER')}:{os.getenv('DB_PASS')}@"
         f"{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
     )
 

@@ -17,6 +17,7 @@ COMMANDS = {
     "load":        ("wcd_pipeline.load",        "Stage 3: load deduplicated Parquet into Postgres"),
     "init-db":     ("wcd_pipeline.init_db",     "Create Postgres tables / manage secondary indexes"),
     "purge":       ("wcd_pipeline.purge",       "Drop or truncate Postgres tables"),
+    "stage0-load": ("wcd_pipeline.stage0",      "Stage 0: load RevisionChest --parquet metadata into Postgres and the revisions Parquet tier"),
     "fixture-dump": ("wcd_pipeline.fixture_dump", "Filter XML history dumps down to a page list (fixture input for RevisionChest)"),
 }
 

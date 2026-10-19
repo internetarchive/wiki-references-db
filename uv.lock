@@ -2437,6 +2437,7 @@ name = "wcd-schema"
 version = "0.1.0"
 source = { editable = "packages/schema" }
 dependencies = [
+    { name = "duckdb" },
     { name = "pyarrow" },
     { name = "sqlalchemy", version = "2.0.54", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "sqlalchemy", version = "2.1.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -2444,6 +2445,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "duckdb", specifier = ">=1.0.0" },
     { name = "pyarrow", specifier = ">=15.0.0" },
     { name = "sqlalchemy", specifier = ">=2.0.25" },
 ]
