@@ -20,7 +20,7 @@ import pytest
 import zstandard as zstd
 from sqlalchemy import create_engine, text
 
-from wcd_pipeline import dedup, extract, gates, init_db, load, materialize, stage0, stage4, stage5, stage6
+from wcd_pipeline import dedup, extract, gates, init_db, load, materialize, stage0, stage4, stage5, stage6, stage7, stage8
 from wcd_pipeline.config import database_url
 from wcd_schema import parquet as layout
 from wcd_schema.ids import instance_id
@@ -386,3 +386,106 @@ def test_stage6_matching(db, staged: Path, work: Path):
     assert stage6.main(["--domain", DOMAIN, "--parquet-dir", parquet, "--jobs", "1", "--force"]) == 0
     after = _read(con, work, "merged_sources", "page_id, merged_source_id")
     assert after.equals(before)
+
+
+# ---------------------------------------------------------------------------
+# Stage 7 (materialization) and Stage 8 (revision stats)
+# ---------------------------------------------------------------------------
+
+def test_stage7_materialize(db, staged: Path, work: Path):
+    parquet = str(work / "parquet")
+    assert stage7.main(["--domain", DOMAIN, "--parquet-dir", parquet]) == 0
+
+    # 7a: one Postgres row per staged global source, with the canonical member's source_type
+    con = duckdb.connect()
+    n_stage = con.execute(f"SELECT count(*) FROM read_parquet('{layout.partition_glob(work / 'parquet', 'matching_intermediate/global_sources_stage', DOMAIN)}')").fetchone()[0]
+    assert scalar(db, "SELECT count(*) FROM global_sources") == n_stage == 9
+    diamond = q(db, "SELECT global_source_id, match_type, confidence, source_type, n_pages, n_total_citations, reliability_score, verdict "
+                    "FROM global_sources WHERE extracted_isbn = '9780143036555'")
+    assert len(diamond) == 1
+    gid, match_type, confidence, source_type, n_pages, n_total, score, verdict = diamond[0]
+    assert (match_type, confidence, source_type) == ("isbn", 0.95, "template")
+
+    # 7b: every merged-map row resolved to a part on its page; per-page match values kept
+    n_map = con.execute(f"SELECT count(*) FROM read_parquet('{layout.partition_glob(work / 'parquet', 'matching_intermediate/merged_citation_source_map', DOMAIN)}')").fetchone()[0]
+    assert scalar(db, "SELECT count(*) FROM citation_source_resolution") == n_map == 12
+    rows = q(db, "SELECT page_id, match_type, confidence FROM citation_source_resolution WHERE global_source_id = :g ORDER BY page_id, confidence", g=gid)
+    assert rows == [(PAGE_A, "isbn", 0.95), (PAGE_A, "isbn", 0.95), (PAGE_B, "singleton", None)]
+
+    # 7c: resolved denorm carries global_source_id for every part
+    assert con.execute(f"SELECT count(*) FROM read_parquet('{layout.partition_glob(work / 'parquet', 'citation_instances_denorm', DOMAIN)}') "
+                       "WHERE global_source_id IS NULL").fetchone()[0] == 0
+
+    # 7d/7e: page_source_summary per (page, source) with history ranges and reuse counts
+    pss = q(db, "SELECT page_id, n_citations, n_revisions_cited, n_self_closing_uses, is_current, first_rev_id, last_rev_id "
+                "FROM page_source_summary WHERE global_source_id = :g ORDER BY page_id", g=gid)
+    # page 101: 2 instances (editions) over revisions 1001-1003, 5 self-closing reuses (1001:1, 1002:2, 1003:2 —
+    # the 1003 reuses resolve through the redefined range), not current (page has later revisions without it)
+    # page 202: 1 instance over 2201-2202, current; its one reuse is of "web1", the cite web source
+    assert pss == [(PAGE_A, 2, 3, 5, False, 1001, 1003), (PAGE_B, 1, 2, 0, True, 2201, 2202)]
+    assert q(db, "SELECT n_self_closing_uses, is_current FROM page_source_summary WHERE extracted_url = 'https://example.org/page'") == [(1, True)]
+    assert (n_pages, n_total) == (2, 3)
+    assert scalar(db, "SELECT count(*) FROM global_sources WHERE n_pages IS NULL") == 0
+
+    # 7f: UVA scorer; template sources are high_confidence; a bare-url singleton is not
+    assert verdict == "high_confidence" and score == 30 + 25 + 15 + 5 + 10   # template, id_tier 1, author, year, isbn
+    bare = q(db, "SELECT reliability_score, verdict FROM global_sources WHERE extracted_url = 'https://example.org/visits'")
+    assert bare == [(25.0, "high_confidence")]   # ref_tag with a URL: id_tier 2 → high_confidence by the id_tier rule
+    assert scalar(db, "SELECT count(*) FROM global_sources WHERE verdict IS NULL") == 0
+
+    # 7g: export matches
+    scores = con.execute(f"SELECT global_source_id, n_pages, reliability_score, verdict FROM read_parquet('{layout.dataset_glob(work / 'parquet', 'global_source_scores')}') ORDER BY 1").fetchall()
+    assert scores == q(db, "SELECT global_source_id, n_pages, reliability_score, verdict FROM global_sources ORDER BY 1")
+
+    # 7h: one cache row per page in revisions (mwdump pages 102-104 have no citations)
+    cache = {r[0]: r for r in q(db, "SELECT page_id, revision_count, latest_rev_id, reference_count, type_breakdown, top_templates, source_profile "
+                                     "FROM page_summary_cache ORDER BY page_id")}
+    assert set(cache) == {101, 102, 103, 104, PAGE_B}
+    a = cache[PAGE_A]
+    assert (a[1], a[2], a[3]) == (6, 1006, 0)          # latest mwdump revision has no citations in our bundle
+    b = cache[PAGE_B]
+    assert (b[1], b[2], b[3]) == (2, 2202, 2)
+    assert b[4] == [{"citation_type": "template", "count": 2}]
+    assert b[5] == [{"template_name": "cite book", "count": 1}, {"template_name": "cite web", "count": 1}]
+    assert b[6]["total_citation_uses"] == 2 and b[6]["summary"].startswith("This page mostly uses")
+    assert {x["label"]: x["count"] for x in b[6]["source_kind_breakdown"]}["Books"] == 1
+    assert cache[103][3] == 0 and cache[103][6]["summary"].startswith("This page does not yet")
+
+    # gate and idempotency
+    import psycopg2
+    pg = psycopg2.connect(os.environ["WCD_TEST_DATABASE_URL"])
+    try:
+        assert stage7.gate(pg, duckdb.connect(), DOMAIN, stage7._domain_id(pg, DOMAIN), parquet) == []
+    finally:
+        pg.close()
+    before = q(db, "SELECT * FROM page_source_summary ORDER BY page_id, global_source_id")
+    assert stage7.main(["--domain", DOMAIN, "--parquet-dir", parquet]) == 0
+    assert q(db, "SELECT * FROM page_source_summary ORDER BY page_id, global_source_id") == before
+    assert scalar(db, "SELECT count(*) FROM global_sources") == 9
+
+
+def test_stage8_revision_stats(db, staged: Path, work: Path):
+    parquet = str(work / "parquet")
+    assert stage8.main(["--domain", DOMAIN, "--parquet-dir", parquet, "--jobs", "1"]) == 0
+    con = duckdb.connect()
+    rows = con.execute(f"SELECT page_id, rev_id, n_total_citations, n_self_closing, n_unique_sources, n_unresolved, "
+                       f"n_high_confidence, n_new_sources, pct_resolved, n_template, n_ref_tag, n_shorthand, n_endnote, n_bare_url "
+                       f"FROM read_parquet('{layout.partition_glob(work / 'parquet', 'page_revision_stats', DOMAIN)}', hive_partitioning=true) "
+                       "ORDER BY page_id, rev_id").fetchall()
+    by_rev = {(r[0], r[1]): r for r in rows}
+    # every revision of every page, zeros included
+    assert len(rows) == len(FIXTURE_REVISIONS) + 2
+    assert by_rev[(103, 3001)][2:8] == (0, 0, 0, 0, 0, 0)
+    # page 101 rev 1001: 6 citations (diamond template, fischer prose, sfn, routledge + métraux + island-link endnotes)
+    r = by_rev[(PAGE_A, 1001)]
+    assert r[2] == 6 and r[3] == 1 and r[5] == 0 and r[8] == 1.0
+    assert r[7] == 5   # sources first seen: 6 citations, sfn+routledge share one source
+    assert (r[9], r[10], r[11], r[12], r[13]) == (1, 1, 1, 3, 0)
+    r2 = by_rev[(PAGE_A, 1002)]
+    assert r2[2] == 8 and r2[3] == 2 and r2[13] == 1 and r2[7] == 3   # + bare-url ref + bullet block (2 sources)
+    r3 = by_rev[(PAGE_A, 1003)]
+    assert r3[2] == 6 and r3[3] == 2 and r3[7] == 0                   # 2nd edition joins the existing isbn source
+    assert by_rev[(PAGE_A, 1004)][2:4] == (0, 0)
+    # high-confidence counts distinct sources with confidence >= 0.85 (singletons have none)
+    assert by_rev[(PAGE_B, 2201)][6] == 0 and by_rev[(PAGE_A, 1003)][6] == 1
+    assert stage8.gate(parquet, DOMAIN) == []

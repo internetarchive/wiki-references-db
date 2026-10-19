@@ -22,7 +22,9 @@ COMMANDS = {
     "denorm-export": ("wcd_pipeline.materialize", "Stage 4.6 / 7c: export citation_instances_denorm Parquet for a domain"),
     "ref-name-links": ("wcd_pipeline.stage5",   "Stage 5: resolve <ref name> reuse to defining instances per revision range"),
     "match":       ("wcd_pipeline.stage6",      "Stage 6: per-page (6a-6c) and cross-page (6d) source matching for a domain"),
-    "gate":        ("wcd_pipeline.gates",       "Run an inter-stage validation gate (0, 3, 4, 5, 6) for a domain"),
+    "materialize": ("wcd_pipeline.stage7",      "Stage 7: global_sources, resolution, page summaries, scores (7a-7h) for a domain"),
+    "revision-stats": ("wcd_pipeline.stage8",   "Stage 8: per-revision citation stats Parquet for a domain"),
+    "gate":        ("wcd_pipeline.gates",       "Run an inter-stage validation gate (0, 3, 4, 5, 6, 7, 8) for a domain"),
     "fixture-dump": ("wcd_pipeline.fixture_dump", "Filter XML history dumps down to a page list (fixture input for RevisionChest)"),
 }
 

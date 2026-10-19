@@ -14,4 +14,5 @@ Database project (see NOTICE); wcd_pipeline wires these to Parquet/Postgres.
     merge_types   per-page cross-type merge          (Stage 6c)
     match_global  cross-page matching                (Stage 6d)
     scoring       reliability score + verdict        (Stage 7f)
+    profile       page source-profile classification (Stage 7h)
 """

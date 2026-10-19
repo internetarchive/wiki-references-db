@@ -13,6 +13,7 @@ upstream module is carried over, the DuckDB loading/writing code is not):
   src/citation_matching/template_matching.py    → match_template.py
   src/citation_matching/cross_type_merger.py    → merge_types.py
   src/citation_matching/cross_page_matcher.py   → match_global.py, scoring.py
+  src/analytics_service/page_summary.py         → profile.py (source-profile classifiers)
 
 Rules for this package:
   * Logic in the vendored functions is kept verbatim. The golden tests in
@@ -40,6 +41,8 @@ by tests/test_additions.py; the golden comparison strips their output keys):
     confidence 0.95 (per-page, cross-type and cross-page), exclude them from
     the cross-page fuzzy pass, and carry all three columns on their outputs.
   * scoring.py gives the 10-point match-type bonus to pmc / arxiv / wikidata_qid.
+  * profile.py adds `build_source_profile`, the assembly upstream did inline
+    in `_get_page_source_profile` (classify each citation row, bucket, summarise).
   * merge_types.py adds `rt_source_ids` / `tm_source_ids` (every member of a
     merged source) beside upstream's first-member `ref_source_id` /
     `tmpl_source_id`, so the per-page citation maps can be joined to merged

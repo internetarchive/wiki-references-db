@@ -215,7 +215,7 @@ def stage5(session: Session, domain: str, parquet_base: str | None = None) -> li
 # CLI
 # ---------------------------------------------------------------------------
 
-STAGES = ("0", "3", "4", "5", "6")
+STAGES = ("0", "3", "4", "5", "6", "7", "8")
 
 
 def run(stage: str, session: Session, domain: str, parquet_base: str | None, **kw) -> list[str]:
@@ -230,6 +230,19 @@ def run(stage: str, session: Session, domain: str, parquet_base: str | None, **k
     if stage == "6":
         from .stage6 import gate as stage6
         return stage6(parquet_base, domain)
+    if stage == "7":
+        import duckdb as _duckdb
+        import psycopg2
+        from .config import psycopg_dsn
+        from .stage7 import _domain_id, gate as stage7
+        pg = psycopg2.connect(psycopg_dsn())
+        try:
+            return stage7(pg, _duckdb.connect(), domain, _domain_id(pg, domain), parquet_base)
+        finally:
+            pg.close()
+    if stage == "8":
+        from .stage8 import gate as stage8
+        return stage8(parquet_base, domain)
     raise ValueError(stage)
 
 
@@ -249,9 +262,9 @@ def main(argv=None) -> int:
     ap.add_argument("--parquet-dir", default=os.environ.get("PARQUET_DIR"), help="Parquet tier base directory (default: PARQUET_DIR)")
     ap.add_argument("--all-buckets", action="store_true", help="Stage 3: check every bucket instead of a sample of 16")
     args = ap.parse_args(argv)
-    if args.stage in ("3", "6") and not args.parquet_dir:
+    if args.stage in ("3", "6", "7", "8") and not args.parquet_dir:
         ap.error("--parquet-dir (or PARQUET_DIR) is required for this gate")
-    session = make_session() if args.stage != "6" else None
+    session = make_session() if args.stage not in ("6", "7", "8") else None
     try:
         kw = {"sample_buckets": None} if (args.stage == "3" and args.all_buckets) else {}
         return report(args.stage, run(args.stage, session, args.domain, args.parquet_dir, **kw))
