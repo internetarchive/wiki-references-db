@@ -65,39 +65,50 @@ uv run pytest           # tests across the workspace
 Stage 0  RevisionChest build      XML dump  → .mwrev.zst bundles + page/revision metadata
                                               (--parquet file, and/or --postgres straight into the schema)
 Stage 0  wcd stage0-load          metadata  → Postgres revisions/page_metadata + revisions Parquet tier, gate
-Stage 1  wcd extract-all          bundles   → staging Parquet (references, normalized text, history)
-Stage 3  wcd dedup                staging   → deduped Parquet
-Stage 3  wcd load                 deduped   → Postgres
+Stage 1  wcd extract-all          bundles   → staging Parquet (instances, normalized text, URLs, templates)
+                                            + Parquet tier: citation_history, named_ref_uses, revision_signals
+Stage 3  wcd dedup                staging   → deduped Parquet (+ instance-id collision gate)
+Stage 3  wcd load                 deduped   → Postgres;  wcd gate 3
+Stage 4  wcd parts                normalized_citations → normalized_citation_parts (UVA normalizers); gate
+Stage 4.6 wcd denorm-export       Postgres  → citation_instances_denorm Parquet (unresolved)
+Stage 5  wcd ref-name-links       history × revisions × named instances → ref_name_links (Postgres + Parquet); gate
 ```
 
 ```
 uv run wcd init-db --no-indexes
-RevisionChest build -d /path/to/dumps -o /path/to/bundles --parquet /path/to/meta.parquet
-uv run wcd stage0-load --domain en.wikipedia.org --metadata /path/to/meta.parquet --parquet-dir ./parquet
-uv run wcd extract-all -d /path/to/bundles -o ./staging --jobs 4
+RevisionChest build -d /path/to/dumps -o /path/to/bundles --parquet /path/to/meta/enwiki.parquet
+uv run wcd stage0-load --domain en.wikipedia.org --metadata /path/to/meta --parquet-dir ./parquet
+uv run wcd extract-all -d /path/to/bundles -o ./staging --domain en.wikipedia.org --parquet-dir ./parquet --jobs 4
 uv run wcd dedup -d ./staging
 uv run wcd load -d ./staging
+uv run wcd gate 3 --domain en.wikipedia.org --parquet-dir ./parquet
 uv run wcd init-db --add-indexes
+uv run wcd parts --domain en.wikipedia.org
+uv run wcd denorm-export --domain en.wikipedia.org --parquet-dir ./parquet
+uv run wcd ref-name-links --domain en.wikipedia.org --parquet-dir ./parquet
 ```
 
-`wcd stage0-load` is idempotent (`ON CONFLICT DO NOTHING` on `revisions`,
-upserts elsewhere) and ends with the Stage-0 gate: every revision's page has a
-`page_metadata` row, `revision_timestamp` is a real `TIMESTAMP`, and the
-`revisions` Parquet partition for the domain has the same row count as
-Postgres. If RevisionChest already wrote Postgres (`--postgres`), the command
-only adds the Parquet copy.
+One bundle directory per domain: the bundle format carries no domain, and
+`--domain` decides the instance ids, the Parquet partitions and every staged
+row. `wcd stage0-load` is idempotent (`ON CONFLICT DO NOTHING` on `revisions`,
+upserts elsewhere) and rebuilds the domain's `revisions` Parquet from
+everything under `--metadata` — point it at the directory holding all of the
+domain's metadata files, overlapping `sync` batches included. Each stage ends
+with its gate from `docs/design/proposed_data_integrity.md`; `wcd gate <0|3|4|5>`
+re-runs one.
 
 Two tiers hold the data: Postgres for the serving tables, and a Parquet
 directory (`PARQUET_DIR`) laid out `<dataset>/domain=<d>/page_bucket=<n>/`
-with `page_bucket = page_id % 512`. `wcd_schema.parquet` defines the datasets
-and schemas, `wcd_schema.duckdb.register_views` opens them (and, ATTACHed,
-the Postgres tables) in one DuckDB connection, and `wcd_schema.ids` holds the
+with `page_bucket = page_id % 512`. Stage 1 writes its per-revision datasets
+straight into that layout (one `<shard>-<i>.parquet` per bucket per bundle;
+re-running a bundle replaces its files), so `citation_history` never passes
+through dedup or Postgres. `wcd_schema.parquet` defines the datasets and
+schemas, `wcd_schema.duckdb.register_views` opens them (and, ATTACHed, the
+Postgres tables) in one DuckDB connection, and `wcd_schema.ids` holds the
 deterministic identifiers (`citation_instances.id` is the first 8 bytes of
 `SHA1("{domain}|{page_id}|{raw_sha1}")`, so every engine can compute it).
 
-`wcd <command> --help` lists each stage's options; they are unchanged from
-the former `build_all.py` / `build_db.py` / `dedup_parquet.py` /
-`load_all.py` / `init_db.py` / `purge.py` scripts. Environment variables are
+`wcd <command> --help` lists each stage's options. Environment variables are
 documented in `example.env`.
 
 `wcd fixture-dump` filters full-history XML dumps down to a page list, to
@@ -115,14 +126,19 @@ committed Stage-0 metadata fixture against the binary.
   identifies a reference's content, `raw_sha1` the exact text on a page.
 * `revisions` (every revision, written at Stage 0) and `page_metadata` carry
   the page's domain; `normalized_citations` holds one row per distinct
-  normalized reference; `citation_instances` one per (domain, page, raw text)
-  with a deterministic id; `citation_history` (Parquet only) records which
-  revisions each instance appears in; `template_data` stores template
-  parameters for search; `web_resources` the cited URLs.
-* The semantic layer (`normalized_citation_parts`, `global_sources`,
-  `citation_source_resolution`, `page_source_summary`, `page_summary_cache`,
-  `ref_name_links`) is defined in `wcd_schema.postgres` per
-  `docs/design/proposed_data_model.md`; Stages 4–8 fill it.
+  normalized reference with its `citation_type` (`ref_tag`, `template`,
+  `bare_url`, `endnote`, `shorthand`, `external_link`); `citation_instances`
+  one per (domain, page, raw text) with a deterministic id;
+  `citation_history` (Parquet only) records which revisions each instance
+  appears in; `named_ref_uses` (Parquet) each self-closing `<ref name=…/>`
+  reuse; `template_data` stores template parameters for search;
+  `web_resources` the cited URLs.
+* `normalized_citation_parts` (Stage 4) holds the UVA normalizers' output per
+  semantic part of a citation; `ref_name_links` (Stage 5) maps a page's
+  `<ref name>` to its defining instance per revision range. `global_sources`,
+  `citation_source_resolution`, `page_source_summary` and
+  `page_summary_cache` are defined in `wcd_schema.postgres` per
+  `docs/design/proposed_data_model.md`; Stages 6–8 fill them.
 
 ## Working with the submodules
 

@@ -48,3 +48,9 @@ def database_url() -> str:
 
 def staging_dir(default: str = "./staging") -> str:
     return os.getenv("STAGING_DIR", default)
+
+
+def psycopg_dsn() -> str:
+    """The same database as ``database_url()``, as a libpq / psycopg2 DSN."""
+    url = database_url()
+    return "postgresql://" + url.split("://", 1)[1]

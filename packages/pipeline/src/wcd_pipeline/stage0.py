@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import shutil
 import time
 
 import duckdb
@@ -157,11 +158,16 @@ def load_to_postgres(session: Session, path: str, domain: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def write_revisions_parquet(path: str, domain: str, parquet_base: str) -> int:
-    """``revisions/domain=<domain>/page_bucket=<n>/`` from the metadata file.
-    Replaces that domain's partitions."""
+    """``revisions/domain=<domain>/page_bucket=<n>/`` from the metadata under
+    ``path`` (a file or a directory of files — point it at *all* the domain's
+    metadata: the domain's partitions are replaced, and a revision reported
+    by several files, as overlapping ``sync`` batches do, is written once)."""
     con = duckdb.connect()
     target = layout.dataset_dir(parquet_base, "revisions")
     target.mkdir(parents=True, exist_ok=True)
+    domain_dir = layout.partition_dir(parquet_base, "revisions", domain)
+    if domain_dir.exists():
+        shutil.rmtree(domain_dir)
     dom = domain.replace("'", "''")
     con.execute(
         f"""COPY (
@@ -173,6 +179,7 @@ def write_revisions_parquet(path: str, domain: str, parquet_base: str) -> int:
                        CAST(strptime(timestamp, '%Y-%m-%dT%H:%M:%SZ') AS TIMESTAMP) AS revision_timestamp
                 FROM read_parquet('{metadata_glob(path)}')
                 WHERE type = 'revision'
+                QUALIFY row_number() OVER (PARTITION BY rev_id ORDER BY timestamp, file_path) = 1
                 ORDER BY page_id, rev_id
             ) TO '{target}' (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (domain, page_bucket), OVERWRITE_OR_IGNORE)"""
     )

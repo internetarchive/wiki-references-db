@@ -103,7 +103,7 @@ def test_tier_layout_and_ids(run: dict):
     assert con.execute(f"select count(*) from read_parquet('{layout.dataset_glob(parquet, 'revision_signals')}')").fetchone()[0] == 5
     reuses = con.execute(f"select page_id, revision_id, ref_name from read_parquet('{layout.dataset_glob(parquet, 'named_ref_uses')}') order by all").fetchall()
     assert reuses == [(101, 1001, "diamond"), (101, 1002, "diamond"), (101, 1002, "diamond"),
-                      (101, 1003, "diamond"), (101, 1003, "diamond"), (202, 2002, "web1")]
+                      (101, 1003, "diamond"), (101, 1003, "diamond"), (202, 2202, "web1")]
     assert con.execute(f"select count(*) from read_parquet('{run['deduped'] / 'citation_instances.parquet'}') "
                        "where reference_name is not null").fetchone()[0] == 3  # diamond ×2 definitions, web1
     types = dict(con.execute(f"select citation_type, count(*) from read_parquet('{run['deduped'] / 'normalized_citations.parquet'}') group by 1").fetchall())

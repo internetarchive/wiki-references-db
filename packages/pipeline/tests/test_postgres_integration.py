@@ -11,6 +11,7 @@ committed ``fixtures/golden/stage0/fixture.parquet`` is still what it writes.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -19,13 +20,13 @@ import pytest
 import zstandard as zstd
 from sqlalchemy import create_engine, text
 
-from wcd_pipeline import dedup, extract, gates, init_db, load, stage0
+from wcd_pipeline import dedup, extract, gates, init_db, load, materialize, stage0, stage4, stage5
 from wcd_pipeline.config import database_url
 from wcd_schema import parquet as layout
 from wcd_schema.ids import instance_id
 from wcd_schema.postgres import Base
 
-from synthetic_bundle import render  # noqa: E402
+from synthetic_bundle import PAGE_A, PAGE_B, render, write_metadata  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 STAGE0_META = REPO_ROOT / "fixtures" / "golden" / "stage0" / "fixture.parquet"
@@ -165,7 +166,16 @@ def test_stage0_gate_detects_drift(db, work: Path):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
-def staged(work: Path) -> Path:
+def staged(db, work: Path) -> Path:
+    # Stage 0 for the synthetic bundle's pages (page 101 and revisions 1001-1003 overlap the
+    # mwdump fixture, page 202 is new): the metadata *directory* now holds both files, and the
+    # domain's revisions Parquet is rebuilt from all of it, each revision once.
+    meta_dir = work / "meta"
+    meta_dir.mkdir()
+    shutil.copy(STAGE0_META, meta_dir / "fixture.parquet")
+    write_metadata(str(meta_dir / "synthetic.parquet"))
+    assert stage0.main(["--domain", DOMAIN, "--metadata", str(meta_dir), "--parquet-dir", str(work / "parquet")]) == 0
+    assert scalar(db, "SELECT count(*) FROM revisions") == len(FIXTURE_REVISIONS) + 2   # 2201, 2202
     bundle = work / "synthetic.mwrev.zst"
     bundle.write_bytes(zstd.ZstdCompressor(level=3).compress(render()))
     staging = work / "staging"
@@ -191,11 +201,11 @@ def test_load_synthetic(db, staged: Path, work: Path):
     # normalized_citations carry (domain, page) of first appearance; article web_resources were not duplicated
     assert scalar(db, "SELECT count(*) FROM normalized_citations WHERE appears_on_domain_id IS NULL "
                       "OR appears_on_page_id IS NULL") == 0
-    assert scalar(db, "SELECT count(*) FROM web_resources WHERE numeric_page_id IS NOT NULL") == len(FIXTURE_PAGES)
+    assert scalar(db, "SELECT count(*) FROM web_resources WHERE numeric_page_id IS NOT NULL") == len(FIXTURE_PAGES) + 1  # + page 202
     assert scalar(db, "SELECT count(*) FROM normalized_citation_web_resources") > 0
     assert scalar(db, "SELECT count(*) FROM template_data") > 0
     # Stage-0 rows untouched
-    assert scalar(db, "SELECT count(*) FROM revisions") == len(FIXTURE_REVISIONS)
+    assert scalar(db, "SELECT count(*) FROM revisions") == len(FIXTURE_REVISIONS) + 2
     # citation_type arrived from Stage 1 and the Stage-3 gate passes
     assert scalar(db, "SELECT count(*) FROM normalized_citations WHERE citation_type IS NULL") == 0
     assert set(r[0] for r in q(db, "SELECT DISTINCT citation_type FROM normalized_citations")) >= {"template", "ref_tag", "shorthand", "endnote"}
@@ -215,3 +225,112 @@ def test_load_is_idempotent(db, staged: Path):
     before = {t: scalar(db, f"SELECT count(*) FROM {t}") for t in tables}
     load.main(["-d", str(staged)])
     assert {t: scalar(db, f"SELECT count(*) FROM {t}") for t in tables} == before
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 (parts) and Stage 5 (ref_name_links)
+# ---------------------------------------------------------------------------
+
+def test_stage4_parts(db, staged: Path):
+    dsn = os.environ["WCD_TEST_DATABASE_URL"]
+    counts = stage4.run(dsn, DOMAIN)
+    assert counts["citations"] == scalar(db, "SELECT count(*) FROM normalized_citations")
+    rows = q(db, "SELECT nc.citation_type, p.part_index, p.part_type, p.norm_subtype, p.template_name, p.author_key, "
+                 "p.year, p.extracted_isbn, p.extracted_url, p.content, p.part_sha1 "
+                 "FROM normalized_citation_parts p JOIN normalized_citations nc ON nc.id = p.normalized_id")
+    by_content = {r[9]: r for r in rows}
+    # bullet block of two {{cite journal}} inside one <ref> → two template parts
+    journal = sorted(r for r in rows if r[4] == "cite journal")
+    assert [(r[1], r[5], r[6]) for r in journal] == [(0, "lee", "2001"), (1, "lee", "2002")]
+    # {{cite book}} with ISBN: template part, normalized identifier
+    books = [r for r in rows if r[4] == "cite book" and r[5] == "diamond"]
+    assert len(books) == 3 and all(r[7] == "9780143036555" for r in books)
+    # prose ref → ref_tag part through the ref-tag normalizer
+    fischer = next(r for r in rows if r[5] == "fischer")
+    assert fischer[:4] == ("ref_tag", 0, "ref_tag", "prose_citation") and fischer[6] == "1995"
+    # standalone {{sfn}} → shorthand_template subtype with anchor author/year
+    sfn = next(r for r in rows if r[0] == "shorthand")
+    assert (sfn[3], sfn[5], sfn[6]) == ("shorthand_template", "routledge", "1919")
+    # bare-url <ref> and bracketed endnote carry extracted_url; wrapper stripped from content
+    assert by_content["[https://example.org/visits Visits]"][8] == "https://example.org/visits"
+    assert by_content["[https://example.org/island Official site]"][0] == "endnote"
+    assert not any(c.startswith("<ref") or c.startswith("* ") for c in by_content)
+    # part_sha1 = sha1(content) everywhere, and the gate agrees
+    from wcd_schema.ids import part_sha1
+    assert all(part_sha1(r[9]) == r[10] for r in rows)
+    from sqlalchemy.orm import Session
+    with db.connect() as con_pg:
+        assert gates.stage4(Session(con_pg), DOMAIN) == []
+    # idempotent
+    before = sorted(rows)
+    stage4.run(dsn, DOMAIN)
+    assert sorted(q(db, "SELECT nc.citation_type, p.part_index, p.part_type, p.norm_subtype, p.template_name, p.author_key, "
+                       "p.year, p.extracted_isbn, p.extracted_url, p.content, p.part_sha1 "
+                       "FROM normalized_citation_parts p JOIN normalized_citations nc ON nc.id = p.normalized_id")) == before
+    # --resume touches nothing when every citation has parts
+    assert stage4.run(dsn, DOMAIN, resume=True)["citations"] == 0
+
+
+def test_stage4_gate_detects_missing_parts(db, staged: Path):
+    from sqlalchemy.orm import Session
+    with db.connect() as con_pg:
+        con_pg.execute(text("DELETE FROM normalized_citation_parts WHERE normalized_id = (SELECT min(id) FROM normalized_citations)"))
+        failures = gates.stage4(Session(con_pg), DOMAIN)
+        assert any("have no part" in f for f in failures), failures
+        con_pg.rollback()
+
+
+def test_stage4_denorm_export(db, staged: Path, work: Path):
+    dsn = os.environ["WCD_TEST_DATABASE_URL"]
+    counts = materialize.export_citation_instances_denorm(dsn, DOMAIN, str(work / "parquet"))
+    n_join = scalar(db, "SELECT count(*) FROM citation_instances ci JOIN normalized_citation_parts p "
+                        "ON p.normalized_id = ci.normalized_id")
+    assert counts["rows"] == n_join == 12   # 11 instances, one of which (the bullet block) has 2 parts
+    con = duckdb.connect()
+    glob_ = layout.dataset_glob(work / "parquet", "citation_instances_denorm")
+    cols = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{glob_}', hive_partitioning=true)").fetchall()]
+    assert cols == [f.name for f in layout.SCHEMAS["citation_instances_denorm"]] + ["domain", "page_bucket"]
+    rows = con.execute(f"SELECT citation_instance_id, page_id, part_index, citation_type, part_type, global_source_id, page_bucket "
+                       f"FROM read_parquet('{glob_}', hive_partitioning=true) ORDER BY page_id, citation_instance_id, part_index").fetchall()
+    assert all(r[5] is None and r[6] == r[1] % 512 for r in rows)
+    assert sum(1 for r in rows if r[2] == 1) == 1
+    assert layout.list_buckets(work / "parquet", "citation_instances_denorm", DOMAIN) == [PAGE_A % 512, PAGE_B % 512]
+    assert not (layout.dataset_dir(work / "parquet", "citation_instances_denorm") / f"_scratch_{DOMAIN}").exists()
+    # a second export replaces, not appends
+    materialize.export_citation_instances_denorm(dsn, DOMAIN, str(work / "parquet"))
+    assert con.execute(f"SELECT count(*) FROM read_parquet('{glob_}')").fetchone()[0] == 12
+
+
+def test_stage5_ref_name_links(db, staged: Path, work: Path):
+    dsn = os.environ["WCD_TEST_DATABASE_URL"]
+    counts = stage5.run(dsn, DOMAIN, str(work / "parquet"))
+    assert counts["links"] == 3
+    rows = q(db, "SELECT r.page_id, r.ref_name, r.first_revision_id, r.last_revision_id, "
+                 "nc.reference_normalized LIKE '%edition=2nd%' FROM ref_name_links r "
+                 "JOIN citation_instances ci ON ci.id = r.defining_instance_id "
+                 "JOIN normalized_citations nc ON nc.id = ci.normalized_id ORDER BY 1, 2, 3")
+    # "diamond": first edition in 1001–1002, redefined (2nd edition) in 1003; page 101 has
+    # later revisions (1004–1006, from the Stage-0 fixture) without it, so the range closes.
+    # "web1": defined in 2201 and still present in the page's latest revision 2202 → open range.
+    assert rows == [(PAGE_A, "diamond", 1001, 1002, False), (PAGE_A, "diamond", 1003, 1003, True),
+                    (PAGE_B, "web1", 2201, None, False)]
+    # the Parquet copy matches and the gate passes; a re-run is idempotent
+    con = duckdb.connect()
+    pq_rows = con.execute(f"SELECT page_id, ref_name, first_revision_id, last_revision_id FROM read_parquet("
+                          f"'{layout.partition_glob(work / 'parquet', 'ref_name_links', DOMAIN)}', hive_partitioning=true) "
+                          "ORDER BY 1, 2, 3").fetchall()
+    assert pq_rows == [(r[0], r[1], r[2], r[3]) for r in rows]
+    from sqlalchemy.orm import Session
+    with db.connect() as con_pg:
+        assert gates.stage5(Session(con_pg), DOMAIN, str(work / "parquet")) == []
+    assert stage5.run(dsn, DOMAIN, str(work / "parquet"))["links"] == 3
+    assert scalar(db, "SELECT count(*) FROM ref_name_links") == 3
+
+
+def test_stage5_gate_detects_overlap(db, staged: Path):
+    from sqlalchemy.orm import Session
+    with db.connect() as con_pg:
+        con_pg.execute(text("UPDATE ref_name_links SET last_revision_id = NULL WHERE first_revision_id = 1001"))
+        failures = gates.stage5(Session(con_pg), DOMAIN)
+        assert any("overlapping" in f for f in failures), failures
+        con_pg.rollback()

@@ -71,9 +71,34 @@ REVISIONS = [
     (PAGE_A, 0, 1001, None, "2004-01-01T00:00:00Z", REV_A1),
     (PAGE_A, 0, 1002, 1001, "2005-06-15T12:00:00Z", REV_A2),
     (PAGE_A, 0, 1003, 1002, "2010-03-03T03:03:03Z", REV_A3),
-    (PAGE_B, 0, 2001, None, "2006-02-02T00:00:00Z", REV_B1),
-    (PAGE_B, 0, 2002, 2001, "2007-02-02T00:00:00Z", REV_B2),
+    # (revision ids 2201/2202 stay clear of the mwdump fixture's 2001)
+    (PAGE_B, 0, 2201, None, "2006-02-02T00:00:00Z", REV_B1),
+    (PAGE_B, 0, 2202, 2201, "2007-02-02T00:00:00Z", REV_B2),
 ]
+
+
+PAGE_TITLES = {PAGE_A: ("Example Island", 0), PAGE_B: ("Second Page", 0)}
+
+
+def metadata_rows(bundle_file: str = "synthetic.mwrev.zst") -> list[dict]:
+    """What RevisionChest's ``--parquet`` metadata would say about this bundle
+    (page rows + revision rows; offsets are not meaningful here)."""
+    rows = [{"type": "page", "page_id": pid, "ns": ns, "title": title, "rev_id": None, "parent_rev_id": None,
+             "file_path": None, "offset_begin": None, "length": None, "timestamp": None}
+            for pid, (title, ns) in PAGE_TITLES.items()]
+    for page_id, ns, rev_id, parent, ts, _text in REVISIONS:
+        rows.append({"type": "revision", "page_id": page_id, "ns": None, "title": None, "rev_id": rev_id,
+                     "parent_rev_id": parent, "file_path": bundle_file, "offset_begin": 0, "length": 0, "timestamp": ts})
+    return rows
+
+
+def write_metadata(path: str) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    schema = pa.schema([("type", pa.string()), ("page_id", pa.int64()), ("ns", pa.int64()), ("title", pa.string()),
+                        ("rev_id", pa.int64()), ("parent_rev_id", pa.int64()), ("file_path", pa.string()),
+                        ("offset_begin", pa.int64()), ("length", pa.int64()), ("timestamp", pa.string())])
+    pq.write_table(pa.Table.from_pylist(metadata_rows(), schema=schema), path)
 
 
 def render() -> bytes:
