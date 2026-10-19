@@ -35,3 +35,25 @@ How it is built:
 
 Golden outputs for the later stages (Stage-4 parts, Stage-6 sources) are
 recorded under `golden/<shard>/` as those stages land.
+
+## sample/ (extractor comparison sample)
+
+Manifests for the Python-vs-Rust extractor comparison: one TSV per wiki
+(`wiki, rev_id, page_id, ns, title, stratum, detail`) plus `sample.json` with
+the parameters and per-stratum counts. Wikis: en, fr, de, it, rm, zh, ar, sr.
+The TSVs are the reproducible record; random sampling and recent changes are
+not repeatable, so regenerate only on purpose.
+
+`scripts/sample_revisions.py` builds it and documents the strata (random,
+Special:LongPages, linter errors, tracking categories, reverted edits):
+
+1. `uv run python scripts/sample_revisions.py probe` checks every source on
+   every wiki (needs `CONTACT_EMAIL` in `.env`).
+2. `… manifest --total 70000` writes `fixtures/sample/`.
+3. `… fetch` downloads the revisions into `data/sample/` (git-ignored) as
+   `<wiki>.xml.bz2` in export-0.11 format. It is resumable.
+4. `… mutate --variants 1` writes `<wiki>.mutated.xml.bz2`: damaged copies
+   with synthetic revision ids (`10_000_000_000 + rev_id * 10 + variant`)
+   and a `<wiki>.mutations.tsv` log.
+5. `RevisionChest build data/sample/<wiki>.xml.bz2 -o data/sample/bundles --no-db`
+   turns either file into the bundle both extractors read.
