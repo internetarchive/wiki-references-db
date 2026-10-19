@@ -38,7 +38,7 @@ legacy/         the v1 Flask API and explorer, frozen; served until v2 cutover.
 fixtures/       committed test inputs and golden outputs (see fixtures/README.md).
 docs/design/    the plan: proposed_*.md, decisions, executive summary.
 docs/uva/       the UVA project's documentation, kept as the reference for packages/semantic.
-scripts/        one-off tooling (fixture page selection).
+scripts/        one-off tooling (fixture page selection and history export, extractor sample).
 ```
 
 Planned, not yet present: `apps/api` (FastAPI v2), `apps/frontend` (the

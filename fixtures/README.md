@@ -27,25 +27,81 @@ intentional metadata change with
 
 ## shards/ (to be added)
 
-The sampled test-article subset of English Wikipedia: a `.mwrev.zst` bundle
-and the RevisionChest metadata Parquet for a few hundred pages carrying their
-**full revision history**. It serves three purposes at once — matching-quality
-evaluation for the ported UVA code, a scale/performance rehearsal input, and
-the API/frontend fixture database.
+The sampled test-article subset of English Wikipedia, with each page's **full
+revision history** up to a fixed cutoff. It serves three purposes at once:
+matching-quality evaluation for the ported UVA code, a scale and performance
+rehearsal input, and the API/frontend fixture database. It comes in two
+nested tiers, recorded in the `tier` column of `pages.tsv`:
 
-How it is built:
+* **ci** — about 70 pages with at most 1,500 revisions each, small enough to
+  run on every build and to hold golden outputs (`golden/ci/`).
+* **rehearsal** — every selected page (about 400), including a few very long
+  histories; for performance runs, not goldens.
 
-1. `scripts/select_fixture_pages.py` applies the sampling strategy and writes
-   `fixtures/pages.txt` (one page id per line). The selection criteria are
-   recorded at the top of that script.
-2. `wcd fixture-dump -p fixtures/pages.txt -o fixture.xml.bz2 <pages-meta-history dumps…>`
-   streams the full-history XML dumps and keeps only those pages, writing a
-   valid (much smaller) dump.
-3. `RevisionChest build fixture.xml.bz2 -o fixtures/shards/ --parquet …` turns
-   it into the bundle and metadata that Stage 0/1 consume.
+The selection centres on WikiProject Medicine and WikiProject Military
+history (dense citation networks: journal citations with PMID/DOI on one
+side, `{{sfn}}` shortened footnotes and ISBN book citations on the other),
+taken as clusters of linked articles so that cross-page source matching has
+shared sources to find, plus assessment-class strata, pages in both projects,
+random articles, Cite-error and list-defined-reference pages, and hand-picked
+edge cases. The criteria are documented at the top of
+`scripts/select_fixture_pages.py`.
 
-Golden outputs for the later stages (Stage-4 parts, Stage-6 sources) are
-recorded under `golden/<shard>/` as those stages land.
+Histories come from the Action API rather than from dump chunks:
+`scripts/export_history.py` fetches each page's revisions up to the cutoff
+and writes export-0.11 XML. That approximates a dump taken at the cutoff;
+the differences (revisions deleted since the cutoff are missing, revisions
+history-merged since are present, titles are current) are listed in its
+docstring. Because the API's answers change over time, **`pages.tsv` and
+the exported XML are the record**, not a re-run of the scripts.
+
+How it is built (needs `CONTACT_EMAIL` in `.env`; run from the repository root):
+
+1. Select the pages. Choose the cutoff once (e.g. the date of the dump the
+   full build uses) and keep it:
+
+   ```
+   uv run python scripts/select_fixture_pages.py --cutoff 2026-10-01T00:00:00Z
+   ```
+
+   This writes `fixtures/pages.tsv` (with the wiki and cutoff in its header),
+   `fixtures/pages.txt` and `fixtures/pages.ci.txt`. Optional:
+   `--seed-page "Medicine=<title>"` to choose cluster seeds instead of drawing
+   them, and `--extra fixtures/fixture_extra.tsv` for hand-picked pages
+   (`title<TAB>reason[<TAB>ci]` per line). The projects' assessed-page lists
+   are cached in `data/fixture/candidates.tsv.gz`; delete it to refetch.
+   Review the summary it prints (pages and approximate revisions per tier).
+
+2. Export the histories (resumable; re-run after an interruption):
+
+   ```
+   uv run python scripts/export_history.py fetch
+   uv run python scripts/export_history.py write
+   ```
+
+   This writes `data/fixture/fixture.xml.bz2` (all pages),
+   `data/fixture/fixture-ci.xml.bz2` and `data/fixture/export.json` (per-page
+   counts, pages left out and why, SHA-256 of both files).
+
+3. Build the bundles and metadata for each tier:
+
+   ```
+   RevisionChest build data/fixture/fixture-ci.xml.bz2 -o fixtures/shards/ci \
+       --parquet fixtures/shards/ci/meta.parquet --domain en.wikipedia.org
+   RevisionChest build data/fixture/fixture.xml.bz2 -o data/fixture/shards/rehearsal \
+       --parquet data/fixture/shards/rehearsal/meta.parquet --domain en.wikipedia.org
+   ```
+
+4. Run the pipeline on the ci shard (scratch Postgres, temporary
+   `PARQUET_DIR`), check every `wcd gate`, and record goldens under
+   `golden/ci/`.
+
+Commit `pages.tsv`, `pages*.txt`, `export.json` and the ci shard. The
+rehearsal bundle stays outside git; keep it with its `export.json` hashes.
+
+`wcd fixture-dump` remains for cutting the same page list out of real
+`pages-meta-history` dumps (it reads `pages.txt`); note that it holds each
+`<page>` element in memory until the page ends.
 
 ## sample/ (extractor comparison sample)
 

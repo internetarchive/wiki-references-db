@@ -624,6 +624,28 @@ def fetch(args) -> int:
     return 0
 
 
+def rev_record(p: dict, rev: dict) -> dict:
+    """Flatten one API revision (formatversion=2, rvslots=main) into the cache record shape."""
+    slot = (rev.get("slots") or {}).get("main") or {}
+    hidden = bool(slot.get("texthidden") or "content" not in slot)
+    return {
+        "rev_id": int(rev["revid"]),
+        "page_id": int(p["pageid"]),
+        "ns": int(p["ns"]),
+        "title": p["title"],
+        "parent_id": int(rev.get("parentid") or 0),
+        "timestamp": rev.get("timestamp", ""),
+        "user": None if rev.get("userhidden") else rev.get("user"),
+        "user_id": None if rev.get("userhidden") else rev.get("userid"),
+        "comment": None if rev.get("commenthidden") else rev.get("comment", ""),
+        "sha1": slot.get("sha1") or rev.get("sha1"),
+        "model": slot.get("contentmodel", "wikitext"),
+        "format": slot.get("contentformat", "text/x-wiki"),
+        "text": None if hidden else slot["content"],
+        "status": "texthidden" if hidden else "ok",
+    }
+
+
 def fetch_batch(api: Api, rev_ids: list[int]) -> Iterator[dict]:
     returned: set[int] = set()
     for data in api.query_all(prop="revisions", revids="|".join(map(str, rev_ids)),
@@ -632,28 +654,11 @@ def fetch_batch(api: Api, rev_ids: list[int]) -> Iterator[dict]:
         q = data.get("query", {})
         for p in q.get("pages", []):
             for rev in p.get("revisions", []):
-                slot = (rev.get("slots") or {}).get("main") or {}
                 rid = int(rev["revid"])
                 if rid in returned:
                     continue
                 returned.add(rid)
-                hidden = bool(slot.get("texthidden") or "content" not in slot)
-                yield {
-                    "rev_id": rid,
-                    "page_id": int(p["pageid"]),
-                    "ns": int(p["ns"]),
-                    "title": p["title"],
-                    "parent_id": int(rev.get("parentid") or 0),
-                    "timestamp": rev.get("timestamp", ""),
-                    "user": None if rev.get("userhidden") else rev.get("user"),
-                    "user_id": None if rev.get("userhidden") else rev.get("userid"),
-                    "comment": None if rev.get("commenthidden") else rev.get("comment", ""),
-                    "sha1": slot.get("sha1") or rev.get("sha1"),
-                    "model": slot.get("contentmodel", "wikitext"),
-                    "format": slot.get("contentformat", "text/x-wiki"),
-                    "text": None if hidden else slot["content"],
-                    "status": "texthidden" if hidden else "ok",
-                }
+                yield rev_record(p, rev)
         bad = q.get("badrevids") or []
         for b in bad.values() if isinstance(bad, dict) else bad:
             rid = int(b["revid"])
@@ -708,6 +713,84 @@ def xml_text(text: str) -> str:
     return escape(text, {"\r": "&#13;"})
 
 
+def xml_header(site: dict) -> str:
+    """The <mediawiki> open tag and <siteinfo>, from a meta=siteinfo response."""
+    g = site["general"]
+    lang = g.get("lang", "en")
+    parts: list[str] = []
+    w = parts.append
+    w('<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" '
+      'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+      'xsi:schemaLocation="http://www.mediawiki.org/xml/export-0.11/ '
+      'http://www.mediawiki.org/xml/export-0.11.xsd" '
+      f'version="0.11" xml:lang={quoteattr(lang)}>\n')
+    w("  <siteinfo>\n")
+    w(f"    <sitename>{escape(g.get('sitename', ''))}</sitename>\n")
+    w(f"    <dbname>{escape(g.get('wikiid', ''))}</dbname>\n")
+    w(f"    <base>{escape(g.get('base', ''))}</base>\n")
+    w(f"    <generator>{escape(g.get('generator', ''))}</generator>\n")
+    w(f"    <case>{escape(g.get('case', 'first-letter'))}</case>\n")
+    w("    <namespaces>\n")
+    nss = site.get("namespaces", {})
+    for ns in sorted(nss.values(), key=lambda n: int(n["id"])):
+        name = ns.get("name", "")
+        case = ns.get("case", "first-letter")
+        if name:
+            w(f'      <namespace key="{int(ns["id"])}" case={quoteattr(case)}>{escape(name)}</namespace>\n')
+        else:
+            w(f'      <namespace key="{int(ns["id"])}" case={quoteattr(case)} />\n')
+    w("    </namespaces>\n")
+    w("  </siteinfo>\n")
+    return "".join(parts)
+
+
+XML_FOOTER = "</mediawiki>\n"
+XML_PAGE_CLOSE = "  </page>\n"
+
+
+def xml_page_open(page_id: int, title: str, ns: int) -> str:
+    return (f"  <page>\n    <title>{escape(title)}</title>\n"
+            f"    <ns>{int(ns)}</ns>\n    <id>{int(page_id)}</id>\n")
+
+
+def xml_revision(r: dict, comment_for: Callable[[dict], str] | None = None) -> str:
+    """One <revision>. A record whose text is None (revision-deleted) is written the way
+    dumps write it: <text bytes="0" deleted="deleted" /> and no <sha1>."""
+    parts: list[str] = []
+    w = parts.append
+    text = r.get("text")
+    w("    <revision>\n")
+    w(f"      <id>{r['rev_id']}</id>\n")
+    if r.get("parent_id"):
+        w(f"      <parentid>{r['parent_id']}</parentid>\n")
+    w(f"      <timestamp>{escape(r.get('timestamp', ''))}</timestamp>\n")
+    if r.get("user") is None:
+        w('      <contributor deleted="deleted" />\n')
+    elif r.get("user_id"):
+        w(f"      <contributor>\n        <username>{escape(r['user'])}</username>\n"
+          f"        <id>{int(r['user_id'])}</id>\n      </contributor>\n")
+    else:
+        w(f"      <contributor>\n        <ip>{escape(r['user'])}</ip>\n      </contributor>\n")
+    comment = comment_for(r) if comment_for else r.get("comment")
+    if comment is None:
+        w('      <comment deleted="deleted" />\n')
+    elif comment:
+        w(f"      <comment>{escape(comment)}</comment>\n")
+    w(f"      <model>{escape(r.get('model') or 'wikitext')}</model>\n")
+    w(f"      <format>{escape(r.get('format') or 'text/x-wiki')}</format>\n")
+    if text is None:
+        w('      <text bytes="0" deleted="deleted" />\n')
+    else:
+        nbytes = len(text.encode("utf-8"))
+        if text:
+            w(f'      <text bytes="{nbytes}" xml:space="preserve">{xml_text(text)}</text>\n')
+        else:
+            w(f'      <text bytes="0" xml:space="preserve" />\n')
+        w(f"      <sha1>{sha1_base36(text)}</sha1>\n")
+    w("    </revision>\n")
+    return "".join(parts)
+
+
 def write_xml(path: Path, site: dict, recs: Iterable[dict], keep: set[int] | None = None,
               comment_for: Callable[[dict], str] | None = None) -> None:
     pages: dict[int, list[dict]] = {}
@@ -724,71 +807,17 @@ def write_xml(path: Path, site: dict, recs: Iterable[dict], keep: set[int] | Non
             continue
         pages.setdefault(rec["page_id"], []).append(rec)
 
-    g = site["general"]
-    lang = g.get("lang", "en")
     n_revs = 0
     with bz2.open(path, "wt", encoding="utf-8") as fh:
-        w = fh.write
-        w('<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" '
-          'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
-          'xsi:schemaLocation="http://www.mediawiki.org/xml/export-0.11/ '
-          'http://www.mediawiki.org/xml/export-0.11.xsd" '
-          f'version="0.11" xml:lang={quoteattr(lang)}>\n')
-        w("  <siteinfo>\n")
-        w(f"    <sitename>{escape(g.get('sitename', ''))}</sitename>\n")
-        w(f"    <dbname>{escape(g.get('wikiid', ''))}</dbname>\n")
-        w(f"    <base>{escape(g.get('base', ''))}</base>\n")
-        w(f"    <generator>{escape(g.get('generator', ''))}</generator>\n")
-        w(f"    <case>{escape(g.get('case', 'first-letter'))}</case>\n")
-        w("    <namespaces>\n")
-        nss = site.get("namespaces", {})
-        for ns in sorted(nss.values(), key=lambda n: int(n["id"])):
-            name = ns.get("name", "")
-            case = ns.get("case", "first-letter")
-            if name:
-                w(f'      <namespace key="{int(ns["id"])}" case={quoteattr(case)}>{escape(name)}</namespace>\n')
-            else:
-                w(f'      <namespace key="{int(ns["id"])}" case={quoteattr(case)} />\n')
-        w("    </namespaces>\n")
-        w("  </siteinfo>\n")
+        fh.write(xml_header(site))
         for pid in sorted(pages):
             revs = sorted(pages[pid], key=lambda r: r["rev_id"])
-            first = revs[0]
-            w("  <page>\n")
-            w(f"    <title>{escape(first['title'])}</title>\n")
-            w(f"    <ns>{first['ns']}</ns>\n")
-            w(f"    <id>{pid}</id>\n")
+            fh.write(xml_page_open(pid, revs[0]["title"], revs[0]["ns"]))
             for r in revs:
-                text = r["text"]
-                w("    <revision>\n")
-                w(f"      <id>{r['rev_id']}</id>\n")
-                if r.get("parent_id"):
-                    w(f"      <parentid>{r['parent_id']}</parentid>\n")
-                w(f"      <timestamp>{escape(r.get('timestamp', ''))}</timestamp>\n")
-                if r.get("user") is None:
-                    w('      <contributor deleted="deleted" />\n')
-                elif r.get("user_id"):
-                    w(f"      <contributor>\n        <username>{escape(r['user'])}</username>\n"
-                      f"        <id>{int(r['user_id'])}</id>\n      </contributor>\n")
-                else:
-                    w(f"      <contributor>\n        <ip>{escape(r['user'])}</ip>\n      </contributor>\n")
-                comment = comment_for(r) if comment_for else r.get("comment")
-                if comment is None:
-                    w('      <comment deleted="deleted" />\n')
-                elif comment:
-                    w(f"      <comment>{escape(comment)}</comment>\n")
-                w(f"      <model>{escape(r.get('model') or 'wikitext')}</model>\n")
-                w(f"      <format>{escape(r.get('format') or 'text/x-wiki')}</format>\n")
-                nbytes = len(text.encode("utf-8"))
-                if text:
-                    w(f'      <text bytes="{nbytes}" xml:space="preserve">{xml_text(text)}</text>\n')
-                else:
-                    w(f'      <text bytes="0" xml:space="preserve" />\n')
-                w(f"      <sha1>{sha1_base36(text)}</sha1>\n")
-                w("    </revision>\n")
+                fh.write(xml_revision(r, comment_for))
                 n_revs += 1
-            w("  </page>\n")
-        w("</mediawiki>\n")
+            fh.write(XML_PAGE_CLOSE)
+        fh.write(XML_FOOTER)
     log(f"wrote {n_revs} revisions on {len(pages)} pages to {path}"
         + (f"; skipped {skipped}" if skipped else ""))
 
