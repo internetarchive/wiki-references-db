@@ -25,7 +25,7 @@ regenerates the file from the dump and requires equality. Regenerate after an
 intentional metadata change with
 `RevisionChest build …/fixture.xml.bz2 -o /tmp/rc --parquet fixtures/golden/stage0/fixture.parquet`.
 
-## shards/ (to be added)
+## shards/
 
 The sampled test-article subset of English Wikipedia, with each page's **full
 revision history** up to a fixed cutoff. It serves three purposes at once:
@@ -92,9 +92,9 @@ How it is built (needs `CONTACT_EMAIL` in `.env`; run from the repository root):
        --parquet data/fixture/shards/rehearsal/meta.parquet --domain en.wikipedia.org
    ```
 
-4. Run the pipeline on the ci shard (scratch Postgres, temporary
-   `PARQUET_DIR`), check every `wcd gate`, and record goldens under
-   `golden/ci/`.
+4. Run the pipeline on the ci shard and record its goldens under
+   `golden/ci/` with `packages/pipeline/tests/test_fixture_ci.py` (see
+   `golden/ci/` below).
 
 Commit `pages.tsv`, `pages*.txt`, `export.json` and the ci shard. The
 rehearsal bundle stays outside git; keep it with its `export.json` hashes.
@@ -102,6 +102,28 @@ rehearsal bundle stays outside git; keep it with its `export.json` hashes.
 `wcd fixture-dump` remains for cutting the same page list out of real
 `pages-meta-history` dumps (it reads `pages.txt`); note that it holds each
 `<page>` element in memory until the page ends.
+
+## golden/ci/
+
+Every output of the full pipeline (Stages 0–8) on `shards/ci/`: one file per
+Postgres table and per Parquet dataset, in a canonical form (load-order
+surrogate keys replaced by natural keys, floats rounded, JSON key-sorted), plus
+`summary.json` with row counts, fixture coverage and step timings.
+Snapshots over 50,000 rows are stored as per-page digests (`*.fp.parquet`).
+`packages/pipeline/tests/test_fixture_ci.py` runs every `wcd` command in
+order with its gate, checks coverage, and compares each output with these
+files. It needs a scratch Postgres database (its `public` schema is dropped):
+
+```
+export WCD_TEST_DATABASE_URL=postgresql://user:pass@127.0.0.1:5432/wcd_fixture_test
+UPDATE_GOLDEN=1 uv run pytest packages/pipeline/tests/test_fixture_ci.py -v   # record
+uv run pytest packages/pipeline/tests/test_fixture_ci.py -v                   # compare
+```
+
+Re-record after an intentional pipeline change and review the diff of
+`summary.json` before committing. Extraction dominates the run (about 14
+minutes on one core: the shard is a single bundle, so `--jobs` does not help
+Stage 1); every other stage takes seconds.
 
 ## sample/ (extractor comparison sample)
 
