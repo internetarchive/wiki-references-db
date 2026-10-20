@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -2412,6 +2412,7 @@ dependencies = [
     { name = "sqlalchemy", version = "2.0.54", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "sqlalchemy", version = "2.1.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "wcd-schema" },
+    { name = "wcd-semantic" },
     { name = "wiki-citation-normalizer" },
     { name = "wiki-references-extractor" },
     { name = "zstandard" },
@@ -2427,6 +2428,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "sqlalchemy", specifier = ">=2.0.25" },
     { name = "wcd-schema", editable = "packages/schema" },
+    { name = "wcd-semantic", editable = "packages/semantic" },
     { name = "wiki-citation-normalizer", editable = "packages/normalizer" },
     { name = "wiki-references-extractor", editable = "packages/extractor" },
     { name = "zstandard", specifier = ">=0.22.0" },
