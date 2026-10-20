@@ -1,0 +1,616 @@
+{
+  "shard": "fixtures/shards/ci",
+  "coverage": {
+    "citation_instances": 8874,
+    "global_sources": 2585,
+    "global_sources_multi_page": 6,
+    "named_ref_uses": 207324,
+    "normalized_citations": 8297,
+    "pages": 51,
+    "parts_sfn": 502,
+    "parts_with_arxiv": 0,
+    "parts_with_doi": 1520,
+    "parts_with_isbn": 986,
+    "parts_with_pmc": 282,
+    "parts_with_pmid": 1751,
+    "parts_with_wikidata_qid": 0,
+    "revisions": 17432,
+    "type:bare_url": 309,
+    "type:endnote": 1533,
+    "type:external_link": 310,
+    "type:ref_tag": 953,
+    "type:shorthand": 507,
+    "type:template": 4685,
+    "verdict:high_confidence": 2138,
+    "verdict:likely_not_citation": 44,
+    "verdict:low_confidence": 84,
+    "verdict:medium_confidence": 15,
+    "verdict:questionable": 304
+  },
+  "snapshots": {
+    "pg.citation_instances": {
+      "rows": 8874,
+      "columns": [
+        "id",
+        "domain_id__value",
+        "page_id",
+        "normalized_id__normalized_sha1",
+        "raw_sha1",
+        "reference_type",
+        "reference_name"
+      ],
+      "stored": "full"
+    },
+    "pg.citation_source_resolution": {
+      "rows": 8754,
+      "columns": [
+        "normalized_id__normalized_sha1",
+        "part_index",
+        "domain_id__value",
+        "page_id",
+        "global_source_id",
+        "source_type",
+        "match_type",
+        "confidence",
+        "is_canonical"
+      ],
+      "stored": "full"
+    },
+    "pg.containers": {
+      "rows": 1,
+      "columns": [
+        "label",
+        "wikidata_id",
+        "librarybase_id"
+      ],
+      "stored": "full"
+    },
+    "pg.documents": {
+      "rows": 0,
+      "columns": [
+        "id",
+        "language_code",
+        "has_container__label",
+        "part_of_larger_work",
+        "title",
+        "wikidata_id",
+        "librarybase_id"
+      ],
+      "stored": "full"
+    },
+    "pg.domains": {
+      "rows": 960,
+      "columns": [
+        "value",
+        "top_level_domain",
+        "parent_domain__value",
+        "for_container__label",
+        "internet_domains_id"
+      ],
+      "stored": "full"
+    },
+    "pg.global_sources": {
+      "rows": 2585,
+      "columns": [
+        "global_source_id",
+        "match_type",
+        "confidence",
+        "canonical_part_sha1",
+        "source_type",
+        "author_key",
+        "year",
+        "title",
+        "extracted_doi",
+        "extracted_isbn",
+        "extracted_pmid",
+        "extracted_pmc",
+        "extracted_arxiv",
+        "extracted_wikidata_qid",
+        "extracted_librarybase_id",
+        "extracted_url",
+        "n_pages",
+        "n_total_citations",
+        "reliability_score",
+        "verdict"
+      ],
+      "stored": "full"
+    },
+    "pg.normalized_citation_parts": {
+      "rows": 8675,
+      "columns": [
+        "normalized_id__normalized_sha1",
+        "part_index",
+        "part_sha1",
+        "content",
+        "part_type",
+        "norm_subtype",
+        "norm_content",
+        "anchor_key",
+        "anchor_label",
+        "url_anchor_text",
+        "page_ref",
+        "template_name",
+        "template_subtype",
+        "params_json",
+        "author_last",
+        "author_first",
+        "journal",
+        "date",
+        "publisher",
+        "location",
+        "edition",
+        "volume",
+        "issue",
+        "pages",
+        "author_key",
+        "title",
+        "year",
+        "year_reliable",
+        "extracted_doi",
+        "extracted_isbn",
+        "extracted_pmid",
+        "extracted_pmc",
+        "extracted_arxiv",
+        "extracted_wikidata_qid",
+        "extracted_librarybase_id",
+        "extracted_url",
+        "is_archive_url",
+        "id_tier",
+        "id_tier_label"
+      ],
+      "stored": "full"
+    },
+    "pg.normalized_citation_web_resources": {
+      "rows": 5497,
+      "columns": [
+        "normalized_id__normalized_sha1",
+        "web_resource_id__url_hash"
+      ],
+      "stored": "full"
+    },
+    "pg.normalized_citations": {
+      "rows": 8297,
+      "columns": [
+        "normalized_sha1",
+        "reference_normalized",
+        "appears_on_domain_id__value",
+        "appears_on_page_id",
+        "citation_type"
+      ],
+      "stored": "full"
+    },
+    "pg.page_metadata": {
+      "rows": 51,
+      "columns": [
+        "domain_id__value",
+        "page_id",
+        "page_title",
+        "page_namespace"
+      ],
+      "stored": "full"
+    },
+    "pg.page_source_summary": {
+      "rows": 2602,
+      "columns": [
+        "domain_id__value",
+        "page_id",
+        "global_source_id",
+        "author_key",
+        "year",
+        "title",
+        "extracted_doi",
+        "extracted_isbn",
+        "extracted_pmid",
+        "extracted_pmc",
+        "extracted_arxiv",
+        "extracted_wikidata_qid",
+        "extracted_librarybase_id",
+        "extracted_url",
+        "source_type",
+        "match_type",
+        "confidence",
+        "first_rev_id",
+        "first_seen",
+        "last_rev_id",
+        "last_seen",
+        "n_citations",
+        "n_revisions_cited",
+        "n_self_closing_uses",
+        "is_current"
+      ],
+      "stored": "full"
+    },
+    "pg.page_summary_cache": {
+      "rows": 51,
+      "columns": [
+        "domain_id__value",
+        "page_id",
+        "revision_count",
+        "first_revision_ts",
+        "latest_revision_ts",
+        "latest_rev_id",
+        "reference_count",
+        "type_breakdown",
+        "top_templates",
+        "source_profile"
+      ],
+      "stored": "full"
+    },
+    "pg.ref_name_links": {
+      "rows": 2717,
+      "columns": [
+        "domain_id__value",
+        "page_id",
+        "ref_name",
+        "defining_instance_id",
+        "first_revision_id",
+        "last_revision_id"
+      ],
+      "stored": "full"
+    },
+    "pg.revision_bundles": {
+      "rows": 1,
+      "columns": [
+        "file_path"
+      ],
+      "stored": "full"
+    },
+    "pg.revisions": {
+      "rows": 17432,
+      "columns": [
+        "revision_id",
+        "domain_id__value",
+        "page_id",
+        "parent_revision_id",
+        "revision_timestamp",
+        "found_in_bundle__file_path",
+        "offset_begin",
+        "length"
+      ],
+      "stored": "full"
+    },
+    "pg.template_data": {
+      "rows": 63160,
+      "columns": [
+        "wiki_template_id__name",
+        "normalized_id__normalized_sha1",
+        "offset_start",
+        "parameter_key",
+        "parameter_key_md5",
+        "parameter_value"
+      ],
+      "stored": "fingerprint"
+    },
+    "pg.web_resources": {
+      "rows": 2618,
+      "columns": [
+        "url",
+        "url_hash",
+        "instance_of_document",
+        "availability_status",
+        "is_archive_of__url_hash",
+        "domain_id__value",
+        "numeric_page_id",
+        "numeric_namespace_id"
+      ],
+      "stored": "full"
+    },
+    "pg.wiki_templates": {
+      "rows": 175,
+      "columns": [
+        "domain__value",
+        "name",
+        "wikidata_id",
+        "librarybase_id"
+      ],
+      "stored": "full"
+    },
+    "pq.citation_history": {
+      "rows": 576037,
+      "columns": [
+        "citation_instance_id",
+        "revision_id",
+        "page_id"
+      ],
+      "stored": "fingerprint"
+    },
+    "pq.citation_instances_denorm": {
+      "rows": 9252,
+      "columns": [
+        "citation_instance_id",
+        "page_id",
+        "raw_sha1",
+        "normalized_sha1",
+        "reference_type",
+        "reference_name",
+        "citation_type",
+        "part_index",
+        "part_sha1",
+        "content",
+        "part_type",
+        "norm_subtype",
+        "norm_content",
+        "template_name",
+        "template_subtype",
+        "author_last",
+        "journal",
+        "pages",
+        "anchor_key",
+        "page_ref",
+        "extracted_doi",
+        "extracted_isbn",
+        "extracted_pmid",
+        "extracted_pmc",
+        "extracted_arxiv",
+        "extracted_wikidata_qid",
+        "extracted_librarybase_id",
+        "extracted_url",
+        "is_archive_url",
+        "author_key",
+        "title",
+        "year",
+        "year_reliable",
+        "id_tier",
+        "id_tier_label",
+        "global_source_id",
+        "source_type",
+        "match_type",
+        "confidence"
+      ],
+      "stored": "full"
+    },
+    "pq.global_source_scores": {
+      "rows": 2585,
+      "columns": [
+        "global_source_id",
+        "n_pages",
+        "n_total_citations",
+        "reliability_score",
+        "verdict"
+      ],
+      "stored": "full"
+    },
+    "pq.matching_intermediate.citation_source_map": {
+      "rows": 3203,
+      "columns": [
+        "part_sha1",
+        "source_id",
+        "page_id",
+        "match_type",
+        "confidence",
+        "is_canonical"
+      ],
+      "stored": "full"
+    },
+    "pq.matching_intermediate.global_source_map": {
+      "rows": 2602,
+      "columns": [
+        "merged_source_id",
+        "global_source_id",
+        "page_id",
+        "match_type",
+        "confidence"
+      ],
+      "stored": "full"
+    },
+    "pq.matching_intermediate.global_sources_stage": {
+      "rows": 2585,
+      "columns": [
+        "global_source_id",
+        "match_type",
+        "confidence",
+        "n_pages",
+        "page_ids",
+        "canonical_part_sha1",
+        "source_type",
+        "author_key",
+        "year",
+        "title",
+        "extracted_doi",
+        "extracted_isbn",
+        "extracted_pmid",
+        "extracted_pmc",
+        "extracted_arxiv",
+        "extracted_wikidata_qid",
+        "extracted_url",
+        "n_total_citations"
+      ],
+      "stored": "full"
+    },
+    "pq.matching_intermediate.merged_citation_source_map": {
+      "rows": 8146,
+      "columns": [
+        "part_sha1",
+        "page_id",
+        "merged_source_id",
+        "source_type",
+        "match_type",
+        "confidence",
+        "is_canonical"
+      ],
+      "stored": "full"
+    },
+    "pq.matching_intermediate.merged_sources": {
+      "rows": 2602,
+      "columns": [
+        "merged_source_id",
+        "page_id",
+        "source_type",
+        "ref_source_id",
+        "tmpl_source_id",
+        "canonical_part_sha1",
+        "author_key",
+        "year",
+        "title",
+        "extracted_doi",
+        "extracted_isbn",
+        "extracted_pmid",
+        "extracted_pmc",
+        "extracted_arxiv",
+        "extracted_wikidata_qid",
+        "extracted_url",
+        "n_ref_citations",
+        "n_tmpl_citations",
+        "n_total_citations",
+        "match_type",
+        "confidence",
+        "id_tier",
+        "year_reliable",
+        "norm_subtype"
+      ],
+      "stored": "full"
+    },
+    "pq.matching_intermediate.sources": {
+      "rows": 1684,
+      "columns": [
+        "source_id",
+        "page_id",
+        "canonical_part_sha1",
+        "norm_subtype",
+        "id_tier",
+        "extracted_doi",
+        "extracted_isbn",
+        "extracted_pmid",
+        "extracted_pmc",
+        "extracted_arxiv",
+        "extracted_wikidata_qid",
+        "extracted_url",
+        "anchor_key",
+        "author_key",
+        "year",
+        "title",
+        "n_citations",
+        "match_type",
+        "confidence"
+      ],
+      "stored": "full"
+    },
+    "pq.matching_intermediate.template_citation_source_map": {
+      "rows": 4943,
+      "columns": [
+        "part_sha1",
+        "source_id",
+        "page_id",
+        "match_type",
+        "confidence",
+        "is_canonical"
+      ],
+      "stored": "full"
+    },
+    "pq.matching_intermediate.template_sources": {
+      "rows": 1492,
+      "columns": [
+        "source_id",
+        "page_id",
+        "canonical_part_sha1",
+        "template_subtype",
+        "template_name",
+        "author_last",
+        "title",
+        "year",
+        "extracted_doi",
+        "extracted_isbn",
+        "extracted_pmid",
+        "extracted_pmc",
+        "extracted_arxiv",
+        "extracted_wikidata_qid",
+        "extracted_url",
+        "id_tier",
+        "n_citations",
+        "match_type",
+        "confidence"
+      ],
+      "stored": "full"
+    },
+    "pq.named_ref_uses": {
+      "rows": 207324,
+      "columns": [
+        "page_id",
+        "revision_id",
+        "ref_name",
+        "offset_start"
+      ],
+      "stored": "fingerprint"
+    },
+    "pq.page_revision_stats": {
+      "rows": 17432,
+      "columns": [
+        "page_id",
+        "rev_id",
+        "timestamp",
+        "n_total_citations",
+        "n_self_closing",
+        "n_unique_sources",
+        "n_unresolved",
+        "n_high_confidence",
+        "n_new_sources",
+        "pct_resolved",
+        "n_ref_tag",
+        "n_template",
+        "n_bare_url",
+        "n_endnote",
+        "n_shorthand",
+        "n_external_link"
+      ],
+      "stored": "full"
+    },
+    "pq.ref_name_links": {
+      "rows": 2717,
+      "columns": [
+        "page_id",
+        "ref_name",
+        "defining_instance_id",
+        "first_revision_id",
+        "last_revision_id"
+      ],
+      "stored": "full"
+    },
+    "pq.revision_signals": {
+      "rows": 17432,
+      "columns": [
+        "revision_id",
+        "page_id",
+        "has_ref_tag",
+        "has_named_ref",
+        "has_self_closing_ref",
+        "has_references_tag",
+        "has_cite_template",
+        "has_citation_template",
+        "has_shorthand_template"
+      ],
+      "stored": "full"
+    },
+    "pq.revisions": {
+      "rows": 17432,
+      "columns": [
+        "revision_id",
+        "page_id",
+        "parent_revision_id",
+        "revision_timestamp"
+      ],
+      "stored": "full"
+    }
+  },
+  "timings_seconds": {
+    "init-db --no-indexes": 0.05,
+    "stage0-load": 0.34,
+    "gate 0": 0.02,
+    "extract-all": 360.37,
+    "dedup": 0.13,
+    "load": 7.89,
+    "gate 3": 0.12,
+    "init-db --add-indexes": 0.33,
+    "parts": 1.69,
+    "gate 4": 0.02,
+    "denorm-export": 0.51,
+    "ref-name-links": 1.48,
+    "gate 5": 0.03,
+    "match": 8.54,
+    "gate 6": 0.02,
+    "materialize": 2.46,
+    "gate 7": 0.05,
+    "revision-stats": 0.57,
+    "gate 8": 0.02
+  },
+  "recorded": "2026-10-20T19:39:04+00:00"
+}
