@@ -157,9 +157,13 @@ temporal AS (
            count(DISTINCT dn.citation_instance_id) AS n_citations,
            count(DISTINCT ch.revision_id)  AS n_revisions_cited,
            bool_or(ch.revision_id = l.latest_rev_id) AS is_current,
-           any_value(dn.source_type) AS source_type,
-           any_value(dn.match_type)  AS match_type,
-           any_value(dn.confidence)  AS confidence
+           -- the strongest member's match on this page: (source_type, match_type, confidence) from
+           -- one row, chosen by (confidence, match_type, source_type), so the triple is coherent and
+           -- the choice deterministic (members of one source can match differently: doi via a
+           -- template, author_year via a prose ref)
+           arg_max(dn.source_type, (coalesce(dn.confidence, -1), dn.match_type, dn.source_type)) AS source_type,
+           arg_max(dn.match_type,  (coalesce(dn.confidence, -1), dn.match_type, dn.source_type)) AS match_type,
+           arg_max(dn.confidence,  (coalesce(dn.confidence, -1), dn.match_type, dn.source_type)) AS confidence
     FROM citation_instances_denorm dn
     JOIN citation_history ch ON ch.citation_instance_id = dn.citation_instance_id
     JOIN revisions r         ON r.revision_id = ch.revision_id

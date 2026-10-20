@@ -52,19 +52,44 @@ _ADDED_IDS = ["extracted_pmc", "extracted_arxiv", "extracted_wikidata_qid"]
 # Inputs (the design's 6a/6b query, both part types at once)
 # ---------------------------------------------------------------------------
 
+# One row per (page, part_sha1) and matcher: the part attributes are functions of the part
+# text, so every occurrence agrees on them, except part_type when the same text occurs both as
+# a bare-URL <ref> (ref_tag) and as a plain external link (external_link). Both go to the
+# ref-tag matcher, which needs content_sha1 unique per page, so they are one input row,
+# typed ref_tag, with revisions counted across both. Template parts stay separate rows
+# (they go to the template matcher).
 _INPUT_SQL = """
-SELECT dn.page_id, dn.part_sha1, dn.part_type, dn.content, dn.norm_content, dn.norm_subtype,
-       dn.id_tier, dn.id_tier_label,
-       dn.extracted_url, dn.extracted_isbn, dn.extracted_doi, dn.extracted_pmid, dn.extracted_pmc,
-       dn.extracted_arxiv, dn.extracted_wikidata_qid,
-       dn.anchor_key, dn.author_key, dn.year, dn.year_reliable, dn.page_ref, dn.title,
-       dn.template_name, dn.template_subtype, dn.author_last, dn.journal, dn.pages,
+SELECT dn.page_id, dn.part_sha1,
+       CASE WHEN bool_or(dn.part_type = 'ref_tag') THEN 'ref_tag' ELSE min(dn.part_type) END AS part_type,
+       min(dn.content) AS content,
+       min(dn.norm_content) AS norm_content,
+       min(dn.norm_subtype) AS norm_subtype,
+       min(dn.id_tier) AS id_tier,
+       min(dn.id_tier_label) AS id_tier_label,
+       min(dn.extracted_url) AS extracted_url,
+       min(dn.extracted_isbn) AS extracted_isbn,
+       min(dn.extracted_doi) AS extracted_doi,
+       min(dn.extracted_pmid) AS extracted_pmid,
+       min(dn.extracted_pmc) AS extracted_pmc,
+       min(dn.extracted_arxiv) AS extracted_arxiv,
+       min(dn.extracted_wikidata_qid) AS extracted_wikidata_qid,
+       min(dn.anchor_key) AS anchor_key,
+       min(dn.author_key) AS author_key,
+       min(dn.year) AS year,
+       min(dn.year_reliable) AS year_reliable,
+       min(dn.page_ref) AS page_ref,
+       min(dn.title) AS title,
+       min(dn.template_name) AS template_name,
+       min(dn.template_subtype) AS template_subtype,
+       min(dn.author_last) AS author_last,
+       min(dn.journal) AS journal,
+       min(dn.pages) AS pages,
        count(DISTINCT ch.revision_id) AS n_revisions,
        min(ch.revision_id)            AS first_rev_id,
        min(dn.reference_name)         AS ref_name
 FROM citation_instances_denorm dn
 JOIN citation_history ch ON ch.citation_instance_id = dn.citation_instance_id
-GROUP BY ALL
+GROUP BY dn.page_id, dn.part_sha1, dn.part_type = 'template'
 ORDER BY dn.page_id, dn.part_sha1
 """
 

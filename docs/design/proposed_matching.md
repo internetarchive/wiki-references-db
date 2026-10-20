@@ -168,9 +168,12 @@ temporal AS (
            COUNT(DISTINCT dn.citation_instance_id) AS n_citations,
            COUNT(DISTINCT ch.revision_id)  AS n_revisions_cited,
            BOOL_OR(ch.revision_id = l.latest_rev_id) AS is_current,
-           ANY_VALUE(dn.source_type) AS source_type,
-           ANY_VALUE(dn.match_type)  AS match_type,
-           ANY_VALUE(dn.confidence)  AS confidence
+           -- one member's match triple, the strongest (members can match differently:
+           -- doi via a template, author_year via a prose ref; ANY_VALUE was neither
+           -- deterministic nor coherent across the three columns)
+           ARG_MAX(dn.source_type, (COALESCE(dn.confidence, -1), dn.match_type, dn.source_type)) AS source_type,
+           ARG_MAX(dn.match_type,  (COALESCE(dn.confidence, -1), dn.match_type, dn.source_type)) AS match_type,
+           ARG_MAX(dn.confidence,  (COALESCE(dn.confidence, -1), dn.match_type, dn.source_type)) AS confidence
     FROM citation_instances_denorm dn
     JOIN citation_history ch ON ch.citation_instance_id = dn.citation_instance_id
     JOIN revisions r         ON r.revision_id = ch.revision_id
