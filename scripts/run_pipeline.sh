@@ -17,7 +17,8 @@ LOG=$RUN_DIR/run.log; TIMINGS=$RUN_DIR/timings.txt; MEM=$RUN_DIR/mem.log
 step() { local name="$1"; shift; local t0=$(date +%s); echo "== $(date '+%F %T') START $name" | tee -a "$LOG"
   if "$@" >> "$LOG" 2>&1; then echo "== $(date '+%F %T') OK $name $(( $(date +%s) - t0 ))s" | tee -a "$LOG"; echo "$name $(( $(date +%s) - t0 ))" >> "$TIMINGS"
   else echo "== $(date '+%F %T') FAIL $name $(( $(date +%s) - t0 ))s (see $LOG)" | tee -a "$LOG"; echo "$name FAILED" >> "$TIMINGS"; kill $SAMPLER 2>/dev/null; exit 1; fi; }
-( while true; do ps -eo rss,args --sort=-rss | grep -E "wcd_pipeline|wcd " | grep -v grep | head -4 | awk -v t="$(date '+%T')" '{printf "%s %d MB %s\n", t, $1/1024, substr($0, index($0,$2), 70)}' >> "$MEM"; sleep 60; done ) &
+# memory sampler (BSD and GNU ps: no --sort, sort by hand)
+( while true; do ps -Ao rss,args | grep -E "wcd_pipeline|wcd " | grep -v grep | sort -nr | head -4 | awk -v t="$(date '+%T')" '{printf "%s %d MB %s\n", t, $1/1024, substr($0, index($0,$2), 70)}' >> "$MEM"; sleep 60; done ) &
 SAMPLER=$!
 if [ -z "$KEEP_SCHEMA" ]; then
   psql "$DATABASE_URL" -qc "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >> "$LOG" 2>&1 || { echo "cannot reset schema"; exit 1; }
