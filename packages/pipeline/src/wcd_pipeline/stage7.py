@@ -257,12 +257,14 @@ def step_e(pg) -> int:
     return n
 
 
-def step_f(pg, batch: int = 20000) -> int:
+def step_f(pg, dsn: str, batch: int = 20000) -> int:
     """Score every global source from its own columns plus the canonical
     member's ``id_tier`` / ``year_reliable`` / ``norm_subtype`` (parts on
     ``canonical_part_sha1``; the same content has the same fields)."""
     n = 0
-    read = psycopg2.connect(pg.dsn)
+    # A second connection for the named (server-side) read cursor. Not pg.dsn: psycopg2
+    # masks the password there ("password=xxx"), so it fails wherever auth needs one.
+    read = psycopg2.connect(dsn)
     try:
         with read.cursor(name="score_read") as rc, pg.cursor() as wc:
             rc.itersize = batch
@@ -482,7 +484,7 @@ def run(dsn: str, domain: str, parquet_base: str, steps=STEPS, force: bool = Fal
             elif s == "e":
                 counts["7e counts"] = step_e(pg)
             elif s == "f":
-                counts["7f scored"] = step_f(pg)
+                counts["7f scored"] = step_f(pg, dsn)
             elif s == "g":
                 counts["7g global_source_scores"] = step_g(pg, parquet_base)
             elif s == "h":
