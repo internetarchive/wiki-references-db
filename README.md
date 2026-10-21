@@ -41,9 +41,9 @@ docs/uva/       the UVA project's documentation, kept as the reference for packa
 scripts/        one-off tooling (fixture page selection and history export, extractor sample).
 ```
 
-Planned, not yet present: `apps/api` (FastAPI v2), `apps/frontend` (the
-dashboard), and pipeline Stages 4–8 wiring `wcd_semantic` to the data. See
-the implementation plan.
+`apps/api` (`wcd_api`) is the `/api/v2` FastAPI service over the built data
+(`apps/api/README.md`, `docs/design/proposed_api.md`). Planned, not yet
+present: `apps/frontend` (the dashboard, Phase 5).
 
 ## Setup
 

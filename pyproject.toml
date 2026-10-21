@@ -11,6 +11,7 @@ name = "wcd-workspace"
 version = "0.0.0"
 requires-python = ">=3.10"
 dependencies = [
+    "wcd-api",
     "wcd-pipeline",
     "wcd-schema",
     "wcd-semantic",
@@ -30,6 +31,7 @@ package = false
 members = ["packages/*", "apps/*"]
 
 [tool.uv.sources]
+wcd-api = { workspace = true }
 wcd-pipeline = { workspace = true }
 wcd-schema = { workspace = true }
 wcd-semantic = { workspace = true }
@@ -43,5 +45,6 @@ testpaths = [
     "packages/schema/tests",
     "packages/semantic/tests",
     "packages/pipeline/tests",
+    "apps/api/tests",
     "scripts/tests",
 ]
