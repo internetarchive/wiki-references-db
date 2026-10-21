@@ -88,7 +88,7 @@ def main(argv=None):
             if started and not done:
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [build_all] Clearing incomplete shard: {subdir}", flush=True)
                 for fname in os.listdir(subdir_path):
-                    if fname.endswith('.jsonl.zst') or fname.endswith('.parquet'):
+                    if fname.endswith('.jsonl.zst') or fname.endswith('.parquet') or fname == 'FAILED.txt':
                         os.remove(os.path.join(subdir_path, fname))
                 # Also remove stale STARTED.txt so it gets a fresh timestamp
                 os.remove(os.path.join(subdir_path, 'STARTED.txt'))
@@ -133,6 +133,7 @@ def main(argv=None):
             "--domain", args.domain,
             "--parquet-dir", args.parquet_dir,
             "--batch-size", os.environ.get("BATCH_SIZE", "1000"),
+            "--batch-bytes", os.environ.get("BATCH_BYTES", str(32 * 2**20)),
         ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
         slot = ProcessSlot(process, log_prefix, file, job_staging_dir)
@@ -162,6 +163,13 @@ def main(argv=None):
 
     # Final aggregate
     aggregate_and_print(all_slots, finished_count, len(files))
+    if FAILED_SHARDS:
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [build_all] {len(FAILED_SHARDS)} shard(s) FAILED: "
+              + ", ".join(f"{os.path.basename(p)} (exit {c})" for p, c in FAILED_SHARDS), flush=True)
+        raise SystemExit(1)
+
+
+FAILED_SHARDS = []
 
 
 def cleanup_finished_processes(process_queue, all_slots):
@@ -173,10 +181,19 @@ def cleanup_finished_processes(process_queue, all_slots):
         else:
             slot.finished = True
             newly_done += 1
-            # Write DONE.txt with current timestamp
             os.makedirs(slot.job_staging_dir, exist_ok=True)
-            with open(os.path.join(slot.job_staging_dir, 'DONE.txt'), 'w') as f:
-                f.write(datetime.now(timezone.utc).isoformat() + '\n')
+            code = slot.process.returncode
+            if code == 0:
+                # Write DONE.txt with current timestamp
+                with open(os.path.join(slot.job_staging_dir, 'DONE.txt'), 'w') as f:
+                    f.write(datetime.now(timezone.utc).isoformat() + '\n')
+            else:
+                # a crashed or killed worker (an OOM kill is -9) leaves STARTED.txt without DONE.txt,
+                # so the next run clears and redoes the shard; the run as a whole fails
+                with open(os.path.join(slot.job_staging_dir, 'FAILED.txt'), 'w') as f:
+                    f.write(f"{datetime.now(timezone.utc).isoformat()} exit code {code}\n")
+                FAILED_SHARDS.append((slot.filepath, code))
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {slot.log_prefix} [FAILED] {slot.filepath} (exit code {code})", flush=True)
             # Release subprocess resources
             slot.process.stdout.close()
             slot.process.wait()

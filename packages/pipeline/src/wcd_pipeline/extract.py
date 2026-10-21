@@ -345,6 +345,20 @@ def process_revisions(revisions, staging, outputs: TierOutputs, domain: str, sou
     }
 
 
+def _release_memory() -> None:
+    """Hand freed heap back to the OS after a batch (glibc keeps it otherwise;
+    on long-history pages the retained fragments add up to gigabytes)."""
+    import gc
+
+    gc.collect()
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 def source_stem_of(path: str) -> str:
     stem = os.path.basename(path)
     return stem[:-len('.mwrev.zst')] if stem.endswith('.mwrev.zst') else stem
@@ -358,6 +372,9 @@ def parse_args(argv=None):
     ap.add_argument('--parquet-dir', default=os.environ.get('PARQUET_DIR'),
                     help='Parquet tier base directory for citation_history / named_ref_uses / revision_signals (default: PARQUET_DIR)')
     ap.add_argument('--batch-size', type=int, default=1000, help='Revisions per processing batch (default: 1000)')
+    ap.add_argument('--batch-bytes', type=int, default=int(os.environ.get('BATCH_BYTES', 32 * 2**20)),
+                    help='Also flush a batch once its revision texts exceed this many bytes (default: BATCH_BYTES or 32 MiB); '
+                         'keeps memory flat on pages with very long revisions')
     ap.add_argument('--worker-id', default='00', help='Worker ID for parallel runs (default: 00)')
     args = ap.parse_args(argv)
     if not args.parquet_dir:
@@ -372,13 +389,15 @@ def main(argv=None):
     outputs = TierOutputs(args.staging_dir, args.parquet_dir, args.domain, stem)
 
     n_rev = 0
-    batch = []
+    batch, batch_bytes = [], 0
     for revision in get_revisions_from_mwrev_zst(args.file):
         batch.append(revision)
-        if len(batch) >= args.batch_size:
+        batch_bytes += len(revision['revision_text'])
+        if len(batch) >= args.batch_size or batch_bytes >= args.batch_bytes:
             process_revisions(batch, staging, outputs, domain=args.domain, source_stem=stem)
             n_rev += len(batch)
-            batch = []
+            batch, batch_bytes = [], 0
+            _release_memory()
     if batch:
         process_revisions(batch, staging, outputs, domain=args.domain, source_stem=stem)
         n_rev += len(batch)

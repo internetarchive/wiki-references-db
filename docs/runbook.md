@@ -56,11 +56,31 @@ uv run wcd materialize --domain en.wikipedia.org
 uv run wcd revision-stats --domain en.wikipedia.org --jobs 8
 ```
 
-Each command ends with its gate and exits non-zero on failure; a failed gate
-means *stop and look*, not retry. `wcd gate <0|3|4|5|6|7|8> --domain D`
+`scripts/run_pipeline.sh <bundles> <metadata> [domain] [jobs]` runs exactly
+this sequence with per-step timings and a memory sampler (it is how the
+rehearsal shard is run). Each command ends with its gate and exits non-zero on
+failure; a failed gate means *stop and look*, not retry. `wcd gate <0|3|4|5|6|7|8> --domain D`
 re-runs one on demand. The ci fixture shard runs this whole sequence in
 `packages/pipeline/tests/test_fixture_ci.py`; it is the rehearsal for any
 change to the order above.
+
+### Stage 1 memory and parallelism
+
+An extraction worker's memory is bounded by the batch it holds in flight:
+`--batch-size` revisions *or* `--batch-bytes` of revision text (`BATCH_BYTES`,
+default 32 MiB), whichever fills first. The byte cap is what matters on pages
+with long histories — a 1000-revision batch of a 150 KB article is 150 MB of
+text that expands roughly tenfold into extracted references, which is how a
+worker reached 3.3 GB and was OOM-killed on the rehearsal shard; with the cap
+the same shard runs at ~0.6 GB per worker. Budget about 20× `BATCH_BYTES` per
+worker, plus the DuckDB re-partition at the end of each shard.
+
+Stage 1 parallelises across bundles, one worker per bundle, so a single
+large bundle (one dump file, or a fixture built from one export) runs on one
+core; `scripts/split_bundle.py bundle.mwrev.zst -n 8 -o pieces/` cuts it on
+page boundaries first. A worker that crashes or is killed leaves
+`STARTED.txt` + `FAILED.txt` and no `DONE.txt`; `extract-all` reports it,
+exits non-zero, and the next run clears and redoes that shard only.
 
 ## What each step owns, and the unit of re-run
 

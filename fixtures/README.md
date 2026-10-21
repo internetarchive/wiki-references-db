@@ -98,6 +98,14 @@ How it is built (needs `CONTACT_EMAIL` in `.env`; run from the repository root):
 
 Commit `pages.tsv`, `pages*.txt`, `export.json` and the ci shard. The
 rehearsal bundle stays outside git; keep it with its `export.json` hashes.
+To run the rehearsal tier, split its single bundle so Stage 1 can use every
+core, then run the driver:
+
+```
+uv run python scripts/split_bundle.py data/fixture/shards/rehearsal/fixture.xml.mwrev.zst -n 8 -o data/fixture/shards/rehearsal/pieces
+DATABASE_URL=postgresql://…/wcd_rehearsal PARQUET_DIR=data/rehearsal/parquet \
+    scripts/run_pipeline.sh data/fixture/shards/rehearsal/pieces data/fixture/shards/rehearsal/meta.parquet en.wikipedia.org 8
+```
 
 `wcd fixture-dump` remains for cutting the same page list out of real
 `pages-meta-history` dumps (it reads `pages.txt`); note that it holds each
