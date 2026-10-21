@@ -226,3 +226,15 @@ def test_article_title_resolution_failure_is_503(synthetic):
         assert r.status_code == 503 and "Could not resolve" in r.json()["error"]
         # curid URLs never touch the site API
         assert c.get("/api/v2/article", params={"url": f"https://{D}/?curid={PAGE_A}"}).status_code == 200
+
+
+def test_frontend_is_served(synthetic):
+    from wcd_api.main import FRONTEND_DIR
+
+    assert (FRONTEND_DIR / "index.html").exists()
+    settings = Settings(database_url="postgresql+psycopg2://" + DSN.split("://", 1)[1], parquet_dir=synthetic["parquet_dir"])
+    with TestClient(create_app(settings, title_resolver=lambda *a: None)) as c:
+        index = c.get("/")
+        assert index.status_code == 200 and "Wikipedia Citations Database" in index.text and "UVA" not in index.text
+        assert c.get("/static/app.js").status_code == 200 and c.get("/static/styles.css").status_code == 200
+        assert 'API_BASE = "/api/v2"' in c.get("/static/app.js").text

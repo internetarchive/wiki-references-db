@@ -23,8 +23,8 @@ from .settings import Settings
 
 log = logging.getLogger("wcd_api")
 
-#: apps/frontend/dist (Phase 5) — served at / when present
-FRONTEND_DIR = Path(__file__).resolve().parents[3] / "frontend" / "dist"
+#: apps/frontend — the dashboard, served at / (and /static) when present
+FRONTEND_DIR = Path(__file__).resolve().parents[3] / "frontend"
 
 
 def create_app(settings: Settings | None = None, *, title_resolver=resolve_title, frontend_dir: Path | None = FRONTEND_DIR) -> FastAPI:

@@ -28,6 +28,9 @@ packages/
                 matching, reliability scoring. Pure functions, vendored from
                 the UVA Wikipedia Citations Database (see its NOTICE).
   pipeline/     `wcd_pipeline` and the `wcd` CLI: the build stages.
+apps/
+  api/          `wcd_api`: the /api/v2 FastAPI service (console script `wcd-api`).
+  frontend/     the page-analytics dashboard (static HTML/JS/CSS, served by the API).
 rust/
   revisionchest/  git submodule → internetarchive/RevisionChest, a Cargo workspace:
                   `mwdump` (streaming XML dump reader), `mwrev` (the .mwrev.zst
@@ -42,8 +45,8 @@ scripts/        one-off tooling (fixture page selection and history export, extr
 ```
 
 `apps/api` (`wcd_api`) is the `/api/v2` FastAPI service over the built data
-(`apps/api/README.md`, `docs/design/proposed_api.md`). Planned, not yet
-present: `apps/frontend` (the dashboard, Phase 5).
+(`apps/api/README.md`, `docs/design/proposed_api.md`); `apps/frontend` is the
+page-analytics dashboard it serves at `/` (`apps/frontend/README.md`).
 
 ## Setup
 

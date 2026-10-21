@@ -29,6 +29,7 @@ package = false
 
 [tool.uv.workspace]
 members = ["packages/*", "apps/*"]
+exclude = ["apps/frontend"]   # static files, not a Python package
 
 [tool.uv.sources]
 wcd-api = { workspace = true }

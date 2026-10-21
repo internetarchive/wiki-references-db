@@ -28,7 +28,7 @@ Settings (environment / `.env`): `DATABASE_URL` or `DB_*`; `PARQUET_DIR`;
 `API_DEFAULT_DOMAIN` (en.wikipedia.org); `API_CORS_ORIGINS` (comma-separated,
 default `*`); `API_POOL_SIZE` (Postgres connections, 5);
 `WIKIPEDIA_API_USER_AGENT` / `WIKIPEDIA_API_CONTACT_EMAIL` for title lookups.
-When `apps/frontend/dist/` exists it is served at `/` (Phase 5).
+The dashboard in `apps/frontend/` is served at `/` (assets under `/static/`).
 
 Tests (`apps/api/tests`) build the synthetic pipeline database
 (`wcd_pipeline.synthetic.build_database`, a few seconds) and exercise every
