@@ -107,6 +107,11 @@ DATABASE_URL=postgresql://…/wcd_rehearsal PARQUET_DIR=data/rehearsal/parquet \
     scripts/run_pipeline.sh data/fixture/shards/rehearsal/pieces data/fixture/shards/rehearsal/meta.parquet en.wikipedia.org 8
 ```
 
+After an extractor or normalizer change, Stage 1's output is stale: remove
+the run's staging directory (`data/rehearsal/staging` here — `extract-all`
+would otherwise skip every piece marked `DONE`) and run the driver again; it
+recreates the schema and redoes everything from Stage 0.
+
 `wcd fixture-dump` remains for cutting the same page list out of real
 `pages-meta-history` dumps (it reads `pages.txt`); note that it holds each
 `<page>` element in memory until the page ends.

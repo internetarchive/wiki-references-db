@@ -1,11 +1,11 @@
 {
   "shard": "fixtures/shards/ci",
   "coverage": {
-    "citation_instances": 8874,
-    "global_sources": 2585,
+    "citation_instances": 8875,
+    "global_sources": 2580,
     "global_sources_multi_page": 6,
     "named_ref_uses": 207324,
-    "normalized_citations": 8297,
+    "normalized_citations": 8298,
     "pages": 51,
     "parts_sfn": 502,
     "parts_with_arxiv": 0,
@@ -15,13 +15,13 @@
     "parts_with_pmid": 1751,
     "parts_with_wikidata_qid": 0,
     "revisions": 17432,
-    "type:bare_url": 309,
+    "type:bare_url": 305,
     "type:endnote": 1533,
-    "type:external_link": 310,
-    "type:ref_tag": 953,
+    "type:external_link": 311,
+    "type:ref_tag": 957,
     "type:shorthand": 507,
     "type:template": 4685,
-    "verdict:high_confidence": 2138,
+    "verdict:high_confidence": 2133,
     "verdict:likely_not_citation": 44,
     "verdict:low_confidence": 84,
     "verdict:medium_confidence": 15,
@@ -29,7 +29,7 @@
   },
   "snapshots": {
     "pg.citation_instances": {
-      "rows": 8874,
+      "rows": 8875,
       "columns": [
         "id",
         "domain_id__value",
@@ -42,7 +42,7 @@
       "stored": "full"
     },
     "pg.citation_source_resolution": {
-      "rows": 8754,
+      "rows": 8755,
       "columns": [
         "normalized_id__normalized_sha1",
         "part_index",
@@ -79,7 +79,7 @@
       "stored": "full"
     },
     "pg.domains": {
-      "rows": 960,
+      "rows": 954,
       "columns": [
         "value",
         "top_level_domain",
@@ -90,7 +90,7 @@
       "stored": "full"
     },
     "pg.global_sources": {
-      "rows": 2585,
+      "rows": 2580,
       "columns": [
         "global_source_id",
         "match_type",
@@ -116,7 +116,7 @@
       "stored": "full"
     },
     "pg.normalized_citation_parts": {
-      "rows": 8675,
+      "rows": 8676,
       "columns": [
         "normalized_id__normalized_sha1",
         "part_index",
@@ -161,7 +161,7 @@
       "stored": "full"
     },
     "pg.normalized_citation_web_resources": {
-      "rows": 5497,
+      "rows": 5495,
       "columns": [
         "normalized_id__normalized_sha1",
         "web_resource_id__url_hash"
@@ -169,7 +169,7 @@
       "stored": "full"
     },
     "pg.normalized_citations": {
-      "rows": 8297,
+      "rows": 8298,
       "columns": [
         "normalized_sha1",
         "reference_normalized",
@@ -190,7 +190,7 @@
       "stored": "full"
     },
     "pg.page_source_summary": {
-      "rows": 2602,
+      "rows": 2597,
       "columns": [
         "domain_id__value",
         "page_id",
@@ -282,7 +282,7 @@
       "stored": "fingerprint"
     },
     "pg.web_resources": {
-      "rows": 2618,
+      "rows": 2533,
       "columns": [
         "url",
         "url_hash",
@@ -306,7 +306,7 @@
       "stored": "full"
     },
     "pq.citation_history": {
-      "rows": 576037,
+      "rows": 576038,
       "columns": [
         "citation_instance_id",
         "revision_id",
@@ -315,7 +315,7 @@
       "stored": "fingerprint"
     },
     "pq.citation_instances_denorm": {
-      "rows": 9252,
+      "rows": 9253,
       "columns": [
         "citation_instance_id",
         "page_id",
@@ -360,7 +360,7 @@
       "stored": "full"
     },
     "pq.global_source_scores": {
-      "rows": 2585,
+      "rows": 2580,
       "columns": [
         "global_source_id",
         "n_pages",
@@ -383,7 +383,7 @@
       "stored": "full"
     },
     "pq.matching_intermediate.global_source_map": {
-      "rows": 2602,
+      "rows": 2597,
       "columns": [
         "merged_source_id",
         "global_source_id",
@@ -394,7 +394,7 @@
       "stored": "full"
     },
     "pq.matching_intermediate.global_sources_stage": {
-      "rows": 2585,
+      "rows": 2580,
       "columns": [
         "global_source_id",
         "match_type",
@@ -431,7 +431,7 @@
       "stored": "full"
     },
     "pq.matching_intermediate.merged_sources": {
-      "rows": 2602,
+      "rows": 2597,
       "columns": [
         "merged_source_id",
         "page_id",
@@ -461,7 +461,7 @@
       "stored": "full"
     },
     "pq.matching_intermediate.sources": {
-      "rows": 1684,
+      "rows": 1679,
       "columns": [
         "source_id",
         "page_id",
@@ -592,25 +592,25 @@
     }
   },
   "timings_seconds": {
-    "init-db --no-indexes": 0.05,
-    "stage0-load": 0.34,
-    "gate 0": 0.02,
-    "extract-all": 360.37,
-    "dedup": 0.13,
-    "load": 7.89,
-    "gate 3": 0.12,
-    "init-db --add-indexes": 0.33,
-    "parts": 1.69,
+    "init-db --no-indexes": 0.1,
+    "stage0-load": 0.73,
+    "gate 0": 0.03,
+    "extract-all": 471.35,
+    "dedup": 0.37,
+    "load": 9.38,
+    "gate 3": 0.18,
+    "init-db --add-indexes": 0.27,
+    "parts": 1.94,
     "gate 4": 0.02,
-    "denorm-export": 0.51,
-    "ref-name-links": 1.48,
-    "gate 5": 0.03,
-    "match": 8.54,
-    "gate 6": 0.02,
-    "materialize": 2.46,
-    "gate 7": 0.05,
-    "revision-stats": 0.57,
+    "denorm-export": 0.71,
+    "ref-name-links": 3.25,
+    "gate 5": 0.04,
+    "match": 5.89,
+    "gate 6": 0.04,
+    "materialize": 6.37,
+    "gate 7": 0.08,
+    "revision-stats": 1.7,
     "gate 8": 0.02
   },
-  "recorded": "2026-10-20T19:39:04+00:00"
+  "recorded": "2026-10-22T00:33:16+00:00"
 }
