@@ -29,7 +29,7 @@ def test_copy_round_trips_values(tmp_path, chunk_rows):
         session.execute(text("CREATE TABLE _copy_target (k integer PRIMARY KEY, v text)"))
         session.commit()
         staged, written = copy_parquet_in_chunks(
-            session, str(path), temp_table="_copy_stage", temp_ddl="k integer, v text",
+            session, f"SELECT k, v FROM read_parquet('{path}')", temp_table="_copy_stage", temp_ddl="k integer, v text",
             columns=["k", "v"], insert_sql="INSERT INTO _copy_target SELECT k, v FROM _copy_stage",
             chunk_rows=chunk_rows)
         assert (staged, written) == (len(VALUES), len(VALUES))
