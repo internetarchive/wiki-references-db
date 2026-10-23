@@ -20,6 +20,7 @@ Usage:
     wcd load --tables containers domains
 """
 
+import io
 import itertools
 import os
 import time
@@ -28,6 +29,7 @@ from collections import OrderedDict
 
 
 import duckdb
+import pyarrow.csv as pa_csv
 from sqlalchemy import create_engine, select as sa_select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -47,6 +49,8 @@ def make_session():
 
 
 BATCH_SIZE = int(os.getenv('LOAD_BATCH_SIZE', '5000'))
+# Rows per COPY chunk for the set-based loaders (one transaction per chunk).
+COPY_ROWS = int(os.getenv('LOAD_COPY_ROWS', '1000000'))
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +93,50 @@ def read_parquet_batches(filepath, batch_size=BATCH_SIZE):
             batch.append(d)
         yield batch
     con.close()
+
+
+def copy_parquet_in_chunks(session, filepath, temp_table, temp_ddl, columns, insert_sql, chunk_rows=None):
+    """Set-based load: stream ``columns`` of a Parquet file into a temporary
+    table with ``COPY … CSV``, ``chunk_rows`` at a time, and after each chunk
+    run ``insert_sql`` (an ``INSERT … SELECT`` from the temp table that resolves
+    ids by joining in Postgres) and commit. Returns (rows staged, rows written).
+
+    This replaces per-batch Python id lookups and multi-row ``INSERT … VALUES``
+    statements, which ran at ~10k rows/s; the rows themselves never become
+    Python objects. NULLs travel as unquoted empty CSV fields and every
+    non-NULL value is quoted, so an empty string stays an empty string.
+    """
+    chunk_rows = chunk_rows or COPY_ROWS
+    dbapi = session.connection().connection.dbapi_connection
+    cur = dbapi.cursor()
+    cur.execute(f"CREATE TEMP TABLE IF NOT EXISTS {temp_table} ({temp_ddl})")
+    col_list = ", ".join(columns)
+    options = pa_csv.WriteOptions(include_header=False, quoting_style="all_valid")
+    con = duckdb.connect()
+    staged = written = 0
+    try:
+        reader = con.execute(
+            f"SELECT {col_list} FROM read_parquet(?)", [filepath]
+        ).fetch_record_batch(chunk_rows)
+        for batch in reader:
+            if batch.num_rows == 0:
+                continue
+            buf = io.BytesIO()
+            pa_csv.write_csv(batch, buf, write_options=options)
+            buf.seek(0)
+            cur.execute(f"TRUNCATE {temp_table}")
+            cur.copy_expert(f"COPY {temp_table} ({col_list}) FROM STDIN WITH (FORMAT csv)", buf)
+            cur.execute(insert_sql)
+            written += cur.rowcount
+            staged += batch.num_rows
+            dbapi.commit()
+    except Exception:
+        dbapi.rollback()
+        raise
+    finally:
+        con.close()
+        cur.close()
+    return staged, written
 
 
 def chunked_iterable(iterable, n):
@@ -344,73 +392,44 @@ def load_ncwr(session, staging_dir):
     log(f"ncwr: {count} rows loaded")
 
 
+# template_data rows resolve three ids by joining in Postgres. Rows whose
+# domain, template or normalized citation is unknown are dropped (inner
+# joins), as the batch loader did. dedup makes the staged rows unique on
+# (domain_label, template_name, normalized_sha1, offset_start, parameter_key),
+# so each primary key appears at most once per statement; if that ever stopped
+# holding, Postgres would refuse the INSERT ("cannot affect row a second time")
+# rather than silently pick one.
+_TEMPLATE_DATA_INSERT = """
+    INSERT INTO template_data
+        (wiki_template_id, normalized_id, offset_start, parameter_key, parameter_key_md5, parameter_value)
+    SELECT w.id, nc.id, s.offset_start, s.parameter_key, md5(s.parameter_key), s.parameter_value
+    FROM _load_template_data s
+    JOIN domains d ON d.value = s.domain_label
+    JOIN wiki_templates w ON w.domain = d.id AND w.name = s.template_name
+    JOIN normalized_citations nc ON nc.normalized_sha1 = s.normalized_sha1
+    WHERE s.offset_start IS NOT NULL AND s.parameter_key IS NOT NULL
+    ON CONFLICT (wiki_template_id, normalized_id, offset_start, parameter_key_md5)
+    DO UPDATE SET parameter_value = EXCLUDED.parameter_value
+"""
+
+
 def load_template_data(session, staging_dir):
     filepath = find_deduped_parquet(staging_dir, 'template_data')
     if not filepath:
         return
     log(f"template_data: loading from {filepath}")
-
-    count = 0
-    for batch in read_parquet_batches(filepath):
-        # Resolve domain labels and template names to ids
-        domain_labels = set(r['domain_label'] for r in batch)
-        domain_to_id = {}
-        if domain_labels:
-            result = session.execute(
-                sa_select(Domain.value, Domain.id).where(Domain.value.in_(list(domain_labels)))
-            ).all()
-            domain_to_id = {v: i for v, i in result}
-
-        # Resolve template ids
-        tpl_keys = set()
-        for r in batch:
-            dom_id = domain_to_id.get(r['domain_label'])
-            if dom_id is not None:
-                tpl_keys.add((dom_id, r['template_name']))
-
-        template_key_to_id = {}
-        if tpl_keys:
-            from sqlalchemy import tuple_
-            result = session.execute(
-                sa_select(WikiTemplate.domain, WikiTemplate.name, WikiTemplate.id)
-                .where(tuple_(WikiTemplate.domain, WikiTemplate.name).in_(list(tpl_keys)))
-            ).all()
-            template_key_to_id = {(d, n): i for d, n, i in result}
-
-        # Resolve normalized_sha1 -> normalized_id
-        sha1s = list(set(r['normalized_sha1'] for r in batch))
-        sha1_to_id = {}
-        for chunk in chunked_iterable(sha1s, 1000):
-            result = session.execute(
-                sa_select(NormalizedCitation.normalized_sha1, NormalizedCitation.id)
-                .where(NormalizedCitation.normalized_sha1.in_(chunk))
-            ).all()
-            sha1_to_id.update({s: i for s, i in result})
-
-        cleaned = []
-        for r in batch:
-            dom_id = domain_to_id.get(r['domain_label'])
-            if dom_id is None:
-                continue
-            tpl_id = template_key_to_id.get((dom_id, r['template_name']))
-            if tpl_id is None:
-                continue
-            norm_id = sha1_to_id.get(r['normalized_sha1'])
-            if norm_id is None:
-                continue
-            cleaned.append({
-                'wiki_template_id': tpl_id,
-                'normalized_id': norm_id,
-                'offset_start': r['offset_start'],
-                'parameter_key': r['parameter_key'],
-                'parameter_value': r.get('parameter_value'),
-            })
-
-        if cleaned:
-            TemplateData.bulk_upsert(session, cleaned)
-            session.commit()
-            count += len(cleaned)
-    log(f"template_data: {count} rows loaded")
+    staged, written = copy_parquet_in_chunks(
+        session, filepath,
+        temp_table='_load_template_data',
+        temp_ddl='domain_label text, template_name text, normalized_sha1 text, '
+                 'offset_start integer, parameter_key text, parameter_value text',
+        columns=['domain_label', 'template_name', 'normalized_sha1', 'offset_start',
+                 'parameter_key', 'parameter_value'],
+        insert_sql=_TEMPLATE_DATA_INSERT,
+    )
+    if staged != written:
+        log(f"template_data: warning: {staged - written} rows skipped (unknown domain, template or normalized citation)")
+    log(f"template_data: {written} rows loaded")
 
 
 # ---------------------------------------------------------------------------
