@@ -459,3 +459,21 @@ Measured with both changes, against the previous binary: the typical file went f
 **Still open:** zstd long-distance matching (a format decision, as above). `build -d` writes all metadata through one sink thread and one Parquet file, which may limit a many-core `-d` run. The per-file runs avoided this, and it has not been measured. Element names are still allocated as a `String` per XML element. history10 is now bound by LZMA decoding itself (568 GB in ~350 s, ~1.6 GB/s). Its block is a single LZMA2 stream, so unwanted pages can't be skipped before decompression, and further gains there would have to come from the decoder.
 
 **Open before the follow-up:** the bundle writer hands zstd one line at a time (`ZSTD_compressStream` plus `Counting::write_all`, ~7 %). Stdout mode (no `-o`) is line-buffered and ~3× slower. The XML reader copies each revision's text 3–4 times. `build -d` goes in name order, so the slowest file can start last. zstd long-distance matching (`--long=27`) roughly halves bundle size (194 → 101 MB on the typical file), but every bundle reader, Rust and Python, would need a 128 MB window limit, so it is a format decision rather than a tuning change.
+
+**Follow-up: zstd long-distance matching** (RevisionChest `fc1d711`, pointer `af53f83`; Python readers `963bd2a`). Bundle frames are now written with long-distance matching and a 128 MiB window (`mwrev::WINDOW_LOG` = 27). The note above was wrong to call this a format decision needing reader changes. 2^27 is libzstd's default *decoder* limit, so the zstd crate, python-zstandard and `zstd -d` all read the new bundles with default settings. RevisionChest 0.1 readers read them too, and old bundles read as before. A window of 2^28 is refused by default readers, and it compressed no smaller. Measured on enwiki-20261001, namespace 0:
+
+| | 2 MiB window | 128 MiB + LDM |
+|---|---|---|
+| history19 bundle | 194 MB | **101 MB** |
+| history19 wall / CPU | 51 s / 85 s | 62 s / 97 s |
+| history10 bundle | 66 MB | **35 MB** |
+| history10 wall / CPU | 349 s / 473 s | 351 s / 467 s |
+| RevisionChest RSS | 125–160 MB | 265–290 MB |
+| Stage-1 reader RSS (python-zstandard) | ~40 MB | ~145 MB |
+
+Decompressed content and metadata are byte-identical, and `fixtures/golden/stage0` matches the new binary (run by hand: no Postgres here). With the zstd CLI on the same 20 GB stream, the 128 MiB window alone gives 116 MB at the default level's CPU cost (18.5 s), and LDM takes it to 101 MB for about 15 more CPU-seconds. For enwiki that is an estimated ~105 GB of bundles instead of 201.7 GB.
+
+**Decisions taken without asking:** LDM on, not just the window: Stage 0 was download-bound and bundles are stored and read many times. Window-only is the fallback if Stage-0 CPU ever matters more than ~13 % of bundle size. `scripts/split_bundle.py` keeps writing its pieces at plain level 3, because N open long-window compressors would cost N × ~150 MB for disposable files. Both Python readers now pass `read_across_frames=True`. python-zstandard 0.25 already reads across frames in chunked reads, but the parameter is documented to default to `False`, and `sync` bundles hold a frame per batch. The committed ci fixture bundle stays as it was (2 MiB window): it doubles as the old-format compatibility case.
+
+**Open:** re-run Stage 0 for enwiki with the new binary so the bundle size and run time are measured rather than estimated. Stage 1's memory budget now includes ~105 MB per worker for the decoder window (runbook).
+

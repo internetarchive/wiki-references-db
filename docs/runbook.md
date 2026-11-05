@@ -20,6 +20,13 @@ Postgres 16 and Python ≥ 3.10 with `uv sync`; Rust ≥ 1.85 only to build
 RevisionChest (`cargo build --release` in `rust/revisionchest`; CI also
 publishes the Linux binary as a workflow artifact).
 
+RevisionChest `build` holds one dump file per job: about 300 MB RSS each
+(the 128 MiB zstd window of its bundle encoder included), and about 1.5 cores,
+since 7z decoding runs on its own thread. On enwiki-20261001 the 7z set
+(240.7 GB, 980 files) gave 201.7 GB of namespace-0 bundles before the
+128 MiB window and an estimated ~105 GB with it (from two files, both −47 %),
+plus 48 GB of metadata; see the plan, §17.
+
 ## Full build, one domain
 
 ```
@@ -73,7 +80,10 @@ with long histories — a 1000-revision batch of a 150 KB article is 150 MB of
 text that expands roughly tenfold into extracted references, which is how a
 worker reached 3.3 GB and was OOM-killed on the rehearsal shard; with the cap
 the same shard runs at ~0.6 GB per worker. Budget about 20× `BATCH_BYTES` per
-worker, plus the DuckDB re-partition at the end of each shard.
+worker, plus up to 128 MiB for the bundle decoder's window (RevisionChest
+writes bundles with a 128 MiB long-distance window; reading an enwiki bundle
+measured ~145 MB RSS against ~40 MB for the older 2 MiB-window bundles), plus
+the DuckDB re-partition at the end of each shard.
 
 Stage 1 parallelises across bundles, one worker per bundle, so a single
 large bundle (one dump file, or a fixture built from one export) runs on one
