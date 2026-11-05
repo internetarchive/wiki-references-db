@@ -56,3 +56,19 @@ def test_extracting_pieces_equals_extracting_whole(bundle, tmp_path):
     # two pieces → two files per touched bucket dataset, named after their shard
     files = sorted(p.name for p in layout.dataset_dir(tmp_path / "split" / "parquet", "citation_history").rglob("*.parquet"))
     assert files == ["synthetic-0-0.parquet", "synthetic-1-0.parquet"]
+
+
+def test_split_reads_every_frame(tmp_path):
+    raw = render()
+    cut = raw.index(b"\n#", len(raw) // 2) + 1
+    whole = tmp_path / "whole.mwrev.zst"
+    whole.write_bytes(zstd.ZstdCompressor(level=3).compress(raw))
+    framed = tmp_path / "framed.mwrev.zst"
+    long = zstd.ZstdCompressionParameters.from_level(3, window_log=27, enable_ldm=True)
+    framed.write_bytes(zstd.ZstdCompressor(level=3).compress(raw[:cut])
+                       + zstd.ZstdCompressor(compression_params=long).compress(raw[cut:]))
+    a = split(str(whole), 2, str(tmp_path / "a"))
+    b = split(str(framed), 2, str(tmp_path / "b"))
+    assert [(pages, revs) for _, pages, revs in a] == [(pages, revs) for _, pages, revs in b]
+    for (pa, _, _), (pb, _, _) in zip(a, b):
+        assert list(get_revisions_from_mwrev_zst(pa)) == list(get_revisions_from_mwrev_zst(pb))

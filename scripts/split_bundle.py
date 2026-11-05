@@ -9,6 +9,10 @@ workers. Offsets inside the bundle are not preserved (Stage 1 never reads
 them; they live in the Stage-0 metadata, which still refers to the original
 bundle).
 
+The pieces are written at plain zstd level 3, not with RevisionChest's
+128 MiB long-distance window: they are disposable Stage-1 input, and N open
+long-window compressors would cost N × ~150 MB. Any zstd reader reads both.
+
     uv run python scripts/split_bundle.py fixture.xml.mwrev.zst -n 4 -o shards/
     # → shards/fixture.xml-0.mwrev.zst … fixture.xml-3.mwrev.zst
 """
@@ -35,7 +39,9 @@ def split(path: str, n: int, out_dir: str, level: int = 3) -> list[tuple[str, in
     target = None
     k = -1
     with open(path, "rb") as fh:
-        reader = io.TextIOWrapper(zstd.ZstdDecompressor().stream_reader(fh), encoding="utf-8")
+        reader = io.TextIOWrapper(
+            zstd.ZstdDecompressor().stream_reader(fh, read_across_frames=True), encoding="utf-8"
+        )
         for line in reader:
             if line.startswith("#"):
                 page_id = None

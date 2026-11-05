@@ -129,10 +129,15 @@ def get_revisions_from_mwrev_zst(filename):
       - Lines starting with a single space ' ' belong to the revision text.
     Required metadata keys:
       page_id, rev_id, parent_rev_id (optional/empty), timestamp
+
+    The zstd stream may hold several frames (RevisionChest `sync` appends a
+    frame per batch), and RevisionChest writes frames with a 128 MiB window
+    and long-distance matching: zstd's default decoder limit, so no window
+    setting is needed here, at the cost of up to 128 MiB per open bundle.
     """
     dctx = zstd.ZstdDecompressor()
     with open(filename, 'rb') as fh:
-        with dctx.stream_reader(fh) as reader:
+        with dctx.stream_reader(fh, read_across_frames=True) as reader:
             text_stream = io.TextIOWrapper(reader, encoding='utf-8')
             current = None
             text_lines = []
