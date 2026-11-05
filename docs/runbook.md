@@ -23,9 +23,10 @@ publishes the Linux binary as a workflow artifact).
 RevisionChest `build` holds one dump file per job: about 300 MB RSS each
 (the 128 MiB zstd window of its bundle encoder included), and about 1.5 cores,
 since 7z decoding runs on its own thread. On enwiki-20261001 the 7z set
-(240.7 GB, 980 files) gave 201.7 GB of namespace-0 bundles before the
-128 MiB window and an estimated ~105 GB with it (from two files, both −47 %),
-plus 48 GB of metadata; see the plan, §17.
+(240.7 GB, 980 files) gave 90.2 GB of namespace-0 bundles with the 128 MiB
+window (201.7 GB before it) and 49.6 GB of metadata in one Parquet file, in
+2 h 08 min with `build -d -j 18` on 28 cores (45 core-hours, 3.8 GB peak
+RSS); see the plan, §17.
 
 ## Full build, one domain
 

@@ -475,5 +475,19 @@ Decompressed content and metadata are byte-identical, and `fixtures/golden/stage
 
 **Decisions taken without asking:** LDM on, not just the window: Stage 0 was download-bound and bundles are stored and read many times. Window-only is the fallback if Stage-0 CPU ever matters more than ~13 % of bundle size. `scripts/split_bundle.py` keeps writing its pieces at plain level 3, because N open long-window compressors would cost N × ~150 MB for disposable files. Both Python readers now pass `read_across_frames=True`. python-zstandard 0.25 already reads across frames in chunked reads, but the parameter is documented to default to `False`, and `sync` bundles hold a frame per batch. The committed ci fixture bundle stays as it was (2 MiB window): it doubles as the old-format compatibility case.
 
-**Open:** re-run Stage 0 for enwiki with the new binary so the bundle size and run time are measured rather than estimated. Stage 1's memory budget now includes ~105 MB per worker for the decoder window (runbook).
+Stage 1's memory budget now includes ~105 MB per worker for the decoder window (runbook).
+
+**Follow-up: full re-run with `build -d`.** enwiki-20261001 was built again from the kept 7z files with the binary at `fc1d711`, as one `RevisionChest build -d … --namespace 0 -j 18` with one metadata file, on the same 28-core VM. A sampler read the process's and the metadata thread's CPU from `/proc` every minute.
+
+| | First run (per file, during download) | `build -d`, all fixes |
+|---|---|---|
+| Wall time | 5 h 13 min (download-bound) | **2 h 08 min** (no download) |
+| CPU | 62.7 core-hours | **45.2 core-hours** |
+| Bundles | 201.7 GB | **90.2 GB** |
+| Metadata | 47.8 GB (980 files) | 49.6 GB (1 file) |
+| Peak RSS | ≤171 MB per file | 3.8 GB for 18 jobs |
+
+All 980 files built. The metadata is identical: 19,314,502 pages and 895,604,187 revisions, with equal per-type checksums over every column. Five sampled bundles, history10 among them, decompress byte-identical to the first run's. Bundles came out 55 % smaller, more than the −47 % the two test files suggested; the early page ranges gained most (history1 p3395p3995: 307 → 58 MB). The shared metadata thread averaged 45 % of a core and peaked at 54 %, so the single sink is not a bottleneck at this scale. The process averaged 21.2 of 28 cores (each job ~1.2 cores, the big files decode-bound), so `-j 22`–`24` should fill the machine; not measured. With largest-first ordering there was no tail: the last minute still had 23 cores busy.
+
+**Open:** nothing in Stage 0 itself. `wcd stage0-load` on the new metadata waits on a Postgres instance. The first run's bundles (201.7 GB) are still on the VM next to the new ones.
 
