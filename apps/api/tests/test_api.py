@@ -178,8 +178,8 @@ def test_citation_detail_and_history(client):
 def test_template_report_and_web_resources(client):
     s, j = get(client, f"/api/v2/pages/{D}/{PAGE_B}/citations")
     tpl = next(t for c in j["citations"] for t in c["templates"] if t["template_name"] == "Cite book")
-    # parameter values are stored as written in the wikitext (here with the trailing space before the next pipe)
-    s, j = get(client, f"/api/v2/templates/{tpl['wiki_template_id']}/report", parameter_key="last", parameter_value="Diamond ")
+    # parameter values are stored trimmed, like keys (the wikitext has "Diamond " before the next pipe)
+    s, j = get(client, f"/api/v2/templates/{tpl['wiki_template_id']}/report", parameter_key="last", parameter_value="Diamond")
     assert s == 200 and j["template_name"] == "Cite book" and j["domain"] == D and j["total"] == 3
     assert all(c["appears_on_domain"] == D and c["appears_on_article"] == c["appears_on_page_id"] for c in j["citations"])
     assert get(client, "/api/v2/templates/999999/report", parameter_key="x", parameter_value="y")[0] == 404
