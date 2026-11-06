@@ -12,7 +12,8 @@ repository root with `.env` filled in (`example.env`).
 |---|---|---|
 | `DATABASE_URL` (or `DB_*`) | every Postgres step, the API | the serving database |
 | `PARQUET_DIR` | Stages 1, 3–8, the API | the Parquet tier: `<dataset>/domain=<d>/page_bucket=<n>/` |
-| `STAGING_DIR` | Stages 1, 3 | per-shard staging Parquet, consumed by `dedup`/`load`, disposable afterwards |
+| `STAGING_DIR` | Stages 0, 1, 3 | per-shard staging Parquet, consumed by `dedup`/`load`, disposable afterwards; Stage 0's default `--work-dir` |
+| `STAGE0_MEMORY_LIMIT` | Stage 0 | DuckDB memory limit for `stage0-load` (default for `--memory-limit`) |
 | `REVISION_BUNDLES_DIR` | Stage 1 | the `.mwrev.zst` bundles, one directory per domain |
 | `API_*`, `WIKIPEDIA_API_*` | the API | CORS, default domain, pool size, User-Agent for title lookups |
 
@@ -115,9 +116,15 @@ Parquet dataset and runs gate 0:
   has duplicates (overlapping `sync` files); an exact count decides, in seconds.
 
 **Memory.** DuckDB's sorts take up to 80 % of the RAM it can see, on top of
-Postgres' `shared_buffers`, with no swap to fall back on. Run the load in a
-memory-capped scope so DuckDB sizes itself to the cap (it reads cgroup
-limits) and Postgres keeps its share:
+Postgres' `shared_buffers`, with no swap to fall back on. Set
+`--memory-limit` (or `STAGE0_MEMORY_LIMIT`), which applies to each of the
+loader's DuckDB connections. The process runs ~5–7 GB above it (Python,
+Arrow, allocations outside DuckDB's buffer manager): on enwiki the Parquet
+step peaked at 27.2 GB RSS with `--memory-limit 20GB` (476 s, against 395 s
+with ~29 GB). Leave the rest of RAM to Postgres and the OS cache.
+
+Alternatively, or as a hard backstop, run the load in a memory-capped scope;
+DuckDB reads the cgroup limit and sizes itself to 80 % of it:
 
 ```
 sudo systemd-run --scope --uid=$USER --gid=$(id -g) -p MemoryMax=36G \
@@ -129,8 +136,9 @@ With `MemoryMax=36G` DuckDB limits itself to 28.7 GiB; the enwiki load peaked
 at 37 GB RSS (DuckDB plus Python and Arrow).
 
 **Disk.** `--work-dir` holds the sorted file (~19 bytes per revision) and
-DuckDB's sort spill: 45 GB at the peak for enwiki. The Parquet step spills to
-`.tmp` in the current directory. `revisions` itself is ~100 bytes per
+DuckDB's spill for both the revision sort and the Parquet step, each in its
+own temporary directory removed afterwards: 45–50 GB at the peak for enwiki
+(more with a lower memory limit). `revisions` itself is ~100 bytes per
 revision (enwiki: 70 GB heap and 19 GB primary key).
 
 **Time, enwiki-20261001** (19.3M pages, 895.6M namespace-0 revisions,
