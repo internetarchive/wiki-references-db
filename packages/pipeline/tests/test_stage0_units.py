@@ -46,3 +46,46 @@ def test_units_cover_every_revision_once(tmp_path, monkeypatch):
     # bundle ids resolved in the file
     got = dict(con.execute(f"SELECT rev_id, bundle_id FROM '{f}'").fetchall())
     assert all(got[r] == bundles[f"b{r % 3}.mwrev.zst"] for r in rev_ids)
+
+
+def test_memory_limit_values():
+    for ok in ("24GB", "512MiB", " 1.5 gb ", "100MB"):
+        assert stage0.check_memory_limit(ok) == ok
+    assert stage0.check_memory_limit(None) is None
+    for bad in ("lots", "24", "1GB'; DROP TABLE x; --", "GB"):
+        try:
+            stage0.check_memory_limit(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+
+
+def test_connections_get_the_memory_limit_and_spill_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(stage0, "MEMORY_LIMIT", "1GB")
+    con = stage0._duckdb(temp_dir=str(tmp_path / "spill"))
+    limit, temp = con.execute("SELECT current_setting('memory_limit'), current_setting('temp_directory')").fetchone()
+    assert limit in ("953.6 MiB", "1.0 GB", "1GB"), limit
+    assert temp == str(tmp_path / "spill")
+    monkeypatch.setattr(stage0, "MEMORY_LIMIT", None)
+    assert stage0._duckdb().execute("SELECT current_setting('memory_limit')").fetchone()[0] != limit
+
+
+def test_cli_rejects_a_bad_memory_limit(capsys):
+    try:
+        stage0.main(["--domain", "x.org", "--metadata", "m.parquet", "--no-postgres", "--parquet-dir", "p",
+                     "--memory-limit", "plenty"])
+    except SystemExit as e:
+        assert e.code == 2
+    else:
+        raise AssertionError("accepted --memory-limit plenty")
+    assert "not a memory size" in capsys.readouterr().err
+
+
+def test_parquet_step_spills_under_the_work_dir_and_cleans_up(tmp_path, monkeypatch):
+    meta = tmp_path / "meta.parquet"
+    rev_ids = _metadata(meta, n=3000)
+    work = tmp_path / "work"
+    monkeypatch.setattr(stage0, "MEMORY_LIMIT", "512MB")
+    n = stage0.write_revisions_parquet(str(meta), "x.wikipedia.org", str(tmp_path / "pq"), work_dir=str(work))
+    assert n == len(rev_ids)
+    assert work.is_dir() and not list(work.iterdir())

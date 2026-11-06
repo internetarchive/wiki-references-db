@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import re
 import shutil
 import time
 
@@ -43,6 +44,30 @@ from .config import database_url, load_dotenv  # noqa: F401
 BATCH = 100_000
 NULL = "\\N"   # COPY text-format NULL
 
+# DuckDB memory limit for every connection this module opens (--memory-limit /
+# STAGE0_MEMORY_LIMIT). None leaves DuckDB's default: 80 % of the RAM it can
+# see, which next to Postgres' shared_buffers on the same host is too much.
+MEMORY_LIMIT: str | None = os.environ.get("STAGE0_MEMORY_LIMIT") or None
+_SIZE = re.compile(r"^\s*\d+(\.\d+)?\s*(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)\s*$", re.IGNORECASE)
+
+
+def check_memory_limit(value: str | None) -> str | None:
+    """``value`` if it is a size DuckDB accepts (``24GB``, ``512MiB``), else ValueError."""
+    if value is not None and not _SIZE.match(value):
+        raise ValueError(f"not a memory size: {value!r} (e.g. 24GB)")
+    return value
+
+
+def _duckdb(temp_dir: str | None = None) -> duckdb.DuckDBPyConnection:
+    """A DuckDB connection with ``MEMORY_LIMIT`` applied and, if given, its
+    spill directory set."""
+    con = duckdb.connect()
+    if check_memory_limit(MEMORY_LIMIT):
+        con.execute(f"SET memory_limit = '{MEMORY_LIMIT.strip()}'")
+    if temp_dir:
+        con.execute(f"SET temp_directory = '{temp_dir}'")
+    return con
+
 
 def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [stage0] {msg}", flush=True)
@@ -54,7 +79,7 @@ def metadata_glob(path: str) -> str:
 
 
 def metadata_counts(path: str) -> dict:
-    con = duckdb.connect()
+    con = _duckdb()
     rows = con.execute(f"SELECT type, count(*) FROM read_parquet('{metadata_glob(path)}') GROUP BY type").fetchall()
     return {t: n for t, n in rows}
 
@@ -70,7 +95,7 @@ def ensure_domain(session: Session, domain: str) -> int:
 
 
 def load_bundles(session: Session, path: str) -> dict[str, int]:
-    con = duckdb.connect()
+    con = _duckdb()
     paths = [r[0] for r in con.execute(
         f"SELECT DISTINCT file_path FROM read_parquet('{metadata_glob(path)}') WHERE type = 'revision' AND file_path IS NOT NULL ORDER BY 1"
     ).fetchall()]
@@ -95,7 +120,7 @@ def load_pages(session: Session, path: str, domain: str, domain_id: int) -> int:
     ``INSERT … SELECT … ON CONFLICT`` statements (``url_hash`` is ``md5(url)``,
     as ``WebResource.compute_url_hash``). A page reported more than once in a
     batch (overlapping ``sync`` files) is written once."""
-    con = duckdb.connect()
+    con = _duckdb()
     cur = con.execute(
         f"SELECT page_id, ns, title FROM read_parquet('{metadata_glob(path)}') WHERE type = 'page' ORDER BY page_id"
     )
@@ -149,8 +174,7 @@ def _sorted_revisions(path: str, bundle_ids: dict[str, int], work_dir: str) -> s
     by ``rev_id``, written to a Parquet file in ``work_dir`` whose row groups
     are the load's work units (their ``rev_id`` ranges are disjoint)."""
     out = os.path.join(work_dir, "revisions-by-rev_id.parquet")
-    con = duckdb.connect()
-    con.execute(f"SET temp_directory = '{os.path.join(work_dir, 'duckdb-tmp')}'")
+    con = _duckdb(temp_dir=os.path.join(work_dir, 'duckdb-tmp'))
     con.execute("CREATE TEMP TABLE bundle_ids (file_path VARCHAR, id INTEGER)")
     con.executemany("INSERT INTO bundle_ids VALUES (?, ?)", list(bundle_ids.items()))
     con.execute(
@@ -165,7 +189,7 @@ def _sorted_revisions(path: str, bundle_ids: dict[str, int], work_dir: str) -> s
 
 def _revision_ranges(sorted_file: str) -> list[tuple[int, int | None]]:
     """Half-open ``rev_id`` ranges, one per row group of the sorted file."""
-    con = duckdb.connect()
+    con = _duckdb()
     mins = [r[0] for r in con.execute(
         f"""SELECT stats_min_value::BIGINT FROM parquet_metadata('{sorted_file}')
             WHERE path_in_schema = 'rev_id' ORDER BY row_group_id"""
@@ -179,7 +203,7 @@ def _load_revision_range(engine, sorted_file: str, domain_id: int, lo: int, hi: 
     import pyarrow.csv as pacsv
 
     where = f"rev_id >= {lo}" + (f" AND rev_id < {hi}" if hi is not None else "")
-    result = duckdb.connect().execute(
+    result = _duckdb().execute(
         f"""SELECT rev_id, page_id, parent_rev_id, timestamp, bundle_id, offset_begin, length
             FROM read_parquet('{sorted_file}') WHERE {where}"""
     )
@@ -216,6 +240,13 @@ def _load_revision_range(engine, sorted_file: str, domain_id: int, lo: int, hi: 
     finally:
         raw.close()
     return table.num_rows
+
+
+def _work_base(work_dir: str | None) -> str:
+    """``--work-dir``, else ``STAGING_DIR``, else the current directory (created)."""
+    base = work_dir or os.environ.get("STAGING_DIR") or os.getcwd()
+    os.makedirs(base, exist_ok=True)
+    return base
 
 
 def _rebuild_primary_key(session: Session) -> None:
@@ -257,9 +288,7 @@ def load_revisions(session: Session, path: str, domain_id: int, bundle_ids: dict
     session.commit()  # domains / bundles are visible to the other connections
     engine = session.get_bind()
     was_empty = not session.execute(text("SELECT EXISTS (SELECT 1 FROM revisions)")).scalar_one()
-    base = work_dir or os.environ.get("STAGING_DIR") or os.getcwd()
-    os.makedirs(base, exist_ok=True)
-    tmp = tempfile.mkdtemp(prefix="stage0-revisions-", dir=base)
+    tmp = tempfile.mkdtemp(prefix="stage0-revisions-", dir=_work_base(work_dir))
     try:
         t = time.time()
         sorted_file = _sorted_revisions(path, bundle_ids, tmp)
@@ -293,12 +322,23 @@ def load_to_postgres(session: Session, path: str, domain: str, jobs: int = 8, wo
 # Parquet
 # ---------------------------------------------------------------------------
 
-def write_revisions_parquet(path: str, domain: str, parquet_base: str) -> int:
+def write_revisions_parquet(path: str, domain: str, parquet_base: str, work_dir: str | None = None) -> int:
     """``revisions/domain=<domain>/page_bucket=<n>/`` from the metadata under
     ``path`` (a file or a directory of files — point it at *all* the domain's
     metadata: the domain's partitions are replaced, and a revision reported
-    by several files, as overlapping ``sync`` batches do, is written once)."""
-    con = duckdb.connect()
+    by several files, as overlapping ``sync`` batches do, is written once).
+    DuckDB spills into a temporary directory under ``work_dir`` (as for the
+    revision load), removed afterwards."""
+    import tempfile
+
+    spill = tempfile.mkdtemp(prefix="stage0-parquet-", dir=_work_base(work_dir))
+    try:
+        return _write_revisions_parquet(path, domain, parquet_base, _duckdb(temp_dir=spill))
+    finally:
+        shutil.rmtree(spill, ignore_errors=True)
+
+
+def _write_revisions_parquet(path: str, domain: str, parquet_base: str, con: duckdb.DuckDBPyConnection) -> int:
     # Rows arrive in page_id order, so every chunk touches every bucket. With
     # DuckDB's default of 100 open partition files it kept closing and
     # reopening them: 685,899 files (~19 KB each) for enwiki's 512 buckets,
@@ -363,6 +403,7 @@ def make_session() -> Session:
 
 
 def main(argv=None) -> int:
+    global MEMORY_LIMIT
     ap = argparse.ArgumentParser(description="Load RevisionChest --parquet metadata into Postgres and write the revisions Parquet dataset")
     ap.add_argument("--domain", required=True, help="site domain the metadata belongs to (e.g. en.wikipedia.org)")
     ap.add_argument("--metadata", required=True, help="RevisionChest metadata .parquet file, or a directory of them")
@@ -375,7 +416,15 @@ def main(argv=None) -> int:
                     help="directory for the rev_id-sorted intermediate file and DuckDB spill "
                          "(default: STAGING_DIR, else the current directory; ~19 bytes per revision for the "
                          "file plus DuckDB's sort spill, ~60 GB for enwiki)")
+    ap.add_argument("--memory-limit", default=MEMORY_LIMIT,
+                    help="DuckDB memory limit for each of the loader's DuckDB connections, e.g. 24GB "
+                         "(default: STAGE0_MEMORY_LIMIT, else DuckDB's 80%% of RAM). Leave room for Postgres.")
     args = ap.parse_args(argv)
+    try:
+        check_memory_limit(args.memory_limit)
+    except ValueError as e:
+        ap.error(str(e))
+    MEMORY_LIMIT = args.memory_limit
 
     counts = metadata_counts(args.metadata)
     log(f"metadata: {counts.get('page', 0)} page rows, {counts.get('revision', 0)} revision rows")
@@ -388,7 +437,7 @@ def main(argv=None) -> int:
             session.rollback()
             raise
     if args.parquet_dir:
-        n = write_revisions_parquet(args.metadata, args.domain, args.parquet_dir)
+        n = write_revisions_parquet(args.metadata, args.domain, args.parquet_dir, work_dir=args.work_dir)
         log(f"revisions Parquet: {n} rows under {layout.partition_dir(args.parquet_dir, 'revisions', args.domain)}")
     elif args.no_postgres:
         ap.error("--no-postgres without --parquet-dir does nothing")
