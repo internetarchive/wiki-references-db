@@ -275,6 +275,14 @@ def write_revisions_parquet(path: str, domain: str, parquet_base: str) -> int:
     metadata: the domain's partitions are replaced, and a revision reported
     by several files, as overlapping ``sync`` batches do, is written once)."""
     con = duckdb.connect()
+    # Rows arrive in page_id order, so every chunk touches every bucket. With
+    # DuckDB's default of 100 open partition files it kept closing and
+    # reopening them: 685,899 files (~19 KB each) for enwiki's 512 buckets,
+    # which every per-bucket reader then pays for. Keep one file per bucket.
+    try:
+        con.execute(f"SET partitioned_write_max_open_files = {layout.PAGE_BUCKETS + 64}")
+    except duckdb.Error:
+        pass  # DuckDB without the setting (< 1.1)
     target = layout.dataset_dir(parquet_base, "revisions")
     target.mkdir(parents=True, exist_ok=True)
     domain_dir = layout.partition_dir(parquet_base, "revisions", domain)
