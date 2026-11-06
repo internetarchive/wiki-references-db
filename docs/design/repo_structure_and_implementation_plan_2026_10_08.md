@@ -491,3 +491,28 @@ All 980 files built. The metadata is identical: 19,314,502 pages and 895,604,187
 
 **Open:** nothing in Stage 0 itself. `wcd stage0-load` on the new metadata waits on a Postgres instance. The first run's bundles (201.7 GB) are still on the VM next to the new ones.
 
+
+## 18. Stage 0 load at full scale: enwiki into Postgres (2026-11-06)
+
+`wcd stage0-load` for enwiki-20261001 (namespace 0: 19,314,502 pages, 895,604,187 revisions, from §17's 49.6 GB metadata file) into a local Postgres 16 on the same 28-core VM. Postgres came from the PGDG apt repository, because Debian 13 ships only 17; the settings are in the runbook. Each run happened inside a `systemd-run` scope with `MemoryMax=36G`, so DuckDB sized itself next to Postgres.
+
+**Baseline** (`941b610`): 8 h 47 min, gate pass. Pages took 85 min: each 100k batch went through SQLAlchemy as an `INSERT … VALUES` with ~400k parameters, for `page_metadata` and again for `web_resources`. Revisions took 6 h 43 min: one connection, one transaction, ~40k rows/s, with one backend at 100 % CPU on each row's primary-key entry and two foreign-key checks. The revisions Parquet took 31 min and the gate 7 min. The Parquet dataset came out as 685,899 files of ~19 KB, because with DuckDB's default of 100 open partition files a `page_id`-ordered write keeps reopening the 512 bucket files.
+
+**What landed** (`c62b681`, `4e3c76a`, `05318e3`, `1c47f72`):
+
+1. Pages: `COPY` into a temp table, then set-based upserts, with `url_hash = md5(url)` computed in SQL. Titles are escaped for `COPY`.
+2. Revisions: one DuckDB sort by `rev_id` into a Parquet file in `--work-dir`; each 1M-row row group is a unit with a disjoint `rev_id` range, loaded by one of `--jobs` connections and committed on its own, so an interrupted load resumes. Rows reach Postgres as pyarrow CSV, with no per-row Python. A first version took its ranges from `row_group_id` instead of the `rev_id` minimum, which left all units but one empty. A fast-tier test now checks that the ranges cover every revision exactly once.
+3. One file per bucket: `partitioned_write_max_open_files` is set above the bucket count. On a slice the write was 2× faster and a bucket read 25× faster.
+4. The primary key is rebuilt after a load into an empty table. Parallel range inserts split B-tree pages in the middle, giving 31 GB instead of 19 GB.
+5. The revisions Parquet is deduplicated only when an exact duplicate count (13 s) finds duplicates, which only overlapping `sync` files produce. That took the step from 1,006 s to 289 s in isolation. Deduplicating with `arg_min … GROUP BY` instead ran out of memory.
+6. The gate's page check is now an anti-join. Its `DISTINCT page_id` over all revisions depended on `ANALYZE`'s n_distinct estimate (681k against 19.3M real pages); with that estimate the hash aggregate ran for 7 h 56 min before I cancelled it. The anti-join takes 94 s whatever the estimate.
+
+Measurements on a 20.3M-revision slice drove the settings. With the default `wal_buffers` of 16 MB, 16 connections reached 163k rows/s, mostly waiting on `WALInsert`/`WALWrite`; with 256 MB, 211k. Without the two foreign keys on `revisions` they reached 344k.
+
+**Result** (`1c47f72`, `--jobs 16`): **1 h 30 min 42 s** end to end, gate pass. Pages 14 min, sort 6 min, inserts 48 min, key rebuild 11 min, Parquet 8 min, gate 2 min. Peak RSS 37 GB, work directory 45 GB at its peak; `revisions` is 89 GB (70 GB heap, 19 GB key), the same as the baseline. Every output matches the baseline exactly: order-independent checksums over all columns of `revisions` (bundle as file path), `page_metadata`, the article `web_resources` rows and the revisions Parquet. The Parquet dataset is 512 files instead of 685,899. Tests: Postgres tier and ci fixture, 284 passed, 1 skipped (the golden-file recorder).
+
+**Decisions taken without asking:** Postgres 16 from PGDG; `wal_buffers` 256 MB and the other settings in the runbook; the foreign keys on `revisions` stay during the load (dropping and re-adding them would save roughly a third of the insert time, but it is a schema-management change, so it is open below); the `REINDEX` runs only after a load into an empty table, because it blocks writes; `--jobs` defaults to 8.
+
+**Fixed along the way:** `apps/api` test `test_template_report_and_web_resources` expected the untrimmed template value `"Diamond "`. Extractor `f41db2d` trims values on purpose, which the user confirmed. Only the Postgres tier runs that test, which is how it went unnoticed (`941b610`).
+
+**Open:** dropping and re-adding `revisions`' foreign keys around a fresh load; a `--memory-limit` for the loader's DuckDB, so it doesn't depend on a cgroup cap; `tier.py`'s partitioned writes (Stage 1) may produce the same small-file pattern as item 3 did, which has not been checked.

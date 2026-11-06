@@ -20,6 +20,24 @@ Postgres 16 and Python ≥ 3.10 with `uv sync`; Rust ≥ 1.85 only to build
 RevisionChest (`cargo build --release` in `rust/revisionchest`; CI also
 publishes the Linux binary as a workflow artifact).
 
+**Postgres settings for a build.** The defaults are sized for a laptop. On the
+28-core, 62 GB build VM these were used (in a `conf.d` file):
+
+```
+shared_buffers = 16GB              # restart
+wal_buffers = 256MB                # restart; the important one for Stage 0
+effective_cache_size = 40GB
+maintenance_work_mem = 4GB         # index builds, REINDEX
+max_wal_size = 32GB
+checkpoint_timeout = 30min
+max_parallel_workers_per_gather = 8
+max_parallel_maintenance_workers = 8
+```
+
+`wal_buffers` matters most: with the 16 MB default, the parallel Stage-0
+revision load spent its time waiting on `WALInsert`/`WALWrite` (163k rows/s
+on 16 connections against 211k with 256 MB).
+
 RevisionChest `build` holds one dump file per job: about 300 MB RSS each
 (the 128 MiB zstd window of its bundle encoder included), and about 1.5 cores,
 since 7z decoding runs on its own thread. On enwiki-20261001 the 7z set
@@ -39,8 +57,9 @@ RevisionChest build -d /dumps/enwiki -o $BUNDLES/en.wikipedia.org \
 # schema
 uv run wcd init-db --no-indexes
 
-# 0  metadata → Postgres + revisions Parquet; gate 0
-uv run wcd stage0-load --domain en.wikipedia.org --metadata $META/en.wikipedia.org
+# 0  metadata → Postgres + revisions Parquet; gate 0  (see "Stage 0 load" below)
+uv run wcd stage0-load --domain en.wikipedia.org --metadata $META/en.wikipedia.org \
+    --jobs 16 --work-dir $STAGING
 
 # 1  bundles → staging + citation_history / named_ref_uses / revision_signals
 uv run wcd extract-all -d $BUNDLES/en.wikipedia.org -o $STAGING --domain en.wikipedia.org --jobs 8
@@ -72,6 +91,53 @@ re-runs one on demand. The ci fixture shard runs this whole sequence in
 `packages/pipeline/tests/test_fixture_ci.py`; it is the rehearsal for any
 change to the order above.
 
+### Stage 0 load: parallelism, memory, disk
+
+`wcd stage0-load` loads pages, then revisions, then writes the `revisions/`
+Parquet dataset and runs gate 0:
+
+* **Pages** (`page_metadata` and the article `web_resources` rows) are
+  `COPY`'d in 100k-row batches and upserted with set-based SQL, one commit per
+  batch.
+* **Revisions** are sorted by `rev_id` once by DuckDB into a Parquet file in
+  `--work-dir` (default `STAGING_DIR`, else the current directory). Each 1M-row
+  row group is a unit with its own `rev_id` range, loaded by one of `--jobs`
+  connections (default 8) and committed on its own. **A failed load is resumed
+  by re-running the command**: finished units are skipped by `ON CONFLICT DO
+  NOTHING`. The WAL is the shared limit: on a 20M-revision test slice with
+  the default `wal_buffers`, 16 jobs were barely faster than 8 (163k against
+  152k rows/s); the enwiki load used 16 with 256 MB. More was not measured.
+* After a load into an **empty** `revisions` table, the primary key is
+  rebuilt with `REINDEX` (parallel inserts leave it half full: 31 GB against
+  19 GB). This blocks writes to `revisions` while it runs; incremental loads
+  skip it.
+* The `revisions/` dataset is deduplicated by `rev_id` only when the metadata
+  has duplicates (overlapping `sync` files); an exact count decides, in seconds.
+
+**Memory.** DuckDB's sorts take up to 80 % of the RAM it can see, on top of
+Postgres' `shared_buffers`, with no swap to fall back on. Run the load in a
+memory-capped scope so DuckDB sizes itself to the cap (it reads cgroup
+limits) and Postgres keeps its share:
+
+```
+sudo systemd-run --scope --uid=$USER --gid=$(id -g) -p MemoryMax=36G \
+    --setenv=PATH=$PATH --setenv=HOME=$HOME --working-directory=$PWD -- \
+    bash -c 'set -a; . ./.env; set +a; exec uv run wcd stage0-load …'
+```
+
+With `MemoryMax=36G` DuckDB limits itself to 28.7 GiB; the enwiki load peaked
+at 37 GB RSS (DuckDB plus Python and Arrow).
+
+**Disk.** `--work-dir` holds the sorted file (~19 bytes per revision) and
+DuckDB's sort spill: 45 GB at the peak for enwiki. The Parquet step spills to
+`.tmp` in the current directory. `revisions` itself is ~100 bytes per
+revision (enwiki: 70 GB heap and 19 GB primary key).
+
+**Time, enwiki-20261001** (19.3M pages, 895.6M namespace-0 revisions,
+`--jobs 16`, 28 cores, settings above): 1 h 31 min end to end — pages 14 min,
+revision sort 6 min, inserts 48 min, key rebuild 11 min, Parquet 8 min,
+gate 2 min. The single-connection loader before it took 8 h 47 min.
+
 ### Stage 1 memory and parallelism
 
 An extraction worker's memory is bounded by the batch it holds in flight:
@@ -98,7 +164,7 @@ exits non-zero, and the next run clears and redoes that shard only.
 | Step | Writes | Replaces | Re-run unit |
 |---|---|---|---|
 | RevisionChest `build` | bundles, metadata file | — (new files) | dump file |
-| `stage0-load` | `domains`, `revision_bundles`, `revisions`, `page_metadata`, article `web_resources`; `revisions/` Parquet | Postgres rows upserted / `ON CONFLICT DO NOTHING`; the domain's `revisions/` partitions rebuilt from **everything under `--metadata`** | domain |
+| `stage0-load` | `domains`, `revision_bundles`, `revisions`, `page_metadata`, article `web_resources`; `revisions/` Parquet | Postgres rows upserted / `ON CONFLICT DO NOTHING`, committed per page batch and per `rev_id` unit (an interrupted load resumes on re-run); the domain's `revisions/` partitions rebuilt from **everything under `--metadata`** | domain |
 | `extract` (`extract-all`) | staging files of the shard; `citation_history/`, `named_ref_uses/`, `revision_signals/` files named after the shard | that shard's files only (`<shard>-<i>.parquet` in every bucket) | shard (one bundle) |
 | `dedup` | `$STAGING/deduped/*.parquet` | per table (`.done` markers; delete `deduped/` to redo) | staging set |
 | `load` | `containers`, `domains`, `web_resources` (cited), `wiki_templates`, `normalized_citations`, `citation_instances`, `normalized_citation_web_resources`, `template_data` | upserts — idempotent | staging set |
