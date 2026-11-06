@@ -12,6 +12,11 @@ scan ``pg.revisions`` from DuckDB.
 The metadata file has no domain column (RevisionChest's ``.mwrev`` header has
 none either), so ``--domain`` is required.
 
+Revisions are loaded by ``--jobs`` connections in parallel, each committing
+one ``rev_id`` range at a time, so an interrupted load can simply be re-run
+(``ON CONFLICT DO NOTHING``). Postgres' ``wal_buffers`` matters at this rate:
+the 16 MB default left the connections waiting on WAL (runbook).
+
 Usage:
     wcd stage0-load --domain en.wikipedia.org --metadata bundles/metadata.parquet --parquet-dir data/parquet
     wcd stage0-load --domain en.wikipedia.org --metadata bundles/metadata.parquet --no-postgres   # Parquet only
@@ -31,7 +36,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
 from wcd_schema import parquet as layout
-from wcd_schema.postgres import Domain, PageMetadata, RevisionBundle, WebResource
+from wcd_schema.postgres import Domain, RevisionBundle
 
 from .config import database_url, load_dotenv  # noqa: F401
 
@@ -75,57 +80,127 @@ def load_bundles(session: Session, path: str) -> dict[str, int]:
     return {p: i for p, i in rows}
 
 
+def _copy_text(v) -> str:
+    """A value in COPY text format: NULL as ``\\N``; backslash, tab, newline
+    and carriage return escaped (page titles may contain backslashes)."""
+    if v is None:
+        return NULL
+    return (str(v).replace("\\", "\\\\").replace("\t", "\\t")
+            .replace("\n", "\\n").replace("\r", "\\r"))
+
+
 def load_pages(session: Session, path: str, domain: str, domain_id: int) -> int:
+    """``page_metadata`` and the article ``web_resources`` rows: each batch is
+    ``COPY``'d into a temp table and upserted with two set-based
+    ``INSERT … SELECT … ON CONFLICT`` statements (``url_hash`` is ``md5(url)``,
+    as ``WebResource.compute_url_hash``). A page reported more than once in a
+    batch (overlapping ``sync`` files) is written once."""
     con = duckdb.connect()
     cur = con.execute(
         f"SELECT page_id, ns, title FROM read_parquet('{metadata_glob(path)}') WHERE type = 'page' ORDER BY page_id"
     )
+    url_prefix = f"https://{domain}/w/index.php?curid="
     n = 0
     while True:
         chunk = cur.fetchmany(BATCH)
         if not chunk:
             break
-        PageMetadata.bulk_upsert(session, [
-            {"domain_id": domain_id, "page_id": pid, "page_title": title, "page_namespace": ns} for pid, ns, title in chunk
-        ])
-        WebResource.bulk_upsert(session, [
-            {"url": f"https://{domain}/w/index.php?curid={pid}", "domain_id": domain_id,
-             "numeric_page_id": pid, "numeric_namespace_id": ns} for pid, ns, _ in chunk
-        ])
+        buf = io.StringIO()
+        for pid, ns, title in chunk:
+            buf.write(f"{_copy_text(pid)}\t{_copy_text(ns)}\t{_copy_text(title)}\n")
+        buf.seek(0)
+        raw = session.connection().connection  # the DBAPI (psycopg2) connection
+        with raw.cursor() as c:
+            c.execute("""CREATE TEMP TABLE IF NOT EXISTS temp_pages (
+                             page_id INTEGER, page_namespace INTEGER, page_title TEXT) ON COMMIT DROP""")
+            c.copy_expert("COPY temp_pages (page_id, page_namespace, page_title) FROM STDIN", buf)
+            c.execute(
+                """INSERT INTO page_metadata (domain_id, page_id, page_title, page_namespace)
+                   SELECT DISTINCT ON (page_id) %s, page_id, page_title, page_namespace
+                   FROM temp_pages WHERE page_id IS NOT NULL ORDER BY page_id
+                   ON CONFLICT (domain_id, page_id)
+                   DO UPDATE SET page_title = EXCLUDED.page_title, page_namespace = EXCLUDED.page_namespace""",
+                (domain_id,),
+            )
+            # Columns left out (instance_of_document, …) keep their values, as
+            # coalesce(NULL, existing) does in WebResource.bulk_upsert.
+            c.execute(
+                """INSERT INTO web_resources (url, url_hash, domain_id, numeric_page_id, numeric_namespace_id)
+                   SELECT url, md5(url), %s, page_id, page_namespace
+                   FROM (SELECT DISTINCT ON (page_id) %s || page_id AS url, page_id, page_namespace
+                         FROM temp_pages WHERE page_id IS NOT NULL ORDER BY page_id) p
+                   ON CONFLICT (url_hash) DO UPDATE SET
+                       url = EXCLUDED.url,
+                       domain_id = coalesce(EXCLUDED.domain_id, web_resources.domain_id),
+                       numeric_page_id = coalesce(EXCLUDED.numeric_page_id, web_resources.numeric_page_id),
+                       numeric_namespace_id = coalesce(EXCLUDED.numeric_namespace_id, web_resources.numeric_namespace_id)""",
+                (domain_id, url_prefix),
+            )
         session.commit()
         n += len(chunk)
     return n
 
 
-def load_revisions(session: Session, path: str, domain_id: int, bundle_ids: dict[str, int]) -> int:
-    """``COPY`` into a temp table, then ``INSERT … ON CONFLICT DO NOTHING``."""
+REVISION_GROUP = 1_000_000   # rows per work unit (a row group of the sorted intermediate file)
+
+
+def _sorted_revisions(path: str, bundle_ids: dict[str, int], work_dir: str) -> str:
+    """One DuckDB pass: the revision rows with their bundle id resolved, sorted
+    by ``rev_id``, written to a Parquet file in ``work_dir`` whose row groups
+    are the load's work units (their ``rev_id`` ranges are disjoint)."""
+    out = os.path.join(work_dir, "revisions-by-rev_id.parquet")
     con = duckdb.connect()
-    cur = con.execute(
-        f"""SELECT rev_id, page_id, parent_rev_id, timestamp, file_path, offset_begin, length
-            FROM read_parquet('{metadata_glob(path)}') WHERE type = 'revision' ORDER BY rev_id"""
+    con.execute(f"SET temp_directory = '{os.path.join(work_dir, 'duckdb-tmp')}'")
+    con.execute("CREATE TEMP TABLE bundle_ids (file_path VARCHAR, id INTEGER)")
+    con.executemany("INSERT INTO bundle_ids VALUES (?, ?)", list(bundle_ids.items()))
+    con.execute(
+        f"""COPY (SELECT m.rev_id, m.page_id, m.parent_rev_id, m.timestamp, b.id AS bundle_id,
+                         m.offset_begin, m.length
+                  FROM read_parquet('{metadata_glob(path)}') m LEFT JOIN bundle_ids b USING (file_path)
+                  WHERE m.type = 'revision' ORDER BY m.rev_id)
+            TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {REVISION_GROUP})"""
     )
-    raw = session.connection().connection  # the DBAPI (psycopg2) connection
-    n = 0
-    with raw.cursor() as c:
-        c.execute(
-            """CREATE TEMP TABLE IF NOT EXISTS temp_revisions (
-                   revision_id BIGINT, page_id INTEGER, parent_revision_id BIGINT, revision_timestamp TEXT,
-                   found_in_bundle INTEGER, offset_begin BIGINT, length BIGINT) ON COMMIT DROP"""
-        )
-        while True:
-            chunk = cur.fetchmany(BATCH)
-            if not chunk:
-                break
-            buf = io.StringIO()
-            for rev_id, page_id, parent, ts, file_path, off, length in chunk:
-                bundle = bundle_ids.get(file_path)
-                fields = (rev_id, page_id, parent, ts, bundle, off, length)
-                buf.write("\t".join(NULL if v is None else str(v) for v in fields))
-                buf.write("\n")
-            buf.seek(0)
-            c.execute("TRUNCATE temp_revisions")
+    return out
+
+
+def _revision_ranges(sorted_file: str) -> list[tuple[int, int | None]]:
+    """Half-open ``rev_id`` ranges, one per row group of the sorted file."""
+    con = duckdb.connect()
+    mins = [r[0] for r in con.execute(
+        f"""SELECT stats_min_value::BIGINT FROM parquet_metadata('{sorted_file}')
+            WHERE path_in_schema = 'rev_id' ORDER BY row_group_id"""
+    ).fetchall()]
+    return [(lo, mins[i + 1] if i + 1 < len(mins) else None) for i, lo in enumerate(mins)]
+
+
+def _load_revision_range(engine, sorted_file: str, domain_id: int, lo: int, hi: int | None) -> int:
+    """``COPY`` one ``rev_id`` range into a temp table, ``INSERT … ON CONFLICT DO
+    NOTHING`` into ``revisions``, commit. Safe to repeat."""
+    import pyarrow.csv as pacsv
+
+    where = f"rev_id >= {lo}" + (f" AND rev_id < {hi}" if hi is not None else "")
+    result = duckdb.connect().execute(
+        f"""SELECT rev_id, page_id, parent_rev_id, timestamp, bundle_id, offset_begin, length
+            FROM read_parquet('{sorted_file}') WHERE {where}"""
+    )
+    # to_arrow_table() replaces fetch_arrow_table() in newer DuckDB; the dependency allows >= 1.0.
+    table = (getattr(result, "to_arrow_table", None) or result.fetch_arrow_table)()
+    if table.num_rows == 0:
+        return 0
+    buf = io.BytesIO()
+    pacsv.write_csv(table, buf, pacsv.WriteOptions(include_header=False))
+    buf.seek(0)
+    raw = engine.raw_connection()
+    try:
+        with raw.cursor() as c:
+            c.execute(
+                """CREATE TEMP TABLE temp_revisions (
+                       revision_id BIGINT, page_id INTEGER, parent_revision_id BIGINT, revision_timestamp TEXT,
+                       found_in_bundle INTEGER, offset_begin BIGINT, length BIGINT) ON COMMIT DROP"""
+            )
             c.copy_expert(
-                "COPY temp_revisions (revision_id, page_id, parent_revision_id, revision_timestamp, found_in_bundle, offset_begin, length) FROM STDIN",
+                "COPY temp_revisions (revision_id, page_id, parent_revision_id, revision_timestamp, "
+                "found_in_bundle, offset_begin, length) FROM STDIN (FORMAT csv)",
                 buf,
             )
             c.execute(
@@ -137,18 +212,55 @@ def load_revisions(session: Session, path: str, domain_id: int, bundle_ids: dict
                    ON CONFLICT (revision_id) DO NOTHING""",
                 (domain_id,),
             )
-            n += len(chunk)
-    session.commit()
-    return n
+        raw.commit()
+    finally:
+        raw.close()
+    return table.num_rows
 
 
-def load_to_postgres(session: Session, path: str, domain: str) -> dict:
+def load_revisions(session: Session, path: str, domain_id: int, bundle_ids: dict[str, int],
+                   jobs: int = 8, work_dir: str | None = None) -> int:
+    """All revision rows, ``jobs`` connections at a time.
+
+    The metadata is sorted by ``rev_id`` once (``_sorted_revisions``), and each
+    row group of that file is one unit: ``COPY`` into a temp table, ``INSERT …
+    ON CONFLICT DO NOTHING``, commit. Units have disjoint ``rev_id`` ranges, so
+    the primary-key B-tree stays append-like, and a unit that is repeated
+    (a re-run after a failure) changes nothing. A single backend was the
+    bottleneck: one insert at a time, each with its primary-key entry and two
+    foreign-key checks.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    import tempfile
+
+    session.commit()  # domains / bundles are visible to the other connections
+    engine = session.get_bind()
+    base = work_dir or os.environ.get("STAGING_DIR") or os.getcwd()
+    os.makedirs(base, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="stage0-revisions-", dir=base)
+    try:
+        t = time.time()
+        sorted_file = _sorted_revisions(path, bundle_ids, tmp)
+        ranges = _revision_ranges(sorted_file)
+        log(f"revisions sorted by rev_id in {time.time() - t:.0f} s: {len(ranges)} unit(s), {jobs} job(s)")
+        n = 0
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            for i, k in enumerate(pool.map(lambda r: _load_revision_range(engine, sorted_file, domain_id, *r), ranges), 1):
+                n += k
+                if i % 50 == 0 or i == len(ranges):
+                    log(f"revisions: {i}/{len(ranges)} units, {n} rows")
+        return n
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def load_to_postgres(session: Session, path: str, domain: str, jobs: int = 8, work_dir: str | None = None) -> dict:
     domain_id = ensure_domain(session, domain)
     bundles = load_bundles(session, path)
     log(f"{len(bundles)} bundle(s)")
     n_pages = load_pages(session, path, domain, domain_id)
     log(f"{n_pages} page_metadata rows")
-    n_revs = load_revisions(session, path, domain_id, bundles)
+    n_revs = load_revisions(session, path, domain_id, bundles, jobs=jobs, work_dir=work_dir)
     log(f"{n_revs} revisions")
     return {"domain_id": domain_id, "bundles": len(bundles), "pages": n_pages, "revisions": n_revs}
 
@@ -214,6 +326,12 @@ def main(argv=None) -> int:
     ap.add_argument("--parquet-dir", default=os.environ.get("PARQUET_DIR"), help="Parquet base directory for the revisions dataset (default: PARQUET_DIR)")
     ap.add_argument("--no-postgres", action="store_true", help="only write the revisions Parquet dataset")
     ap.add_argument("--no-gate", action="store_true", help="skip the Stage-0 checks afterwards")
+    ap.add_argument("--jobs", type=int, default=8,
+                    help="Postgres connections loading revisions in parallel (default 8)")
+    ap.add_argument("--work-dir", default=None,
+                    help="directory for the rev_id-sorted intermediate file and DuckDB spill "
+                         "(default: STAGING_DIR, else the current directory; ~19 bytes per revision for the "
+                         "file plus DuckDB's sort spill, ~60 GB for enwiki)")
     args = ap.parse_args(argv)
 
     counts = metadata_counts(args.metadata)
@@ -222,7 +340,7 @@ def main(argv=None) -> int:
     if not args.no_postgres:
         session = make_session()
         try:
-            load_to_postgres(session, args.metadata, args.domain)
+            load_to_postgres(session, args.metadata, args.domain, jobs=args.jobs, work_dir=args.work_dir)
         except Exception:
             session.rollback()
             raise
