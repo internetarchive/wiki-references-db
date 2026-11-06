@@ -218,6 +218,25 @@ def _load_revision_range(engine, sorted_file: str, domain_id: int, lo: int, hi: 
     return table.num_rows
 
 
+def _rebuild_primary_key(session: Session) -> None:
+    """``REINDEX`` the ``revisions`` primary key after a load into an empty table.
+
+    Parallel units insert into many key ranges at once, so B-tree pages split
+    in the middle and stay half full: on enwiki the index came out at 31 GB
+    against 19 GB rebuilt (6 minutes, a parallel sorted build). Only after a
+    load into an empty table; an incremental load (``sync`` batches) leaves the
+    index alone. ``REINDEX`` blocks writes to ``revisions`` while it runs."""
+    from sqlalchemy import text
+
+    t = time.time()
+    index = session.execute(text(
+        "SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid = 'revisions'::regclass AND indisprimary"
+    )).scalar_one()
+    session.execute(text(f"REINDEX INDEX {index}"))
+    session.commit()
+    log(f"rebuilt {index} in {time.time() - t:.0f} s")
+
+
 def load_revisions(session: Session, path: str, domain_id: int, bundle_ids: dict[str, int],
                    jobs: int = 8, work_dir: str | None = None) -> int:
     """All revision rows, ``jobs`` connections at a time.
@@ -233,8 +252,11 @@ def load_revisions(session: Session, path: str, domain_id: int, bundle_ids: dict
     from concurrent.futures import ThreadPoolExecutor
     import tempfile
 
+    from sqlalchemy import text
+
     session.commit()  # domains / bundles are visible to the other connections
     engine = session.get_bind()
+    was_empty = not session.execute(text("SELECT EXISTS (SELECT 1 FROM revisions)")).scalar_one()
     base = work_dir or os.environ.get("STAGING_DIR") or os.getcwd()
     os.makedirs(base, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix="stage0-revisions-", dir=base)
@@ -249,6 +271,8 @@ def load_revisions(session: Session, path: str, domain_id: int, bundle_ids: dict
                 n += k
                 if i % 50 == 0 or i == len(ranges):
                     log(f"revisions: {i}/{len(ranges)} units, {n} rows")
+        if was_empty and n:
+            _rebuild_primary_key(session)
         return n
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -289,6 +313,17 @@ def write_revisions_parquet(path: str, domain: str, parquet_base: str) -> int:
     if domain_dir.exists():
         shutil.rmtree(domain_dir)
     dom = domain.replace("'", "''")
+    src = f"read_parquet('{metadata_glob(path)}')"
+    # The window that keeps one row per rev_id is the expensive part (enwiki:
+    # 17 min of 1-2 cores and ~78 GB of spill, against 5 min without it), and
+    # only overlapping files (``sync`` batches) produce duplicates: count them
+    # exactly first (13 s on enwiki) and drop the window when there are none.
+    duplicates = con.execute(
+        f"SELECT count(*) - count(DISTINCT rev_id) FROM {src} WHERE type = 'revision'"
+    ).fetchone()[0]
+    dedup = ("QUALIFY row_number() OVER (PARTITION BY rev_id ORDER BY timestamp, file_path) = 1"
+             if duplicates else "")
+    log(f"revisions Parquet: {duplicates} duplicate revision row(s)" + (", deduplicating" if duplicates else ""))
     con.execute(
         f"""COPY (
                 SELECT '{dom}' AS domain,
@@ -297,9 +332,9 @@ def write_revisions_parquet(path: str, domain: str, parquet_base: str) -> int:
                        CAST(page_id AS INTEGER) AS page_id,
                        CAST(parent_rev_id AS BIGINT) AS parent_revision_id,
                        CAST(strptime(timestamp, '%Y-%m-%dT%H:%M:%SZ') AS TIMESTAMP) AS revision_timestamp
-                FROM read_parquet('{metadata_glob(path)}')
+                FROM {src}
                 WHERE type = 'revision'
-                QUALIFY row_number() OVER (PARTITION BY rev_id ORDER BY timestamp, file_path) = 1
+                {dedup}
                 ORDER BY page_id, rev_id
             ) TO '{target}' (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (domain, page_bucket), OVERWRITE_OR_IGNORE)"""
     )

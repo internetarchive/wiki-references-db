@@ -84,7 +84,7 @@ def test_titles_hashes_and_idempotence(engine, tmp_path):
     assert _rows(engine) == (pm, wr)
 
 
-def test_revisions_load_in_parallel_units_and_rerun_is_a_no_op(engine, tmp_path, monkeypatch):
+def test_revisions_load_in_parallel_units_and_rerun_is_a_no_op(engine, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(stage0, "REVISION_GROUP", 2048)
     con = duckdb.connect()
     con.execute("""CREATE TABLE m (type VARCHAR, page_id UBIGINT, ns BIGINT, title VARCHAR, rev_id UBIGINT,
@@ -99,9 +99,11 @@ def test_revisions_load_in_parallel_units_and_rerun_is_a_no_op(engine, tmp_path,
     try:
         domain_id = stage0.ensure_domain(session, DOMAIN)
         bundles = stage0.load_bundles(session, str(meta))
-        for _ in range(2):  # the second run must change nothing
+        for attempt in range(2):  # the second run must change nothing
             n = stage0.load_revisions(session, str(meta), domain_id, bundles, jobs=4, work_dir=str(tmp_path))
             assert n == len(rows)
+            # the primary key is rebuilt after the load into the empty table only
+            assert ("rebuilt revisions_pkey" in capsys.readouterr().out) == (attempt == 0)
             with engine.connect() as c:
                 got = c.execute(text(
                     "SELECT r.revision_id, r.page_id, r.parent_revision_id, b.file_path, r.offset_begin, r.length, "
