@@ -112,3 +112,24 @@ def test_revisions_load_in_parallel_units_and_rerun_is_a_no_op(engine, tmp_path,
         assert not list(tmp_path.glob("stage0-revisions-*"))  # the work directory is cleaned up
     finally:
         session.close()
+
+
+def test_gate_reports_revisions_whose_page_is_missing(engine):
+    from wcd_pipeline import gates
+    other = "yy.wikipedia.org"
+    session = sessionmaker(bind=engine)()
+    try:
+        d = stage0.ensure_domain(session, other)
+        session.execute(text("INSERT INTO page_metadata (domain_id, page_id, page_title, page_namespace) "
+                             "VALUES (:d, 7, 'Seven', 0)"), {"d": d})
+        session.execute(text("INSERT INTO revisions (revision_id, domain_id, page_id, revision_timestamp) VALUES "
+                             "(9000001, :d, 7, '2020-01-01'), (9000002, :d, 7, '2020-01-02')"), {"d": d})
+        session.commit()
+        assert gates.stage0(session, other, None) == []
+        # two revisions of one page that has no page_metadata row: one page reported
+        session.execute(text("INSERT INTO revisions (revision_id, domain_id, page_id, revision_timestamp) VALUES "
+                             "(9000003, :d, 8, '2020-01-03'), (9000004, :d, 8, '2020-01-04')"), {"d": d})
+        session.commit()
+        assert gates.stage0(session, other, None) == ["1 page(s) in revisions have no page_metadata row"]
+    finally:
+        session.close()

@@ -62,9 +62,13 @@ def stage0(session: Session | None, domain: str, parquet_base: str | None) -> li
         pg_count = session.execute(select(func.count()).select_from(Revision).where(Revision.domain_id == domain_id)).scalar_one()
         if pg_count == 0:
             failures.append("revisions has no rows for the domain")
+        # An anti-join first, DISTINCT only over the (normally zero) orphans: a DISTINCT
+        # over all revisions makes the plan hinge on the sampled n_distinct of page_id,
+        # which for enwiki was 681k against 19.3M real pages, and the resulting
+        # hash aggregate ran for 8 hours instead of the 1.5 minutes this takes.
         missing = session.execute(text(
-            "SELECT count(*) FROM (SELECT DISTINCT page_id FROM revisions WHERE domain_id = :d) r "
-            "LEFT JOIN page_metadata p ON p.domain_id = :d AND p.page_id = r.page_id WHERE p.page_id IS NULL"
+            "SELECT count(DISTINCT r.page_id) FROM revisions r WHERE r.domain_id = :d "
+            "AND NOT EXISTS (SELECT 1 FROM page_metadata p WHERE p.domain_id = :d AND p.page_id = r.page_id)"
         ), {"d": domain_id}).scalar_one()
         if missing:
             failures.append(f"{missing} page(s) in revisions have no page_metadata row")
