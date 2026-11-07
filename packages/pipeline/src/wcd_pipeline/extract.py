@@ -235,20 +235,45 @@ class PageRefCache:
     crosses pages or shards; ``max_entries`` bounds a pathological page.
     """
 
-    def __init__(self, max_entries: int = 200_000):
+    def __init__(self, max_entries: int = 200_000, max_staged: int = 2_000_000):
         self.max_entries = max_entries
+        self.max_staged = max_staged
         self.page_id = None
         self.normalized: Dict[str, tuple] = {}   # raw -> (normalized, normalized_sha1, raw_sha1)
         self.templates: Dict[str, list] = {}     # raw -> extract_templates_from_text result
+        self.staged: set = set()                 # (table, *row values) already staged for this page
+        self.skipped = 0                         # staging rows not written because the page already had them
 
     def start_page(self, page_id) -> None:
         if page_id != self.page_id:
             self.page_id = page_id
             self.normalized.clear()
             self.templates.clear()
+            self.staged.clear()
         elif len(self.normalized) + len(self.templates) > self.max_entries:
             self.normalized.clear()
             self.templates.clear()
+
+    def first(self, key: tuple) -> bool:
+        """True the first time this page produces the staging row ``key``
+        (``(table, *values)``), False for a repeat.
+
+        Staging rows are entity rows that ``wcd dedup`` reduces with DISTINCT /
+        GROUP BY … MIN, which ignore how often a row occurs, so writing an
+        exact repeat once instead of once per revision cannot change the deduped
+        output. Nearly all repeats are within a page (consecutive revisions keep
+        their references: 324x on an enwiki sample), so per-page state removes
+        almost all of them while holding only one page's distinct rows; the
+        strings in a key are the ones the cache already holds. Past
+        ``max_staged`` keys the set is cleared and repeats go through to dedup,
+        as before."""
+        if key in self.staged:
+            self.skipped += 1
+            return False
+        if len(self.staged) >= self.max_staged:
+            self.staged.clear()
+        self.staged.add(key)
+        return True
 
     def normalize(self, reference_raw: str) -> tuple:
         hit = self.normalized.get(reference_raw)
@@ -262,7 +287,9 @@ class PageRefCache:
 def process_revisions(revisions, staging, outputs: TierOutputs, domain: str, source_stem: str = 'unknown',
                       cache: PageRefCache | None = None):
     """Derive rows from a batch of revisions: staging rows go to ``staging``,
-    per-revision rows to ``outputs``. No deduplication is performed here.
+    per-revision rows to ``outputs``. A staging row that its page already
+    produced is not written again (``PageRefCache.first``); everything else is
+    left to ``wcd dedup``.
     ``cache`` carries per-page memoized work across batches (a batch can end
     mid-page); without one, each call starts fresh."""
     if cache is None:
@@ -302,22 +329,27 @@ def process_revisions(revisions, staging, outputs: TierOutputs, domain: str, sou
             reference_normalized, normalized_sha1, raw_sha1 = cache.normalize(reference_raw)
             inst_id = instance_id(domain, page_id, raw_sha1)
 
-            citation_instances.append({
-                "citation_instance_id": inst_id,
-                "domain": domain,
-                "page_id": page_id,
-                "raw_sha1": raw_sha1,
-                "normalized_sha1": normalized_sha1,
-                "reference_type": ref.get('reference_type', 0),
-                "reference_name": ref.get('reference_name'),
-            })
-            normalized_citations.append({
-                "normalized_sha1": normalized_sha1,
-                "reference_normalized": reference_normalized,
-                "appears_on_page_id": page_id,
-                "appears_on_domain": domain,
-                "citation_type": ref.get("citation_type"),
-            })
+            reference_type = ref.get('reference_type', 0)
+            reference_name = ref.get('reference_name')
+            citation_type = ref.get("citation_type")
+            if cache.first(("ci", inst_id, raw_sha1, normalized_sha1, reference_type, reference_name)):
+                citation_instances.append({
+                    "citation_instance_id": inst_id,
+                    "domain": domain,
+                    "page_id": page_id,
+                    "raw_sha1": raw_sha1,
+                    "normalized_sha1": normalized_sha1,
+                    "reference_type": reference_type,
+                    "reference_name": reference_name,
+                })
+            if cache.first(("nc", normalized_sha1, citation_type)):
+                normalized_citations.append({
+                    "normalized_sha1": normalized_sha1,
+                    "reference_normalized": reference_normalized,
+                    "appears_on_page_id": page_id,
+                    "appears_on_domain": domain,
+                    "citation_type": citation_type,
+                })
             history_rows.append({
                 "citation_instance_id": inst_id,
                 "revision_id": revision_id,
@@ -331,10 +363,12 @@ def process_revisions(revisions, staging, outputs: TierOutputs, domain: str, sou
                     netloc = urlparse(url).netloc
                 except Exception:
                     netloc = None
-                if netloc:
+                if netloc and cache.first(("dom", netloc)):
                     domains_rows.append({'value': netloc, 'for_container_label': None})
-                web_resources_rows.append({'url': url, 'domain_label': netloc})
-                ncwr_rows.append({'normalized_sha1': normalized_sha1, 'url': url})
+                if cache.first(("wr", url, netloc)):
+                    web_resources_rows.append({'url': url, 'domain_label': netloc})
+                if cache.first(("ncwr", normalized_sha1, url)):
+                    ncwr_rows.append({'normalized_sha1': normalized_sha1, 'url': url})
 
             for idx, tpl in enumerate(ref.get('templates') or [], start=1):
                 tpl_name_raw = (tpl or {}).get('template_name') or ''
@@ -342,7 +376,8 @@ def process_revisions(revisions, staging, outputs: TierOutputs, domain: str, sou
                     continue
                 tpl_full_text = (tpl or {}).get('full_text') or ''
                 normalized_tpl_name = _normalize_template_name(tpl_name_raw)
-                wiki_template_rows.append({'domain_label': domain, 'name': normalized_tpl_name})
+                if cache.first(("wt", normalized_tpl_name)):
+                    wiki_template_rows.append({'domain_label': domain, 'name': normalized_tpl_name})
 
                 tpl_offset = _find_nth(reference_normalized, "{{" + normalized_tpl_name, idx)
                 if tpl_offset < 0:
@@ -352,6 +387,8 @@ def process_revisions(revisions, staging, outputs: TierOutputs, domain: str, sou
                 for p in (tpl or {}).get('parameters') or []:
                     key = (p or {}).get('key')
                     if not key:
+                        continue
+                    if not cache.first(("td", normalized_tpl_name, normalized_sha1, tpl_offset, key, (p or {}).get('value'))):
                         continue
                     template_data_rows.append({
                         'domain_label': domain,
