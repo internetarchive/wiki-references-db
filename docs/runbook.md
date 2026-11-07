@@ -148,6 +148,14 @@ gate 2 min. The single-connection loader before it took 8 h 47 min.
 
 ### Stage 1 memory and parallelism
 
+**Size and time, enwiki-20261001** (namespace 0, 21.6 TB of revision text;
+estimated from a stratified 834-page sample, plan §19): ~1,200 core-hours,
+~43 h on 28 workers with one process per dump-file bundle (the bundles are
+balanced: largest ~2.5 h); ~27 GB of staging and ~17 GB of Parquet tier; up to
+~2 GB RSS on the heaviest pages. Staging holds each entity row once per page
+per shard (repeats within a page are skipped at extraction), so `dedup` reads
+little.
+
 An extraction worker's memory is bounded by the batch it holds in flight:
 `--batch-size` revisions *or* `--batch-bytes` of revision text (`BATCH_BYTES`,
 default 32 MiB), whichever fills first. The byte cap is what matters on pages
