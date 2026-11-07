@@ -35,3 +35,12 @@ def test_failed_shard_is_not_done(tmp_path, capsys):
     assert "[skip]" in out and "good.mwrev.zst" in out.split("[skip]")[1].split("\n")[0]
     assert (staging / "bad" / "DONE.txt").exists() and not (staging / "bad" / "FAILED.txt").exists()
     assert os.path.exists(parquet / "revision_signals" / "domain=en.wikipedia.org" / "bad.parquet")
+
+
+def test_bundles_are_ordered_largest_first(tmp_path):
+    from wcd_pipeline.extract_all import sort_key
+    for name, n in [("a.mwrev.zst", 10), ("b.mwrev.zst", 300), ("c.mwrev.zst", 20)]:
+        (tmp_path / name).write_bytes(b"x" * n)
+    files = [str(tmp_path / n) for n in ("a.mwrev.zst", "b.mwrev.zst", "c.mwrev.zst", "missing.mwrev.zst")]
+    files.sort(key=sort_key)
+    assert [f.rsplit("/", 1)[1] for f in files] == ["b.mwrev.zst", "c.mwrev.zst", "a.mwrev.zst", "missing.mwrev.zst"]
