@@ -148,11 +148,13 @@ gate 2 min. The single-connection loader before it took 8 h 47 min.
 
 ### Stage 1 memory and parallelism
 
-**Size and time, enwiki-20261001** (namespace 0, 21.6 TB of revision text;
-estimated from a stratified 834-page sample, plan §19): ~1,200 core-hours,
-~43 h on 28 workers with one process per dump-file bundle (the bundles are
-balanced: largest ~2.5 h); ~27 GB of staging and ~17 GB of Parquet tier; up to
-~2 GB RSS on the heaviest pages. Staging holds each entity row once per page
+**Size and time, enwiki-20261001** (namespace 0, 21.6 TB of revision text,
+980 bundles; measured, plan §19): 45 h 17 min with `extract-all -j 28` on 28
+cores, 1,186 core-hours; 78.5 GB of staging and 33.3 GB of Parquet tier
+(27.8 billion `citation_history` rows). Workers use up to ~2 GB RSS on the
+heaviest pages; all 28 together peaked at 39.5 GB, so give the run ~40 GB
+beyond Postgres (a `systemd-run --scope -p MemoryMax=…` cap confines an
+out-of-memory kill to one worker, whose shard the next run redoes). Staging holds each entity row once per page
 per shard (repeats within a page are skipped at extraction), so `dedup` reads
 little.
 
