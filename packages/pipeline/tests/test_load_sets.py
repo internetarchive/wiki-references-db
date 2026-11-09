@@ -42,18 +42,19 @@ def engine():
     engine.dispose()
 
 
-def _write(staging, name, columns):
+def _write(staging, row_group_size, name, columns):
     deduped = staging / "deduped"
     deduped.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.table(columns), deduped / f"{name}.parquet")
+    pq.write_table(pa.table(columns), deduped / f"{name}.parquet", row_group_size=row_group_size)
 
 
-def _stage(staging, citation_instance_ids=None):
-    _write(staging, "domains", {"value": [EN, "example.com"], "for_container_label": pa.array([None, None], pa.string())})
-    _write(staging, "web_resources", {
+def _stage(staging, citation_instance_ids=None, row_group_size=None):
+    rg = row_group_size
+    _write(staging, rg, "domains", {"value": [EN, "example.com"], "for_container_label": pa.array([None, None], pa.string())})
+    _write(staging, rg, "web_resources", {
         "url": ["https://example.com/a", "https://unknown.example/b", ARTICLE_URL, "https://ex.com/ü?q=\"x\",y"],
         "domain_label": ["example.com", "not-a-domain.example", EN, None]})
-    _write(staging, "normalized_citations", {
+    _write(staging, rg, "normalized_citations", {
         "normalized_sha1": [SHA_A, SHA_B, SHA_C, SHA_D],
         "reference_normalized": ["ref a", "ref b, with \"quotes\"\nand a newline", "ref c", "ref d"],
         "appears_on_page_id": pa.array([7, 7, None, 7], pa.int64()),
@@ -61,7 +62,7 @@ def _stage(staging, citation_instance_ids=None):
         "citation_type": ["template", "ref_tag", "template", "template"]})
     keys = [(EN, 7, RAW_1), (EN, 7, RAW_2), (EN, 7, RAW_3)]
     ids = citation_instance_ids or [instance_id(*k) for k in keys]
-    _write(staging, "citation_instances", {
+    _write(staging, rg, "citation_instances", {
         "citation_instance_id": pa.array(ids, pa.int64()),
         "domain": [k[0] for k in keys], "page_id": pa.array([k[1] for k in keys], pa.int64()),
         "raw_sha1": [k[2] for k in keys],
@@ -69,7 +70,7 @@ def _stage(staging, citation_instance_ids=None):
         "normalized_sha1": [SHA_A, SHA_B, SHA_C],
         "reference_type": pa.array([1, None, 1], pa.int8()),
         "reference_name": pa.array(["n1", None, ""], pa.string())})
-    _write(staging, "ncwr", {
+    _write(staging, rg, "ncwr", {
         "normalized_sha1": [SHA_A, SHA_B, SHA_A, SHA_C],
         "url": ["https://example.com/a", "https://ex.com/ü?q=\"x\",y", "https://never-staged.example/", "https://example.com/a"]})
 
@@ -103,12 +104,13 @@ def _snapshot(engine):
         }
 
 
-@pytest.mark.parametrize("chunk_rows", [1, 1000])
-def test_set_based_loaders(engine, tmp_path, monkeypatch, chunk_rows):
-    monkeypatch.setattr(load, "COPY_ROWS", chunk_rows)
+@pytest.mark.parametrize("row_group_size,jobs", [(None, 1), (1, 1), (1, 4)])
+def test_set_based_loaders(engine, tmp_path, row_group_size, jobs):
+    """One row group, or one row per row group (one unit each) on 1 or 4 connections."""
     _article_row(engine)
-    _stage(tmp_path)
-    load.main(["-d", str(tmp_path), "--tables", *TABLES])
+    _stage(tmp_path, row_group_size=row_group_size)
+    args = ["-d", str(tmp_path), "--jobs", str(jobs), "--tables", *TABLES]
+    load.main(args)
     got = _snapshot(engine)
 
     def md5(u):
@@ -132,7 +134,7 @@ def test_set_based_loaders(engine, tmp_path, monkeypatch, chunk_rows):
     assert got["ncwr"] == [(SHA_A, "https://example.com/a"), (SHA_B, "https://ex.com/ü?q=\"x\",y")]
 
     # a re-run changes nothing
-    load.main(["-d", str(tmp_path), "--tables", *TABLES])
+    load.main(args)
     assert _snapshot(engine) == got
 
 

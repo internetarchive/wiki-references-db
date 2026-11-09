@@ -56,6 +56,8 @@ def make_session():
 BATCH_SIZE = int(os.getenv('LOAD_BATCH_SIZE', '5000'))
 # Rows per COPY chunk for the set-based loaders (one transaction per chunk).
 COPY_ROWS = int(os.getenv('LOAD_COPY_ROWS', '1000000'))
+# Connections for the citation tables (copy_parquet_parallel); --jobs overrides.
+LOAD_JOBS = int(os.getenv('LOAD_JOBS', '8'))
 
 
 # ---------------------------------------------------------------------------
@@ -100,8 +102,43 @@ def read_parquet_batches(filepath, batch_size=BATCH_SIZE):
     con.close()
 
 
+_CSV_OPTIONS = pa_csv.WriteOptions(include_header=False, quoting_style="all_valid")
+
+
+def _copy_and_insert(cur, rows, temp_table, temp_ddl, columns, insert_sql, index_lookups=False):
+    """``COPY`` the Arrow table or batch ``rows`` into the temporary table
+    ``temp_table`` (created if missing, emptied first) and run ``insert_sql``;
+    returns the rows it wrote. The caller commits.
+
+    NULLs travel as unquoted empty CSV fields and every non-NULL value is
+    quoted, so an empty string stays an empty string.
+
+    ``index_lookups=True`` turns hash and merge joins off for ``insert_sql``:
+    use it when the rows join a table far larger than themselves (half a
+    million staged rows against hundreds of millions of
+    ``normalized_citations``), where a hash join would scan the whole table for
+    each unit, and the planner's costs for that and for the index probes are
+    close.
+    """
+    buf = io.BytesIO()
+    pa_csv.write_csv(rows, buf, write_options=_CSV_OPTIONS)
+    buf.seek(0)
+    cur.execute(f"CREATE TEMP TABLE IF NOT EXISTS {temp_table} ({temp_ddl})")
+    cur.execute(f"TRUNCATE {temp_table}")
+    cur.copy_expert(f"COPY {temp_table} ({', '.join(columns)}) FROM STDIN WITH (FORMAT csv)", buf)
+    # a freshly filled temp table has no statistics, and autovacuum never
+    # analyzes temp tables
+    cur.execute(f"ANALYZE {temp_table}")
+    if index_lookups:
+        # SET LOCAL lasts until the caller's commit
+        cur.execute("SET LOCAL enable_hashjoin = off")
+        cur.execute("SET LOCAL enable_mergejoin = off")
+    cur.execute(insert_sql)
+    return cur.rowcount
+
+
 def copy_parquet_in_chunks(session, source_sql, temp_table, temp_ddl, columns, insert_sql,
-                           duck_tables=None, chunk_rows=None, index_lookups=False, progress=None):
+                           duck_tables=None, chunk_rows=None):
     """Set-based load: run ``source_sql`` in DuckDB (it reads the staged
     Parquet, and may join the small Arrow tables in ``duck_tables``), stream its
     rows into a temporary table with ``COPY … CSV``, ``chunk_rows`` at a time,
@@ -110,29 +147,17 @@ def copy_parquet_in_chunks(session, source_sql, temp_table, temp_ddl, columns, i
 
     This replaces per-batch Python id lookups and multi-row ``INSERT … VALUES``
     statements, which ran at ~10k rows/s; the rows never become Python
-    objects. NULLs travel as unquoted empty CSV fields and every non-NULL value
-    is quoted, so an empty string stays an empty string.
+    objects. ``copy_parquet_parallel`` does the same on several connections.
 
     Keep ``insert_sql`` to single-column joins on columns typed as in
     ``temp_ddl``: Postgres multiplies the selectivities of a multi-column join
     key as if they were independent, estimates a chunk of a million rows at a
     few dozen, and picks a nested loop. Resolve small lookups (domains,
     templates) in DuckDB instead, through ``duck_tables``.
-
-    ``index_lookups=True`` turns hash and merge joins off for ``insert_sql``:
-    use it when the chunk joins a table far larger than the chunk (a million
-    staged rows against hundreds of millions of ``normalized_citations``),
-    where a hash join would scan the whole table once per chunk, and the
-    planner's costs for that and for a million index probes are close.
-    ``progress``, if given, is called as ``progress(staged, written)`` after
-    each chunk.
     """
     chunk_rows = chunk_rows or COPY_ROWS
     dbapi = session.connection().connection.dbapi_connection
     cur = dbapi.cursor()
-    cur.execute(f"CREATE TEMP TABLE IF NOT EXISTS {temp_table} ({temp_ddl})")
-    col_list = ", ".join(columns)
-    options = pa_csv.WriteOptions(include_header=False, quoting_style="all_valid")
     con = duckdb.connect()
     staged = written = 0
     try:
@@ -142,30 +167,80 @@ def copy_parquet_in_chunks(session, source_sql, temp_table, temp_ddl, columns, i
         for batch in reader:
             if batch.num_rows == 0:
                 continue
-            buf = io.BytesIO()
-            pa_csv.write_csv(batch, buf, write_options=options)
-            buf.seek(0)
-            cur.execute(f"TRUNCATE {temp_table}")
-            cur.copy_expert(f"COPY {temp_table} ({col_list}) FROM STDIN WITH (FORMAT csv)", buf)
-            # a freshly filled temp table has no statistics, and autovacuum
-            # never analyzes temp tables
-            cur.execute(f"ANALYZE {temp_table}")
-            if index_lookups:
-                # SET LOCAL lasts until this chunk's commit
-                cur.execute("SET LOCAL enable_hashjoin = off")
-                cur.execute("SET LOCAL enable_mergejoin = off")
-            cur.execute(insert_sql)
-            written += cur.rowcount
+            written += _copy_and_insert(cur, batch, temp_table, temp_ddl, columns, insert_sql)
             staged += batch.num_rows
             dbapi.commit()
-            if progress:
-                progress(staged, written)
     except Exception:
         dbapi.rollback()
         raise
     finally:
         con.close()
         cur.close()
+    return staged, written
+
+
+def copy_parquet_parallel(engine, filepath, source_sql, temp_table, temp_ddl, columns, insert_sql,
+                          jobs=None, index_lookups=False, progress=None):
+    """``copy_parquet_in_chunks`` on ``jobs`` connections: each row group of
+    the Parquet file ``filepath`` is one unit, read with pyarrow, put through
+    ``source_sql`` in DuckDB (which reads it as the relation ``src``), copied
+    into a temporary table and inserted with ``insert_sql``, then committed.
+    Returns (rows staged, rows written).
+
+    One backend was the bottleneck at ~32k rows/s on enwiki: each row's index
+    entries and foreign-key checks run in that backend while the machine idles.
+    Units may run in any order and at the same time, so ``insert_sql`` must not
+    depend on another unit's rows, and two units must not write the same
+    conflict key (the deduped tables have one row per key). A unit commits on
+    its own, so a load that fails part way leaves the committed units in
+    place, and a re-run upserts them again. After a failure, units not yet
+    started are cancelled.
+
+    ``progress``, if given, is called as ``progress(units_done, units, staged,
+    written)`` in the calling thread.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import pyarrow.parquet as pq
+
+    jobs = jobs or LOAD_JOBS
+    n_units = pq.ParquetFile(filepath).metadata.num_row_groups
+
+    def unit(i):
+        table = pq.ParquetFile(filepath).read_row_group(i)
+        con = duckdb.connect()
+        try:
+            con.register('src', table)
+            result = con.execute(source_sql)
+            # to_arrow_table() replaces fetch_arrow_table() in newer DuckDB
+            rows = (getattr(result, 'to_arrow_table', None) or result.fetch_arrow_table)()
+        finally:
+            con.close()
+        if rows.num_rows == 0:
+            return 0, 0
+        raw = engine.raw_connection()
+        try:
+            with raw.cursor() as cur:
+                n = _copy_and_insert(cur, rows, temp_table, temp_ddl, columns, insert_sql, index_lookups)
+            raw.commit()
+        finally:
+            raw.close()
+        return rows.num_rows, n
+
+    staged = written = done = 0
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = [pool.submit(unit, i) for i in range(n_units)]
+        try:
+            for f in as_completed(futures):
+                s, w = f.result()
+                staged += s
+                written += w
+                done += 1
+                if progress:
+                    progress(done, n_units, staged, written)
+        except BaseException:
+            for f in futures:
+                f.cancel()
+            raise
     return staged, written
 
 
@@ -236,26 +311,22 @@ def _analyze(session, *tables):
     session.commit()
 
 
-def _progress(name, every=20):
-    """A ``progress`` callback for copy_parquet_in_chunks that logs the rate
-    every ``every`` chunks."""
-    t0 = time.time()
-    chunks = [0]
-
-    def report(staged, written):
-        chunks[0] += 1
-        if chunks[0] % every == 0:
-            dt = time.time() - t0
-            log(f"{name}: {staged:,} staged, {written:,} written, {staged / dt:,.0f} rows/s")
-    return report
-
-
 def _copy_load(session, name, filepath, **kwargs):
+    """``copy_parquet_parallel`` with progress lines (every 40 units) and a
+    summary; ``source_sql`` reads one row group as ``src``."""
+    session.commit()  # earlier phases' rows are visible to the other connections
     t0 = time.time()
-    staged, written = copy_parquet_in_chunks(session, progress=_progress(name), **kwargs)
+
+    def progress(done, units, staged, written):
+        if done % 40 == 0 or done == units:
+            dt = time.time() - t0
+            log(f"{name}: {done}/{units} units, {staged:,} staged, {written:,} written, "
+                f"{staged / dt:,.0f} rows/s")
+
+    staged, written = copy_parquet_parallel(session.get_bind(), filepath, progress=progress, **kwargs)
     dt = time.time() - t0
     log(f"{name}: {staged:,} rows staged, {written:,} written in {dt:.1f}s "
-        f"({staged / dt if dt else 0:,.0f} rows/s)")
+        f"({staged / dt if dt else 0:,.0f} rows/s, {LOAD_JOBS} jobs)")
     return staged, written
 
 
@@ -271,8 +342,8 @@ def load_web_resources(session, staging_dir):
     _copy_load(
         session, 'web_resources', filepath,
         # md5 of the UTF-8 bytes as lowercase hex, as WebResource.compute_url_hash
-        source_sql=f"SELECT url, md5(url) AS url_hash, domain_label FROM read_parquet('{_q(filepath)}') "
-                   f"WHERE url IS NOT NULL",
+        source_sql="SELECT url, md5(url) AS url_hash, domain_label FROM src "
+                   "WHERE url IS NOT NULL",
         temp_table='_wr_stage', temp_ddl='url text, url_hash char(32), domain_label text',
         columns=['url', 'url_hash', 'domain_label'],
         insert_sql="""
@@ -330,8 +401,8 @@ def load_normalized_citations(session, staging_dir):
     _analyze(session, 'domains')
     staged, written = _copy_load(
         session, 'normalized_citations', filepath,
-        source_sql=f"SELECT normalized_sha1, reference_normalized, appears_on_domain, appears_on_page_id, "
-                   f"citation_type FROM read_parquet('{_q(filepath)}') WHERE normalized_sha1 IS NOT NULL",
+        source_sql="SELECT normalized_sha1, reference_normalized, appears_on_domain, appears_on_page_id, "
+                   "citation_type FROM src WHERE normalized_sha1 IS NOT NULL",
         temp_table='_nc_stage',
         temp_ddl='normalized_sha1 char(40), reference_normalized text, appears_on_domain text, '
                  'appears_on_page_id integer, citation_type text',
@@ -374,7 +445,7 @@ def load_citation_instances(session, staging_dir):
                         ELSE computed END AS id,
                    domain, page_id, raw_sha1, normalized_sha1,
                    COALESCE(reference_type, 0) AS reference_type, reference_name
-            FROM (SELECT *, {computed} AS computed FROM read_parquet('{_q(filepath)}'))""",
+            FROM (SELECT *, {computed} AS computed FROM src)""",
         temp_table='_ci_stage',
         temp_ddl='id bigint, domain text, page_id integer, raw_sha1 char(40), normalized_sha1 char(40), '
                  'reference_type smallint, reference_name text',
@@ -407,8 +478,8 @@ def load_ncwr(session, staging_dir):
     staged, written = _copy_load(
         session, 'ncwr', filepath,
         # URLs resolve through url_hash, the indexed unique key (there is no index on url)
-        source_sql=f"SELECT normalized_sha1, md5(url) AS url_hash FROM read_parquet('{_q(filepath)}') "
-                   f"WHERE normalized_sha1 IS NOT NULL AND url IS NOT NULL",
+        source_sql="SELECT normalized_sha1, md5(url) AS url_hash FROM src "
+                   "WHERE normalized_sha1 IS NOT NULL AND url IS NOT NULL",
         temp_table='_ncwr_stage', temp_ddl='normalized_sha1 char(40), url_hash char(32)',
         columns=['normalized_sha1', 'url_hash'],
         insert_sql="""
@@ -604,7 +675,7 @@ def _write_template_counts(session, domains, counts):
 # ---------------------------------------------------------------------------
 
 def main(argv=None):
-    global BATCH_SIZE
+    global BATCH_SIZE, LOAD_JOBS
     parser = argparse.ArgumentParser(description='Load staged Parquet files into PostgreSQL')
     parser.add_argument('-d', '--staging-dir', default=os.environ.get('STAGING_DIR', './staging'),
                         help='Staging directory (default: STAGING_DIR env or ./staging)')
@@ -613,6 +684,9 @@ def main(argv=None):
                              'required for the template_data phase')
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE,
                         help=f'Rows per INSERT batch (default: {BATCH_SIZE})')
+    parser.add_argument('--jobs', type=int, default=LOAD_JOBS,
+                        help='Connections loading web_resources, normalized_citations, citation_instances '
+                             f'and ncwr in parallel, one Parquet row group per unit (default: LOAD_JOBS or {LOAD_JOBS})')
 
     all_phases = OrderedDict([
         ('containers',           ('Phase 1: containers',            lambda s, d, ctx: load_containers(s, d))),
@@ -637,6 +711,9 @@ def main(argv=None):
         raise SystemExit(f"Staging directory does not exist: {staging_dir}")
 
     BATCH_SIZE = args.batch_size
+    if args.jobs < 1:
+        raise SystemExit("--jobs must be at least 1")
+    LOAD_JOBS = args.jobs
 
     session = make_session()
     t0 = time.time()
