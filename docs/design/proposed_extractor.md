@@ -29,7 +29,7 @@ Known gaps in the current pipeline that this proposal fixes: `build_all.py` neve
 | **Syntactic normalizer** (`syntax.py`) | Canonical text + `normalized_sha1` for deduplication. Unchanged. |
 | **Extractor** (`article.py`) | Four candidate kinds (ref tags, standalone shorthand, reference-section list items, external links) with offsets; per-domain config in `wikis.yaml`. |
 | **URL/domain extraction** | `web_resources`, `domains`, `ncwr`. Unchanged. |
-| **Template parameter storage** (`template_data`) | Arbitrary parameter search. Unchanged. |
+| **Template parameter storage** (`template_data`) | Arbitrary parameter search. Staged as before; since plan §20 stored in the Parquet tier (`template_params`, `template_param_index`), not Postgres. |
 | **Entity/occurrence split** | `normalized_citations` + `citation_instances`. Kept; semantic columns go on a new `normalized_citation_parts`. |
 | **Parquet staging → dedup → load** | Kept; extended. |
 

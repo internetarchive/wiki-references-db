@@ -82,7 +82,7 @@ One `global_sources` row with `n_pages, n_total_citations, reliability_score, ve
 
 ##### `GET /api/v2/pages/{domain}/{page_id}/citations?revision_id=&raw=false&limit=100&offset=0`
 Citations present at a revision. `NormalizedCitationItem` gains: `citation_type`, `parts[] {part_index, part_type, norm_subtype, template_name, template_subtype, extracted_{doi,isbn,pmid,pmc,arxiv,wikidata_qid,url}, global_source_id, source_type, match_type, confidence, reliability_score, verdict}`.
-**Tables**: `citation_history` (Parquet) → `citation_instances`, `normalized_citations`, `normalized_citation_parts`, `citation_source_resolution`, `global_sources`, `normalized_citation_web_resources`, `web_resources`, `template_data`, `wiki_templates` (Postgres).
+**Tables**: `citation_history` (Parquet) → `citation_instances`, `normalized_citations`, `normalized_citation_parts`, `citation_source_resolution`, `global_sources`, `normalized_citation_web_resources`, `web_resources`, `wiki_templates` (Postgres); template parameters from Parquet `template_params` / `template_param_index` (plan §20).
 
 ##### `GET /api/v2/citations/{normalized_sha1}`
 v1 `CitationDetailResponse` + `citation_type` + `parts[]` as above + `instances[] {domain, page_id, reference_name, reference_type}`.
@@ -112,10 +112,10 @@ Unchanged shape; each referencing citation gains `global_source_id`, `reliabilit
 | `/pages/{d}/{id}/top-sources` | `page_source_summary`, `global_sources`, `page_metadata` | — |
 | `/sources/{id}/pages`, `/sources/{id}` | `page_source_summary`, `global_sources`, `page_metadata`, `domains`, `citation_source_resolution` | — |
 | `/pages/{d}/{id}/revisions` | `revisions` | `citation_history` |
-| `/pages/{d}/{id}/citations` | `citation_instances`, `normalized_citations`, `normalized_citation_parts`, `citation_source_resolution`, `global_sources`, `web_resources`, `normalized_citation_web_resources`, `template_data`, `wiki_templates` | `citation_history` |
+| `/pages/{d}/{id}/citations` | `citation_instances`, `normalized_citations`, `normalized_citation_parts`, `citation_source_resolution`, `global_sources`, `web_resources`, `normalized_citation_web_resources`, `wiki_templates` | `citation_history`, `template_params` |
 | `/citations/{sha1}` | same minus history | — |
 | `/citations/{sha1}/history` | `citation_instances`, `revisions` | `citation_history` |
-| `/templates/{id}/report` | `wiki_templates`, `template_data`, `normalized_citations` | — |
+| `/templates/{id}/report` | `wiki_templates`, `template_value_counts`, `normalized_citations` | `template_param_index` (one `search_bucket`); citations listed by `normalized_sha1` |
 | `/web-resources?url=` | `web_resources`, `domains`, `normalized_citation_web_resources`, `normalized_citations`, `normalized_citation_parts`, `citation_source_resolution`, `global_sources` | — |
 
 ---

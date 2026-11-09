@@ -14,6 +14,8 @@ repository root with `.env` filled in (`example.env`).
 | `PARQUET_DIR` | Stages 1, 3–8, the API | the Parquet tier: `<dataset>/domain=<d>/page_bucket=<n>/` |
 | `STAGING_DIR` | Stages 0, 1, 3 | per-shard staging Parquet, consumed by `dedup`/`load`, disposable afterwards; Stage 0's default `--work-dir` |
 | `STAGE0_MEMORY_LIMIT` | Stage 0 | DuckDB memory limit for `stage0-load` (default for `--memory-limit`) |
+| `DEDUP_ROWS_PER_PARTITION` | Stage 3 | staged rows per key partition in `dedup` (memory follows it) |
+| `LOAD_MEMORY_LIMIT`, `LOAD_ROWS_PER_PARTITION`, `TEMPLATE_COUNT_MIN` | Stage 3 | DuckDB memory limit and join partition size for the template Parquet written by `load`; the citation count from which a template value's report total is precomputed |
 | `REVISION_BUNDLES_DIR` | Stage 1 | the `.mwrev.zst` bundles, one directory per domain |
 | `API_*`, `WIKIPEDIA_API_*` | the API | CORS, default domain, pool size, User-Agent for title lookups |
 
@@ -67,7 +69,7 @@ uv run wcd extract-all -d $BUNDLES/en.wikipedia.org -o $STAGING --domain en.wiki
 
 # 3  dedup (instance-id collision gate) → load → gate 3 → indexes
 uv run wcd dedup -d $STAGING
-uv run wcd load -d $STAGING
+uv run wcd load -d $STAGING --parquet-dir $PARQUET_DIR
 uv run wcd gate 3 --domain en.wikipedia.org
 uv run wcd init-db --add-indexes
 
@@ -185,7 +187,7 @@ exits non-zero, and the next run clears and redoes that shard only.
 | `stage0-load` | `domains`, `revision_bundles`, `revisions`, `page_metadata`, article `web_resources`; `revisions/` Parquet | Postgres rows upserted / `ON CONFLICT DO NOTHING`, committed per page batch and per `rev_id` unit (an interrupted load resumes on re-run); the domain's `revisions/` partitions rebuilt from **everything under `--metadata`** | domain |
 | `extract` (`extract-all`) | staging files of the shard; `citation_history/`, `named_ref_uses/`, `revision_signals/` files named after the shard | that shard's files only (`<shard>-<i>.parquet` in every bucket) | shard (one bundle) |
 | `dedup` | `$STAGING/deduped/*.parquet` | per table (`.done` markers; delete `deduped/` to redo) | staging set |
-| `load` | `containers`, `domains`, `web_resources` (cited), `wiki_templates`, `normalized_citations`, `citation_instances`, `normalized_citation_web_resources`, `template_data` | upserts — idempotent | staging set |
+| `load` | `containers`, `domains`, `web_resources` (cited), `wiki_templates`, `normalized_citations`, `citation_instances`, `normalized_citation_web_resources`, `template_value_counts`; Parquet `template_params/`, `template_param_index/` | upserts — idempotent; the template datasets' domain partitions and that domain's `template_value_counts` replaced | staging set |
 | `parts` | `normalized_citation_parts` | DELETE + INSERT per batch; `--resume` skips citations that already have parts | domain (or all) |
 | `denorm-export` | `citation_instances_denorm/` | the domain's partitions | domain |
 | `ref-name-links` | `ref_name_links` table and Parquet | the domain | domain |

@@ -57,7 +57,8 @@ domains                -- domain names (the site identifier)
 containers             -- periodicals, journals
 wiki_templates         -- template names per domain
 revision_bundles       -- pointers to .mwrev.zst files (written by RevisionChest)
-template_data          -- per-parameter rows for template search
+template_value_counts  -- report totals of heavy template values (parameters themselves: Parquet,
+                       --   template_params / template_param_index; plan §20)
 normalized_citation_web_resources
 ```
 
@@ -459,7 +460,8 @@ Stages 1–3: Extraction + Load (build_db.py / dedup_parquet.py / load_all.py)
     → Parquet staging (citation_instances, normalized_citations, ncwr, template_data, …)
     → Tier-2 Parquet written directly: citation_history, named_ref_uses, revision_signals
     → Postgres load: domains, web_resources (cited URLs), normalized_citations,
-      citation_instances, ncwr, wiki_templates, template_data
+      citation_instances, ncwr, wiki_templates, template_value_counts
+      + Parquet template_params, template_param_index
       (+ RevisionChest metadata → revisions, page_metadata if not loaded in Stage 0)
     → revisions Parquet (re-partitioned from RevisionChest metadata)
 

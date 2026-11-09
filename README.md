@@ -149,7 +149,9 @@ committed Stage-0 metadata fixture against the binary.
   one per (domain, page, raw text) with a deterministic id;
   `citation_history` (Parquet only) records which revisions each instance
   appears in; `named_ref_uses` (Parquet) each self-closing `<ref name=…/>`
-  reuse; `template_data` stores template parameters for search;
+  reuse; template parameters live in the Parquet tier (`template_params` by page,
+  `template_param_index` for the template report; `template_value_counts` in Postgres
+  holds the report totals of heavy values);
   `web_resources` the cited URLs.
 * `normalized_citation_parts` (Stage 4) holds the UVA normalizers' output per
   semantic part of a citation; `ref_name_links` (Stage 5) maps a page's
