@@ -33,15 +33,13 @@ from collections import OrderedDict
 
 
 import duckdb
-import pyarrow as pa
 import pyarrow.csv as pa_csv
 from sqlalchemy import create_engine, select as sa_select, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
-from wcd_schema.ids import instance_id
+from wcd_schema.ids import instance_id_sql
 from wcd_schema.postgres import (
-    CitationInstance, Container, Domain, NormalizedCitation,
-    NormalizedCitationWebResource, WebResource, WikiTemplate,
+    Container, Domain, WikiTemplate,
 )
 from wcd_schema import parquet as layout
 from wcd_schema.ids import PAGE_BUCKETS, template_search_bucket_sql
@@ -103,7 +101,7 @@ def read_parquet_batches(filepath, batch_size=BATCH_SIZE):
 
 
 def copy_parquet_in_chunks(session, source_sql, temp_table, temp_ddl, columns, insert_sql,
-                           duck_tables=None, chunk_rows=None):
+                           duck_tables=None, chunk_rows=None, index_lookups=False, progress=None):
     """Set-based load: run ``source_sql`` in DuckDB (it reads the staged
     Parquet, and may join the small Arrow tables in ``duck_tables``), stream its
     rows into a temporary table with ``COPY … CSV``, ``chunk_rows`` at a time,
@@ -120,6 +118,14 @@ def copy_parquet_in_chunks(session, source_sql, temp_table, temp_ddl, columns, i
     key as if they were independent, estimates a chunk of a million rows at a
     few dozen, and picks a nested loop. Resolve small lookups (domains,
     templates) in DuckDB instead, through ``duck_tables``.
+
+    ``index_lookups=True`` turns hash and merge joins off for ``insert_sql``:
+    use it when the chunk joins a table far larger than the chunk (a million
+    staged rows against hundreds of millions of ``normalized_citations``),
+    where a hash join would scan the whole table once per chunk, and the
+    planner's costs for that and for a million index probes are close.
+    ``progress``, if given, is called as ``progress(staged, written)`` after
+    each chunk.
     """
     chunk_rows = chunk_rows or COPY_ROWS
     dbapi = session.connection().connection.dbapi_connection
@@ -144,10 +150,16 @@ def copy_parquet_in_chunks(session, source_sql, temp_table, temp_ddl, columns, i
             # a freshly filled temp table has no statistics, and autovacuum
             # never analyzes temp tables
             cur.execute(f"ANALYZE {temp_table}")
+            if index_lookups:
+                # SET LOCAL lasts until this chunk's commit
+                cur.execute("SET LOCAL enable_hashjoin = off")
+                cur.execute("SET LOCAL enable_mergejoin = off")
             cur.execute(insert_sql)
             written += cur.rowcount
             staged += batch.num_rows
             dbapi.commit()
+            if progress:
+                progress(staged, written)
     except Exception:
         dbapi.rollback()
         raise
@@ -216,28 +228,60 @@ def load_domains(session, staging_dir):
     log(f"domains: {count} rows loaded")
 
 
+def _analyze(session, *tables):
+    """Refresh planner statistics on lookup tables an earlier phase just
+    filled (autovacuum may not have analyzed them yet)."""
+    for t in tables:
+        session.execute(text(f"ANALYZE {t}"))
+    session.commit()
+
+
+def _progress(name, every=20):
+    """A ``progress`` callback for copy_parquet_in_chunks that logs the rate
+    every ``every`` chunks."""
+    t0 = time.time()
+    chunks = [0]
+
+    def report(staged, written):
+        chunks[0] += 1
+        if chunks[0] % every == 0:
+            dt = time.time() - t0
+            log(f"{name}: {staged:,} staged, {written:,} written, {staged / dt:,.0f} rows/s")
+    return report
+
+
+def _copy_load(session, name, filepath, **kwargs):
+    t0 = time.time()
+    staged, written = copy_parquet_in_chunks(session, progress=_progress(name), **kwargs)
+    dt = time.time() - t0
+    log(f"{name}: {staged:,} rows staged, {written:,} written in {dt:.1f}s "
+        f"({staged / dt if dt else 0:,.0f} rows/s)")
+    return staged, written
+
+
 def load_web_resources(session, staging_dir):
-    """Cited URLs (article curid rows are written at Stage 0)."""
+    """Cited URLs (article curid rows are written at Stage 0). A URL already
+    present (an article row, or a re-run) keeps its other columns; a resolved
+    domain replaces the stored one."""
     filepath = find_deduped_parquet(staging_dir, 'web_resources')
     if not filepath:
         return
     log(f"web_resources: loading from {filepath}")
-
-    count = 0
-    for batch in read_parquet_batches(filepath):
-        domain_to_id = _domain_ids(session, (r.get('domain_label') for r in batch))
-        cleaned = []
-        for r in batch:
-            wr = {'url': r['url']}
-            dl = r.get('domain_label')
-            if dl and dl in domain_to_id:
-                wr['domain_id'] = domain_to_id[dl]
-            cleaned.append(wr)
-        if cleaned:
-            WebResource.bulk_upsert(session, cleaned)
-            session.commit()
-        count += len(cleaned)
-    log(f"web_resources: {count} rows loaded")
+    _analyze(session, 'domains')
+    _copy_load(
+        session, 'web_resources', filepath,
+        # md5 of the UTF-8 bytes as lowercase hex, as WebResource.compute_url_hash
+        source_sql=f"SELECT url, md5(url) AS url_hash, domain_label FROM read_parquet('{_q(filepath)}') "
+                   f"WHERE url IS NOT NULL",
+        temp_table='_wr_stage', temp_ddl='url text, url_hash char(32), domain_label text',
+        columns=['url', 'url_hash', 'domain_label'],
+        insert_sql="""
+            INSERT INTO web_resources (url, url_hash, domain_id)
+            SELECT s.url, s.url_hash, d.id
+            FROM _wr_stage s LEFT JOIN domains d ON d.value = s.domain_label
+            ON CONFLICT (url_hash) DO UPDATE SET
+                url = EXCLUDED.url,
+                domain_id = COALESCE(EXCLUDED.domain_id, web_resources.domain_id)""")
 
 
 def _domain_ids(session, labels):
@@ -283,32 +327,31 @@ def load_normalized_citations(session, staging_dir):
     if not filepath:
         return
     log(f"normalized_citations: loading from {filepath}")
-
-    count = 0
-    skipped = 0
-    for batch in read_parquet_batches(filepath):
-        domain_to_id = _domain_ids(session, (r.get('appears_on_domain') for r in batch))
-        cleaned = []
-        for r in batch:
-            domain_id = domain_to_id.get(r.get('appears_on_domain'))
-            page_id = r.get('appears_on_page_id')
-            if domain_id is None or page_id is None or not r.get('citation_type'):
-                skipped += 1
-                continue
-            cleaned.append({
-                'normalized_sha1': r['normalized_sha1'],
-                'reference_normalized': r['reference_normalized'],
-                'appears_on_domain_id': domain_id,
-                'appears_on_page_id': page_id,
-                'citation_type': r['citation_type'],
-            })
-        if cleaned:
-            NormalizedCitation.bulk_upsert(session, cleaned)
-            session.commit()
-            count += len(cleaned)
-    if skipped:
-        log(f"normalized_citations: warning: {skipped} rows skipped (unknown domain, missing page id or citation_type)")
-    log(f"normalized_citations: {count} rows loaded")
+    _analyze(session, 'domains')
+    staged, written = _copy_load(
+        session, 'normalized_citations', filepath,
+        source_sql=f"SELECT normalized_sha1, reference_normalized, appears_on_domain, appears_on_page_id, "
+                   f"citation_type FROM read_parquet('{_q(filepath)}') WHERE normalized_sha1 IS NOT NULL",
+        temp_table='_nc_stage',
+        temp_ddl='normalized_sha1 char(40), reference_normalized text, appears_on_domain text, '
+                 'appears_on_page_id integer, citation_type text',
+        columns=['normalized_sha1', 'reference_normalized', 'appears_on_domain', 'appears_on_page_id',
+                 'citation_type'],
+        # rows with an unknown domain, no page id or no citation_type are skipped
+        insert_sql="""
+            INSERT INTO normalized_citations
+                (normalized_sha1, reference_normalized, appears_on_domain_id, appears_on_page_id, citation_type)
+            SELECT s.normalized_sha1, s.reference_normalized, d.id, s.appears_on_page_id, s.citation_type
+            FROM _nc_stage s JOIN domains d ON d.value = s.appears_on_domain
+            WHERE s.appears_on_page_id IS NOT NULL AND s.citation_type <> ''
+            ON CONFLICT (normalized_sha1) DO UPDATE SET
+                reference_normalized = EXCLUDED.reference_normalized,
+                appears_on_domain_id = EXCLUDED.appears_on_domain_id,
+                appears_on_page_id = EXCLUDED.appears_on_page_id,
+                citation_type = EXCLUDED.citation_type""")
+    if staged != written:
+        log(f"normalized_citations: warning: {staged - written} rows skipped "
+            f"(unknown domain, missing page id or citation_type)")
 
 
 def load_citation_instances(session, staging_dir):
@@ -320,50 +363,38 @@ def load_citation_instances(session, staging_dir):
     if not filepath:
         return
     log(f"citation_instances: loading from {filepath}")
-
-    count = 0
-    skipped = 0
-    for batch in read_parquet_batches(filepath):
-        sha1s = list({r['normalized_sha1'] for r in batch if r.get('normalized_sha1')})
-        sha1_to_norm = {}
-        for chunk in chunked_iterable(sha1s, 1000):
-            result = session.execute(
-                sa_select(NormalizedCitation.normalized_sha1, NormalizedCitation.id)
-                .where(NormalizedCitation.normalized_sha1.in_(chunk))
-            ).all()
-            sha1_to_norm.update(dict(result))
-        domain_to_id = _domain_ids(session, (r.get('domain') for r in batch))
-
-        cleaned = []
-        for r in batch:
-            norm_id = sha1_to_norm.get(r.get('normalized_sha1'))
-            domain_id = domain_to_id.get(r.get('domain'))
-            if norm_id is None or domain_id is None:
-                skipped += 1
-                continue
-            expected = instance_id(r['domain'], r['page_id'], r['raw_sha1'])
-            staged = r.get('citation_instance_id')
-            if staged is not None and staged != expected:
-                raise RuntimeError(
-                    f"citation_instance_id mismatch for ({r['domain']}, {r['page_id']}, {r['raw_sha1']}): "
-                    f"staged {staged}, computed {expected}")
-            cleaned.append({
-                'id': expected,
-                'domain_id': domain_id,
-                'page_id': r['page_id'],
-                'raw_sha1': r['raw_sha1'],
-                'normalized_id': norm_id,
-                'reference_type': r.get('reference_type', 0),
-                'reference_name': r.get('reference_name'),
-            })
-
-        if cleaned:
-            CitationInstance.bulk_upsert(session, cleaned)
-            session.commit()
-            count += len(cleaned)
-    if skipped:
-        log(f"citation_instances: warning: {skipped} rows skipped (no matching normalized citation or unknown domain)")
-    log(f"citation_instances: {count} rows loaded")
+    _analyze(session, 'domains', 'normalized_citations')
+    computed = instance_id_sql('domain', 'page_id', 'raw_sha1')
+    staged, written = _copy_load(
+        session, 'citation_instances', filepath,
+        source_sql=f"""
+            SELECT CASE WHEN citation_instance_id IS NOT NULL AND citation_instance_id <> computed
+                        THEN error('citation_instance_id mismatch for (' || domain || ', ' || page_id || ', '
+                                   || raw_sha1 || '): staged ' || citation_instance_id || ', computed ' || computed)
+                        ELSE computed END AS id,
+                   domain, page_id, raw_sha1, normalized_sha1,
+                   COALESCE(reference_type, 0) AS reference_type, reference_name
+            FROM (SELECT *, {computed} AS computed FROM read_parquet('{_q(filepath)}'))""",
+        temp_table='_ci_stage',
+        temp_ddl='id bigint, domain text, page_id integer, raw_sha1 char(40), normalized_sha1 char(40), '
+                 'reference_type smallint, reference_name text',
+        columns=['id', 'domain', 'page_id', 'raw_sha1', 'normalized_sha1', 'reference_type', 'reference_name'],
+        # rows without a matching normalized citation or domain are skipped
+        insert_sql="""
+            INSERT INTO citation_instances
+                (id, domain_id, page_id, raw_sha1, normalized_id, reference_type, reference_name)
+            SELECT s.id, d.id, s.page_id, s.raw_sha1, n.id, s.reference_type, s.reference_name
+            FROM _ci_stage s
+            JOIN domains d ON d.value = s.domain
+            JOIN normalized_citations n ON n.normalized_sha1 = s.normalized_sha1
+            ON CONFLICT (id) DO UPDATE SET
+                normalized_id = EXCLUDED.normalized_id,
+                reference_type = EXCLUDED.reference_type,
+                reference_name = EXCLUDED.reference_name""",
+        index_lookups=True)
+    if staged != written:
+        log(f"citation_instances: warning: {staged - written} rows skipped "
+            f"(no matching normalized citation or unknown domain)")
 
 
 def load_ncwr(session, staging_dir):
@@ -372,42 +403,24 @@ def load_ncwr(session, staging_dir):
     if not filepath:
         return
     log(f"ncwr: loading from {filepath}")
-
-    count = 0
-    for batch in read_parquet_batches(filepath):
-        # Resolve URLs to web_resource_ids
-        urls = list(set(r['url'] for r in batch))
-        url_to_id = {}
-        for chunk in chunked_iterable(urls, 1000):
-            result = session.execute(
-                sa_select(WebResource.url, WebResource.id).where(WebResource.url.in_(chunk))
-            ).all()
-            url_to_id.update({u: i for u, i in result})
-
-        # Resolve normalized_sha1 -> normalized_id
-        sha1s = list(set(r['normalized_sha1'] for r in batch))
-        sha1_to_id = {}
-        for chunk in chunked_iterable(sha1s, 1000):
-            result = session.execute(
-                sa_select(NormalizedCitation.normalized_sha1, NormalizedCitation.id)
-                .where(NormalizedCitation.normalized_sha1.in_(chunk))
-            ).all()
-            sha1_to_id.update({s: i for s, i in result})
-
-        cleaned = []
-        for r in batch:
-            wr_id = url_to_id.get(r['url'])
-            norm_id = sha1_to_id.get(r['normalized_sha1'])
-            if wr_id is not None and norm_id is not None:
-                cleaned.append({
-                    'normalized_id': norm_id,
-                    'web_resource_id': wr_id,
-                })
-        if cleaned:
-            NormalizedCitationWebResource.bulk_upsert(session, cleaned)
-            session.commit()
-            count += len(cleaned)
-    log(f"ncwr: {count} rows loaded")
+    _analyze(session, 'normalized_citations', 'web_resources')
+    staged, written = _copy_load(
+        session, 'ncwr', filepath,
+        # URLs resolve through url_hash, the indexed unique key (there is no index on url)
+        source_sql=f"SELECT normalized_sha1, md5(url) AS url_hash FROM read_parquet('{_q(filepath)}') "
+                   f"WHERE normalized_sha1 IS NOT NULL AND url IS NOT NULL",
+        temp_table='_ncwr_stage', temp_ddl='normalized_sha1 char(40), url_hash char(32)',
+        columns=['normalized_sha1', 'url_hash'],
+        insert_sql="""
+            INSERT INTO normalized_citation_web_resources (normalized_id, web_resource_id)
+            SELECT n.id, w.id
+            FROM _ncwr_stage s
+            JOIN normalized_citations n ON n.normalized_sha1 = s.normalized_sha1
+            JOIN web_resources w ON w.url_hash = s.url_hash
+            ON CONFLICT DO NOTHING""",
+        index_lookups=True)
+    if staged != written:
+        log(f"ncwr: {staged - written} rows not written (unresolved citation or URL, or already present)")
 
 
 # ---------------------------------------------------------------------------
