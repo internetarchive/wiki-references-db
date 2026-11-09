@@ -145,3 +145,25 @@ def test_citation_instance_id_mismatch_fails(engine, tmp_path):
         load.main(["-d", str(tmp_path), "--tables", "citation_instances"])
     with engine.connect() as con:
         assert con.execute(text("SELECT count(*) FROM citation_instances")).scalar() == 0
+
+
+def test_sorted_copy_orders_row_groups(tmp_path, monkeypatch):
+    """Units are the sorted copy's row groups, so they must come out in key order
+    (``_duck`` turns preserve_insertion_order off, which ORDER BY must override)."""
+    n = 20000
+    keys = [hashlib.sha1(str(i).encode()).hexdigest() for i in range(n)]
+    src = tmp_path / "t.parquet"
+    pq.write_table(pa.table({"k": keys, "v": list(range(n))}), src, row_group_size=997)
+    # DuckDB rounds row groups to whole vectors (2,048 rows)
+    monkeypatch.setattr(load, "SORTED_GROUP", 4096)
+    out = load._sorted_copy(str(src), "k", str(tmp_path / "work"))
+    f = pq.ParquetFile(out)
+    assert f.metadata.num_row_groups >= 4
+    got = [k for i in range(f.metadata.num_row_groups) for k in f.read_row_group(i).column("k").to_pylist()]
+    assert got == sorted(keys)
+
+
+def test_loaders_leave_no_sorted_copies(engine, tmp_path):
+    _stage(tmp_path, row_group_size=1)
+    load.main(["-d", str(tmp_path), "--jobs", "2", "--tables", *TABLES])
+    assert not any((tmp_path / ".load-sort").rglob("*"))

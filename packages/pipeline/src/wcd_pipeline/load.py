@@ -27,6 +27,7 @@ Usage:
 import io
 import itertools
 import os
+import shutil
 import time
 import argparse
 from collections import OrderedDict
@@ -58,6 +59,8 @@ BATCH_SIZE = int(os.getenv('LOAD_BATCH_SIZE', '5000'))
 COPY_ROWS = int(os.getenv('LOAD_COPY_ROWS', '1000000'))
 # Connections for the citation tables (copy_parquet_parallel); --jobs overrides.
 LOAD_JOBS = int(os.getenv('LOAD_JOBS', '8'))
+# Rows per row group (= per unit) of the key-sorted copies the citation tables load from
+SORTED_GROUP = 500_000
 
 
 # ---------------------------------------------------------------------------
@@ -179,8 +182,27 @@ def copy_parquet_in_chunks(session, source_sql, temp_table, temp_ddl, columns, i
     return staged, written
 
 
+def _sorted_copy(filepath, sort_by, work_dir):
+    """A copy of ``filepath`` ordered by the SQL expression ``sort_by``
+    (DuckDB, under ``LOAD_MEMORY_LIMIT``, spilling next to it), in row groups
+    of ``SORTED_GROUP`` rows, in a new directory under ``work_dir``; returns
+    its path. The caller removes that directory."""
+    import tempfile
+
+    os.makedirs(work_dir, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix='load-sort-', dir=work_dir)
+    out = os.path.join(tmp, os.path.basename(filepath).replace('.parquet', '.sorted.parquet'))
+    con = _duck(temp_dir=os.path.join(tmp, 'spill'))
+    try:
+        con.execute(f"""COPY (SELECT * FROM read_parquet('{_q(filepath)}') ORDER BY {sort_by})
+                        TO '{_q(out)}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {SORTED_GROUP})""")
+    finally:
+        con.close()
+    return out
+
+
 def copy_parquet_parallel(engine, filepath, source_sql, temp_table, temp_ddl, columns, insert_sql,
-                          jobs=None, index_lookups=False, progress=None):
+                          jobs=None, index_lookups=False, progress=None, sort_by=None, work_dir=None):
     """``copy_parquet_in_chunks`` on ``jobs`` connections: each row group of
     the Parquet file ``filepath`` is one unit, read with pyarrow, put through
     ``source_sql`` in DuckDB (which reads it as the relation ``src``), copied
@@ -198,11 +220,37 @@ def copy_parquet_parallel(engine, filepath, source_sql, temp_table, temp_ddl, co
 
     ``progress``, if given, is called as ``progress(units_done, units, staged,
     written)`` in the calling thread.
+
+    ``sort_by`` (an SQL expression over the file's columns) first writes a
+    copy of the file in that order under ``work_dir`` (deleted afterwards), and
+    the units are its row groups, started in key order. Use the key of the
+    table's largest random-keyed index (a SHA-1, an md5): the units in flight
+    then cover adjacent key ranges, so that index is written in a few narrow
+    regions instead of all over. Unsorted, enwiki's ``normalized_citations``
+    fell from ~114k to ~14k rows/s as its ``normalized_sha1`` index (18 GB)
+    outgrew the cache and every insert became a random read.
     """
+    jobs = jobs or LOAD_JOBS
+    sorted_file = None
+    if sort_by:
+        if not work_dir:
+            raise ValueError("sort_by needs a work_dir")
+        t0 = time.time()
+        sorted_file = filepath = _sorted_copy(filepath, sort_by, work_dir)
+        log(f"{temp_table}: sorted by {sort_by} in {time.time() - t0:.0f}s")
+    try:
+        return _run_units(engine, filepath, source_sql, temp_table, temp_ddl, columns, insert_sql,
+                          jobs, index_lookups, progress)
+    finally:
+        if sorted_file:
+            shutil.rmtree(os.path.dirname(sorted_file), ignore_errors=True)
+
+
+def _run_units(engine, filepath, source_sql, temp_table, temp_ddl, columns, insert_sql,
+               jobs, index_lookups, progress):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import pyarrow.parquet as pq
 
-    jobs = jobs or LOAD_JOBS
     n_units = pq.ParquetFile(filepath).metadata.num_row_groups
 
     def unit(i):
@@ -323,6 +371,9 @@ def _copy_load(session, name, filepath, **kwargs):
             log(f"{name}: {done}/{units} units, {staged:,} staged, {written:,} written, "
                 f"{staged / dt:,.0f} rows/s")
 
+    # sorted copies go under <staging>/.load-sort (filepath is <staging>/deduped/<table>.parquet)
+    kwargs.setdefault('work_dir', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(filepath))),
+                                               '.load-sort'))
     staged, written = copy_parquet_parallel(session.get_bind(), filepath, progress=progress, **kwargs)
     dt = time.time() - t0
     log(f"{name}: {staged:,} rows staged, {written:,} written in {dt:.1f}s "
@@ -352,7 +403,8 @@ def load_web_resources(session, staging_dir):
             FROM _wr_stage s LEFT JOIN domains d ON d.value = s.domain_label
             ON CONFLICT (url_hash) DO UPDATE SET
                 url = EXCLUDED.url,
-                domain_id = COALESCE(EXCLUDED.domain_id, web_resources.domain_id)""")
+                domain_id = COALESCE(EXCLUDED.domain_id, web_resources.domain_id)""",
+        sort_by='md5(url)')  # url_hash order
 
 
 def _domain_ids(session, labels):
@@ -419,7 +471,8 @@ def load_normalized_citations(session, staging_dir):
                 reference_normalized = EXCLUDED.reference_normalized,
                 appears_on_domain_id = EXCLUDED.appears_on_domain_id,
                 appears_on_page_id = EXCLUDED.appears_on_page_id,
-                citation_type = EXCLUDED.citation_type""")
+                citation_type = EXCLUDED.citation_type""",
+        sort_by='normalized_sha1')
     if staged != written:
         log(f"normalized_citations: warning: {staged - written} rows skipped "
             f"(unknown domain, missing page id or citation_type)")
@@ -462,7 +515,10 @@ def load_citation_instances(session, staging_dir):
                 normalized_id = EXCLUDED.normalized_id,
                 reference_type = EXCLUDED.reference_type,
                 reference_name = EXCLUDED.reference_name""",
-        index_lookups=True)
+        index_lookups=True,
+        # the order of uix_ci_domain_page_raw, the largest index; the 8-byte
+        # primary key and the normalized_sha1 lookups stay random but small
+        sort_by='domain, page_id, raw_sha1')
     if staged != written:
         log(f"citation_instances: warning: {staged - written} rows skipped "
             f"(no matching normalized citation or unknown domain)")
@@ -489,7 +545,10 @@ def load_ncwr(session, staging_dir):
             JOIN normalized_citations n ON n.normalized_sha1 = s.normalized_sha1
             JOIN web_resources w ON w.url_hash = s.url_hash
             ON CONFLICT DO NOTHING""",
-        index_lookups=True)
+        index_lookups=True,
+        # normalized_citations were inserted in normalized_sha1 order, so their
+        # ids, and this table's primary key, grow with it
+        sort_by='normalized_sha1, url')
     if staged != written:
         log(f"ncwr: {staged - written} rows not written (unresolved citation or URL, or already present)")
 
