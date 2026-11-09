@@ -351,12 +351,27 @@ def load_domains(session, staging_dir):
     log(f"domains: {count} rows loaded")
 
 
-def _analyze(session, *tables):
+def _analyze(session, *tables, vacuum=False):
     """Refresh planner statistics on lookup tables an earlier phase just
-    filled (autovacuum may not have analyzed them yet)."""
-    for t in tables:
-        session.execute(text(f"ANALYZE {t}"))
+    filled (autovacuum may not have analyzed them yet).
+
+    ``vacuum=True`` runs ``VACUUM (ANALYZE)`` instead, for tables the next
+    phase probes row by row: a freshly loaded table otherwise gets an
+    insert-triggered, throttled autovacuum that reads the whole heap (68 GB
+    for enwiki's normalized_citations) while that phase competes for the
+    same disk. Run here it is unthrottled, once, and later runs skip the
+    pages it marked all-visible."""
     session.commit()
+    if not vacuum:
+        for t in tables:
+            session.execute(text(f"ANALYZE {t}"))
+        session.commit()
+        return
+    t0 = time.time()
+    with session.get_bind().connect().execution_options(isolation_level="AUTOCOMMIT") as con:
+        for t in tables:
+            con.execute(text(f"VACUUM (ANALYZE) {t}"))
+    log(f"vacuumed {', '.join(tables)} in {time.time() - t0:.0f}s")
 
 
 def _copy_load(session, name, filepath, **kwargs):
@@ -487,7 +502,7 @@ def load_citation_instances(session, staging_dir):
     if not filepath:
         return
     log(f"citation_instances: loading from {filepath}")
-    _analyze(session, 'domains', 'normalized_citations')
+    _analyze(session, 'domains', 'normalized_citations', vacuum=True)
     computed = instance_id_sql('domain', 'page_id', 'raw_sha1')
     staged, written = _copy_load(
         session, 'citation_instances', filepath,
@@ -530,7 +545,7 @@ def load_ncwr(session, staging_dir):
     if not filepath:
         return
     log(f"ncwr: loading from {filepath}")
-    _analyze(session, 'normalized_citations', 'web_resources')
+    _analyze(session, 'normalized_citations', 'web_resources', vacuum=True)
     staged, written = _copy_load(
         session, 'ncwr', filepath,
         # URLs resolve through url_hash, the indexed unique key (there is no index on url)
