@@ -81,7 +81,7 @@ NATURAL_KEY = {
 DROP_COLUMNS = {"page_summary_cache": {"updated_at"}}
 PG_TABLES = sorted(Base.metadata.tables)
 PQ_DATASETS = sorted(layout.SCHEMAS)
-PARTITION_COLUMNS = {"domain", "page_bucket"}
+PARTITION_COLUMNS = {"domain", "page_bucket", "search_bucket"}
 PQ_DROP = {"citation_instances_denorm": {"normalized_id"}}   # load-order surrogate; normalized_sha1 is there
 
 pytestmark = [
@@ -163,7 +163,7 @@ def test_02_extract_all(run: Run):
 
 def test_03_dedup_load(run: Run):
     run.wcd("dedup", "dedup", "-d", str(run.staging))
-    run.wcd("load", "load", "-d", str(run.staging))
+    run.wcd("load", "load", "-d", str(run.staging), "--parquet-dir", str(run.parquet))
     run.wcd("gate 3", "gate", "3", "--domain", DOMAIN, "--parquet-dir", str(run.parquet), "--all-buckets")
     run.wcd("init-db --add-indexes", "init-db", "--add-indexes")
 

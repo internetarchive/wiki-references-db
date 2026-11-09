@@ -184,8 +184,14 @@ def staged(db, work: Path) -> Path:
     return staging
 
 
+def _template_parquet_counts(work: Path) -> tuple[int, int]:
+    con = duckdb.connect()
+    return tuple(con.execute(f"SELECT count(*) FROM read_parquet('{layout.dataset_glob(work / 'parquet', ds)}')").fetchone()[0]
+                 for ds in ("template_param_index", "template_params"))
+
+
 def test_load_synthetic(db, staged: Path, work: Path):
-    load.main(["-d", str(staged)])
+    load.main(["-d", str(staged), "--parquet-dir", str(work / "parquet")])
     con = duckdb.connect()
     n_inst = con.execute(f"SELECT count(*) FROM read_parquet('{staged / 'deduped' / 'citation_instances.parquet'}')").fetchone()[0]
     n_norm = con.execute(f"SELECT count(*) FROM read_parquet('{staged / 'deduped' / 'normalized_citations.parquet'}')").fetchone()[0]
@@ -203,7 +209,14 @@ def test_load_synthetic(db, staged: Path, work: Path):
                       "OR appears_on_page_id IS NULL") == 0
     assert scalar(db, "SELECT count(*) FROM web_resources WHERE numeric_page_id IS NOT NULL") == len(FIXTURE_PAGES) + 1  # + page 202
     assert scalar(db, "SELECT count(*) FROM normalized_citation_web_resources") > 0
-    assert scalar(db, "SELECT count(*) FROM template_data") > 0
+    # template parameters went to the Parquet tier, not Postgres
+    n_index, n_params = _template_parquet_counts(work)
+    con = duckdb.connect()
+    td = staged / 'deduped' / 'template_data.parquet'
+    assert n_index == con.execute(f"SELECT count(*) FROM (SELECT DISTINCT template_name, parameter_key, parameter_value, "
+                                  f"normalized_sha1 FROM read_parquet('{td}'))").fetchone()[0] > 0
+    assert n_params > 0
+    assert scalar(db, "SELECT count(*) FROM information_schema.tables WHERE table_name = 'template_data'") == 0
     # Stage-0 rows untouched
     assert scalar(db, "SELECT count(*) FROM revisions") == len(FIXTURE_REVISIONS) + 2
     # citation_type arrived from Stage 1 and the Stage-3 gate passes
@@ -219,12 +232,40 @@ def test_load_synthetic(db, staged: Path, work: Path):
         con_pg.rollback()
 
 
-def test_load_is_idempotent(db, staged: Path):
+def test_load_is_idempotent(db, staged: Path, work: Path):
     tables = ("citation_instances", "normalized_citations", "web_resources", "wiki_templates",
-              "template_data", "normalized_citation_web_resources", "domains", "containers")
+              "template_value_counts", "normalized_citation_web_resources", "domains", "containers")
     before = {t: scalar(db, f"SELECT count(*) FROM {t}") for t in tables}
-    load.main(["-d", str(staged)])
+    parquet_before = _template_parquet_counts(work)
+    load.main(["-d", str(staged), "--parquet-dir", str(work / "parquet")])
     assert {t: scalar(db, f"SELECT count(*) FROM {t}") for t in tables} == before
+    assert _template_parquet_counts(work) == parquet_before   # the domain's partitions were replaced, not added to
+
+
+def test_template_parquet_partitioned_join_and_counts(db, staged: Path, work: Path, tmp_path, monkeypatch):
+    """template_params built from many sha1 partitions equals the one-partition
+    build, and template_value_counts holds every value at the threshold."""
+    from sqlalchemy.orm import Session
+    monkeypatch.setattr(load, "TEMPLATE_ROWS_PER_PARTITION", 7)
+    monkeypatch.setattr(load, "TEMPLATE_COUNT_MIN", 2)
+    other = tmp_path / "pq"
+    with Session(db) as s:
+        load.write_template_parquet(s, str(staged), str(other))
+    con = duckdb.connect()
+    for ds in ("template_params", "template_param_index"):
+        a = f"SELECT * FROM read_parquet('{layout.dataset_glob(work / 'parquet', ds)}', hive_partitioning=true)"
+        b = f"SELECT * FROM read_parquet('{layout.dataset_glob(other, ds)}', hive_partitioning=true)"
+        assert con.execute(f"SELECT count(*) FROM ({a})").fetchone()[0] > 0
+        assert not con.execute(f"{a} EXCEPT ALL {b}").fetchall() and not con.execute(f"{b} EXCEPT ALL {a}").fetchall(), ds
+    heavy = con.execute(f"""SELECT template_name, parameter_key, parameter_value, count(*) FROM read_parquet(
+                            '{layout.dataset_glob(other, 'template_param_index')}') WHERE parameter_value IS NOT NULL
+                            GROUP BY ALL HAVING count(*) >= 2 ORDER BY ALL""").fetchall()
+    got = q(db, "SELECT w.name, c.parameter_key, c.parameter_value, c.n_citations FROM template_value_counts c "
+                "JOIN wiki_templates w ON w.id = c.wiki_template_id ORDER BY 1, 2, 3, 4")
+    assert heavy and [tuple(r) for r in got] == [tuple(r) for r in heavy]
+    with db.begin() as c:
+        c.execute(text("DELETE FROM template_value_counts"))
+    assert not list((staged / ".template-work").glob("*")) if (staged / ".template-work").exists() else True
 
 
 # ---------------------------------------------------------------------------

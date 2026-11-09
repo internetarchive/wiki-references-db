@@ -17,7 +17,7 @@ revision_bundles, revisions,            RevisionChest (Stage 0), or ``wcd stage0
 page_metadata, web_resources (articles) from its Parquet metadata
 web_resources (cited URLs),             Stage 3 load
 normalized_citation_web_resources
-wiki_templates, template_data           Stage 3 load
+wiki_templates, template_value_counts   Stage 3 load (template parameters: Parquet tier)
 normalized_citations, citation_instances Stage 3 load
 normalized_citation_parts               Stage 4
 ref_name_links                          Stage 5
@@ -404,39 +404,26 @@ class WikiTemplate(Base):
         session.execute(stmt)
 
 
-class TemplateData(Base):
-    """One row per template parameter inside a normalized citation."""
-    __tablename__ = 'template_data'
+class TemplateValueCount(Base):
+    """Precomputed totals for the template report's heavy values.
+
+    Template parameters themselves live in the Parquet tier
+    (``template_params``, ``template_param_index``): 2.5 billion rows for
+    enwiki, ~750 GB as a Postgres table with its keys and indexes. The report
+    counts matching citations from ``template_param_index``; for a (template,
+    key, value) with at least ``wcd_pipeline.load.TEMPLATE_COUNT_MIN`` citations
+    (``doi-access=free`` on ``Cite journal`` has millions) that count is read
+    from here instead. ``parameter_value_md5`` keys long values."""
+    __tablename__ = 'template_value_counts'
     wiki_template_id = Column(Integer, ForeignKey('wiki_templates.id'), nullable=False)
-    normalized_id = Column(Integer, ForeignKey('normalized_citations.id'), nullable=False)
-    offset_start = Column(Integer, nullable=False)
     parameter_key = Column(String, nullable=False)
-    parameter_key_md5 = Column(CHAR(32), nullable=False)
-    parameter_value = Column(Text, nullable=True)
+    parameter_value_md5 = Column(CHAR(32), nullable=False)
+    parameter_value = Column(Text, nullable=False)
+    n_citations = Column(BigInteger, nullable=False)
 
     __table_args__ = (
-        PrimaryKeyConstraint('wiki_template_id', 'normalized_id', 'offset_start', 'parameter_key_md5', name='pk_template_param'),
-        Index('idx_template_lookup_md5', 'wiki_template_id', 'parameter_key', func.md5(parameter_value), 'normalized_id',
-              postgresql_where=text('parameter_value IS NOT NULL')),
-        Index('idx_td_norm_offset_key', 'normalized_id', 'offset_start', 'parameter_key'),
+        PrimaryKeyConstraint('wiki_template_id', 'parameter_key', 'parameter_value_md5', name='pk_template_value_counts'),
     )
-
-    @staticmethod
-    def bulk_upsert(session: Session, rows):
-        prepared = []
-        for r in rows:
-            r2 = dict(r)
-            if r2.get('parameter_key') is not None:
-                r2['parameter_key_md5'] = hashlib.md5(r2['parameter_key'].encode()).hexdigest()
-            prepared.append(r2)
-        cleaned = _merge_rows(prepared, ('wiki_template_id', 'normalized_id', 'offset_start', 'parameter_key_md5'))
-        if not cleaned:
-            return
-        stmt = insert(TemplateData).values(cleaned).on_conflict_do_update(
-            index_elements=['wiki_template_id', 'normalized_id', 'offset_start', 'parameter_key_md5'],
-            set_={'parameter_value': insert(TemplateData).excluded.parameter_value},
-        )
-        session.execute(stmt)
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +634,7 @@ class PageSummaryCache(Base):
 STAGE_TABLES = {
     0: ('domains', 'revision_bundles', 'revisions', 'page_metadata', 'web_resources'),
     3: ('containers', 'domains', 'web_resources', 'wiki_templates', 'normalized_citations',
-        'citation_instances', 'normalized_citation_web_resources', 'template_data'),
+        'citation_instances', 'normalized_citation_web_resources', 'template_value_counts'),
     4: ('normalized_citation_parts',),
     5: ('ref_name_links',),
     7: ('global_sources', 'citation_source_resolution', 'page_source_summary', 'page_summary_cache'),

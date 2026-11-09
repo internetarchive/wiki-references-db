@@ -193,6 +193,24 @@ def test_template_report_and_web_resources(client):
 
 # v1 aliases and meta ---------------------------------------------------------
 
+def test_template_report_uses_precomputed_total(client):
+    """A heavy (template, key, value) takes its total from template_value_counts."""
+    from sqlalchemy import create_engine, text
+    s, j = get(client, f"/api/v2/pages/{D}/{PAGE_B}/citations")
+    tpl = next(t for c in j["citations"] for t in c["templates"] if t["template_name"] == "Cite book")
+    engine = create_engine("postgresql+psycopg2://" + DSN.split("://", 1)[1])
+    try:
+        with engine.begin() as con:
+            con.execute(text("INSERT INTO template_value_counts VALUES (:w, 'last', md5('Diamond'), 'Diamond', 987654)"),
+                        {"w": tpl["wiki_template_id"]})
+        s, j = get(client, f"/api/v2/templates/{tpl['wiki_template_id']}/report", parameter_key="last", parameter_value="Diamond")
+        assert s == 200 and j["total"] == 987654 and len(j["citations"]) == 3   # the listing still comes from Parquet
+    finally:
+        with engine.begin() as con:
+            con.execute(text("DELETE FROM template_value_counts"))
+        engine.dispose()
+
+
 def test_v1_aliases(client):
     assert client.get("/healthz").json() == {"status": "ok"}
     s, j = get(client, "/api/v1/article", url=f"https://{D}/w/index.php?curid={PAGE_A}")

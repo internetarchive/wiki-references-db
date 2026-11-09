@@ -73,18 +73,33 @@ def _links(con, nc_ids: list[int]) -> dict[int, list[ExtractedLink]]:
     return out
 
 
-def _templates(con, nc_ids: list[int]) -> dict[int, list[TemplateUse]]:
+def _templates(db: Database, con, domain: str, page_id: int, sha_by_id: dict[int, str]) -> dict[int, list[TemplateUse]]:
+    """Template uses of the normalized citations ``sha_by_id`` (id → sha1) as
+    cited on ``(domain, page_id)``, from the page's ``template_params``
+    partition; template ids from ``wiki_templates``."""
     out = defaultdict(list)
-    if nc_ids:
-        grouped: dict[tuple, dict] = {}
-        for nid, wt_id, name, key, value, offset in con.execute(text(
-                "SELECT t.normalized_id, w.id, w.name, t.parameter_key, t.parameter_value, t.offset_start "
-                "FROM template_data t JOIN wiki_templates w ON w.id = t.wiki_template_id "
-                "WHERE t.normalized_id = ANY(:ids) ORDER BY t.normalized_id, t.offset_start, t.parameter_key"),
-                {"ids": nc_ids}).all():
-            grouped.setdefault((nid, wt_id, name, offset), {})[key] = value
-        for (nid, wt_id, name, _off), params in grouped.items():
-            out[nid].append(TemplateUse(wiki_template_id=wt_id, template_name=name, parameters=params))
+    if not sha_by_id:
+        return out
+    id_by_sha = {sha: nid for nid, sha in sha_by_id.items()}
+    duck = db.duck()
+    try:
+        db.bind(duck, domain, page_id, ("template_params",))
+        rows = duck.execute(
+            "SELECT normalized_sha1, template_name, offset_start, parameter_key, parameter_value FROM template_params "
+            "WHERE page_id = ? AND normalized_sha1 IN (SELECT unnest(?::VARCHAR[])) "
+            "ORDER BY normalized_sha1, offset_start, parameter_key", [page_id, list(id_by_sha)]).fetchall()
+    finally:
+        duck.close()
+    names = sorted({r[1] for r in rows})
+    tpl_ids = dict(con.execute(text(
+        "SELECT w.name, w.id FROM wiki_templates w JOIN domains d ON d.id = w.domain WHERE d.value = :d AND w.name = ANY(:n)"),
+        {"d": domain, "n": names}).all()) if names else {}
+    grouped: dict[tuple, dict] = {}
+    for sha, name, offset, key, value in rows:
+        if name in tpl_ids:
+            grouped.setdefault((id_by_sha[sha], tpl_ids[name], name, offset), {})[key] = value
+    for (nid, wt_id, name, _off), params in sorted(grouped.items(), key=lambda kv: (kv[0][0], kv[0][3])):
+        out[nid].append(TemplateUse(wiki_template_id=wt_id, template_name=name, parameters=params))
     return out
 
 
@@ -186,7 +201,9 @@ def get_citations(db: Database, domain: str, page_id: int, revision_id: int | No
         nc_ids = sorted({v["nc_id"] for v in inst.values()})
         links = templates = parts = others = {}
         if not raw:
-            links, templates, parts, others = _links(con, nc_ids), _templates(con, nc_ids), _parts(con, nc_ids, domain_id, page_id), _other_articles(con, nc_ids)
+            sha_by_id = {v["nc_id"]: v["normalized_sha1"] for v in inst.values()}
+            links, parts, others = _links(con, nc_ids), _parts(con, nc_ids, domain_id, page_id), _other_articles(con, nc_ids)
+            templates = _templates(db, con, domain, page_id, sha_by_id)
 
     citations = []
     for cid, first_id, last_id, n, in_next in page_rows:
@@ -263,7 +280,10 @@ def get_citation(db: Database, normalized_sha1: str) -> CitationDetailResponse:
         if nc is None:
             raise NotFound("Citation not found")
         instances = _instances(con, nc["id"])
-        links, templates = _links(con, [nc["id"]]), _templates(con, [nc["id"]])
+        links = _links(con, [nc["id"]])
+        # template parameters are a function of the normalized text: any page citing it has them
+        templates = (_templates(db, con, instances[0]["domain"], instances[0]["page_id"], {nc["id"]: nc["normalized_sha1"]})
+                     if instances else {})
         parts, resolutions = _parts(con, [nc["id"]], None, None), _resolutions(con, [nc["id"]])
         history = _history(db, con, instances, None)
     pages = sorted({(i["domain"], i["page_id"]) for i in instances})

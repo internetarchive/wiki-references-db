@@ -39,3 +39,22 @@ def test_page_bucket():
     assert ids.page_bucket(512) == 0
     assert ids.page_bucket(513) == 1
     assert ids.PAGE_BUCKETS == 512
+
+
+@pytest.mark.parametrize("name,key,value", [
+    ("Cite journal", "doi-access", "free"),
+    ("Cite web", "title", "Ünïcødé — 日本語 \\ 'quoted'"),
+    ("Cite book", "last", None),
+    ("Cite book", "last", ""),
+    ("Sfn", "1", "Smith"),
+] + [("Cite web", "url", f"https://example.org/{i}") for i in range(0, 3000, 61)])
+def test_template_search_bucket_duckdb_matches_python(name, key, value):
+    con = duckdb.connect()
+    got = con.execute(f"SELECT {ids.template_search_bucket_sql('?', '?', '?')}", [name, key, value]).fetchone()[0]
+    want = ids.template_search_bucket(name, key, value)
+    assert got == want and 0 <= want < ids.TEMPLATE_SEARCH_BUCKETS
+
+
+def test_template_search_buckets_spread():
+    buckets = {ids.template_search_bucket("Cite web", "url", f"https://example.org/{i}") for i in range(5000)}
+    assert len(buckets) > 500   # nearly all 512 used by 5,000 values of one template/key

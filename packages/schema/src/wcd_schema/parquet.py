@@ -16,7 +16,8 @@ import pyarrow as pa
 from .ids import PAGE_BUCKETS, page_bucket
 
 __all__ = ["PAGE_BUCKETS", "page_bucket", "SCHEMAS", "PAGE_PARTITIONED", "DOMAIN_PARTITIONED",
-           "GLOBAL", "dataset_dir", "partition_dir", "dataset_glob", "partition_glob", "list_buckets"]
+           "SEARCH_PARTITIONED", "GLOBAL", "dataset_dir", "partition_dir", "search_partition_dir",
+           "dataset_glob", "partition_glob", "list_buckets"]
 
 # ---------------------------------------------------------------------------
 # Schemas (the stored columns; partition columns are added by the reader)
@@ -52,6 +53,24 @@ SCHEMAS: dict[str, pa.Schema] = {
         ("page_id", pa.int32()),
         ("parent_revision_id", pa.int64()),
         ("revision_timestamp", pa.timestamp("s")),
+    ]),
+    # Stage 3 (wcd load): template parameters, kept out of Postgres (2.5 billion rows
+    # for enwiki). template_params serves a page's citations (page-partitioned);
+    # template_param_index serves the template report, one row per distinct
+    # (template, key, value, citation), partitioned by template_search_bucket.
+    "template_params": pa.schema([
+        ("page_id", pa.int32()),
+        ("normalized_sha1", pa.string()),
+        ("template_name", pa.string()),
+        ("offset_start", pa.int32()),
+        ("parameter_key", pa.string()),
+        ("parameter_value", pa.string()),
+    ]),
+    "template_param_index": pa.schema([
+        ("template_name", pa.string()),
+        ("parameter_key", pa.string()),
+        ("parameter_value", pa.string()),
+        ("normalized_sha1", pa.string()),
     ]),
     # Stage 5
     "ref_name_links": pa.schema([
@@ -259,7 +278,7 @@ SCHEMAS: dict[str, pa.Schema] = {
 
 #: datasets partitioned by domain= and page_bucket=
 PAGE_PARTITIONED = (
-    "citation_history", "named_ref_uses", "revisions", "ref_name_links",
+    "citation_history", "named_ref_uses", "revisions", "ref_name_links", "template_params",
     "citation_instances_denorm", "page_revision_stats",
     "matching_intermediate/sources", "matching_intermediate/citation_source_map",
     "matching_intermediate/template_sources", "matching_intermediate/template_citation_source_map",
@@ -268,6 +287,8 @@ PAGE_PARTITIONED = (
 #: datasets partitioned by domain= only (the cross-page match runs per domain for now)
 DOMAIN_PARTITIONED = ("revision_signals", "matching_intermediate/global_source_map",
                       "matching_intermediate/global_sources_stage")
+#: datasets partitioned by domain= and search_bucket= (``ids.template_search_bucket``)
+SEARCH_PARTITIONED = ("template_param_index",)
 #: unpartitioned datasets
 GLOBAL = ("global_source_scores",)
 
@@ -282,6 +303,11 @@ def partition_dir(base: str | os.PathLike, name: str, domain: str, bucket: int |
     """``<base>/<name>/domain=<domain>[/page_bucket=<bucket>]``."""
     d = dataset_dir(base, name) / f"domain={domain}"
     return d if bucket is None else d / f"page_bucket={int(bucket)}"
+
+
+def search_partition_dir(base: str | os.PathLike, name: str, domain: str, bucket: int) -> Path:
+    """``<base>/<name>/domain=<domain>/search_bucket=<bucket>`` (``SEARCH_PARTITIONED``)."""
+    return dataset_dir(base, name) / f"domain={domain}" / f"search_bucket={int(bucket)}"
 
 
 def dataset_glob(base: str | os.PathLike, name: str) -> str:

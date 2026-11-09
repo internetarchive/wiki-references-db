@@ -42,6 +42,28 @@ def instance_id_sql(domain_expr: str, page_id_expr: str, raw_sha1_expr: str) -> 
     )
 
 
+TEMPLATE_SEARCH_BUCKETS = 512
+_UNIT_SEPARATOR = "\x1f"
+
+
+def template_search_bucket(template_name: str, parameter_key: str, parameter_value: str | None) -> int:
+    """The ``template_param_index`` partition of a (template, key, value) lookup:
+    the first 4 bytes of ``MD5(name + US + key + US + value)`` (US = U+001F,
+    a NULL value as the empty string) as an unsigned big-endian int, mod 512.
+
+    The template report asks for all three, so a lookup reads one partition,
+    and partitions are even however skewed the templates and keys are.
+    """
+    joined = _UNIT_SEPARATOR.join((template_name, parameter_key, parameter_value or ""))
+    return int(hashlib.md5(joined.encode("utf-8")).hexdigest()[:8], 16) % TEMPLATE_SEARCH_BUCKETS
+
+
+def template_search_bucket_sql(name_expr: str, key_expr: str, value_expr: str) -> str:
+    """``template_search_bucket`` in DuckDB SQL (arguments are SQL expressions)."""
+    joined = f"{name_expr} || chr(31) || {key_expr} || chr(31) || coalesce({value_expr}, '')"
+    return f"CAST(('0x' || left(md5({joined}), 8))::UBIGINT % {TEMPLATE_SEARCH_BUCKETS} AS INTEGER)"
+
+
 def global_source_id(member_ids: Iterable[str]) -> str:
     """``global_sources.global_source_id`` (UVA): ``sha1("global:" + "|".join(sorted(members)))[:16]``."""
     joined = "|".join(sorted(member_ids))

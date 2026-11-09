@@ -269,17 +269,16 @@
       ],
       "stored": "full"
     },
-    "pg.template_data": {
-      "rows": 63160,
+    "pg.template_value_counts": {
+      "rows": 0,
       "columns": [
         "wiki_template_id__name",
-        "normalized_id__normalized_sha1",
-        "offset_start",
         "parameter_key",
-        "parameter_key_md5",
-        "parameter_value"
+        "parameter_value_md5",
+        "parameter_value",
+        "n_citations"
       ],
-      "stored": "fingerprint"
+      "stored": "full"
     },
     "pg.web_resources": {
       "rows": 2533,
@@ -589,28 +588,50 @@
         "revision_timestamp"
       ],
       "stored": "full"
+    },
+    "pq.template_param_index": {
+      "rows": 47712,
+      "columns": [
+        "template_name",
+        "parameter_key",
+        "parameter_value",
+        "normalized_sha1"
+      ],
+      "stored": "full"
+    },
+    "pq.template_params": {
+      "rows": 63604,
+      "columns": [
+        "page_id",
+        "normalized_sha1",
+        "template_name",
+        "offset_start",
+        "parameter_key",
+        "parameter_value"
+      ],
+      "stored": "fingerprint"
     }
   },
   "timings_seconds": {
-    "init-db --no-indexes": 0.05,
-    "stage0-load": 0.38,
-    "gate 0": 0.03,
-    "extract-all": 64.62,
-    "dedup": 0.16,
-    "load": 5.57,
-    "gate 3": 0.18,
-    "init-db --add-indexes": 0.46,
-    "parts": 2.15,
-    "gate 4": 0.02,
-    "denorm-export": 0.36,
-    "ref-name-links": 1.91,
-    "gate 5": 0.03,
-    "match": 5.48,
-    "gate 6": 0.03,
-    "materialize": 5.99,
-    "gate 7": 0.06,
-    "revision-stats": 1.59,
+    "init-db --no-indexes": 0.22,
+    "stage0-load": 1.16,
+    "gate 0": 0.06,
+    "extract-all": 61.63,
+    "dedup": 0.2,
+    "load": 7.53,
+    "gate 3": 0.28,
+    "init-db --add-indexes": 0.23,
+    "parts": 3.0,
+    "gate 4": 0.06,
+    "denorm-export": 0.59,
+    "ref-name-links": 5.12,
+    "gate 5": 0.06,
+    "match": 5.24,
+    "gate 6": 0.04,
+    "materialize": 12.44,
+    "gate 7": 0.09,
+    "revision-stats": 1.21,
     "gate 8": 0.03
   },
-  "recorded": "2026-11-01T02:59:46+00:00"
+  "recorded": "2026-11-09T16:46:43+00:00"
 }

@@ -11,12 +11,16 @@ What this stage no longer writes (rebuild model, docs/design/proposed_data_model
   (Stage 0), or ``wcd stage0-load`` from its Parquet metadata
 - ``citation_history`` — Parquet only (``citation_history/`` under the
   Parquet base), never a Postgres table
+- template parameters — Parquet only: ``template_params`` (by page) and
+  ``template_param_index`` (by template/key/value), written by the
+  ``template_data`` phase with ``--parquet-dir``; Postgres keeps only
+  ``template_value_counts`` for the report's heavy values
 
 Page identity is ``(domain_id, page_id)``; ``citation_instances.id`` is the
 deterministic ``wcd_schema.ids.instance_id(domain, page_id, raw_sha1)``.
 
 Usage:
-    wcd load -d ./staging
+    wcd load -d ./staging --parquet-dir ./parquet
     wcd load --tables containers domains
 """
 
@@ -37,8 +41,10 @@ from sqlalchemy.pool import NullPool
 from wcd_schema.ids import instance_id
 from wcd_schema.postgres import (
     CitationInstance, Container, Domain, NormalizedCitation,
-    NormalizedCitationWebResource, TemplateData, WebResource, WikiTemplate,
+    NormalizedCitationWebResource, WebResource, WikiTemplate,
 )
+from wcd_schema import parquet as layout
+from wcd_schema.ids import PAGE_BUCKETS, template_search_bucket_sql
 
 from .config import database_url
 
@@ -404,57 +410,180 @@ def load_ncwr(session, staging_dir):
     log(f"ncwr: {count} rows loaded")
 
 
-# template_data needs three ids. The template id (domain label + template
-# name) is resolved in DuckDB against the wiki_templates table, which is small;
-# the normalized-citation id by a single-key join in Postgres. Rows whose ids
-# don't resolve are dropped, as the batch loader did. dedup makes the staged
-# rows unique on (domain_label, template_name, normalized_sha1, offset_start,
-# parameter_key), so each primary key appears at most once per statement; if
-# that ever stopped holding, Postgres would refuse the INSERT ("cannot affect
-# row a second time") rather than silently pick one.
-_TEMPLATE_DATA_INSERT = """
-    INSERT INTO template_data
-        (wiki_template_id, normalized_id, offset_start, parameter_key, parameter_key_md5, parameter_value)
-    SELECT s.wiki_template_id, nc.id, s.offset_start, s.parameter_key, md5(s.parameter_key), s.parameter_value
-    FROM _load_template_data s
-    JOIN normalized_citations nc ON nc.normalized_sha1 = s.normalized_sha1
-    ON CONFLICT (wiki_template_id, normalized_id, offset_start, parameter_key_md5)
-    DO UPDATE SET parameter_value = EXCLUDED.parameter_value
-"""
+# ---------------------------------------------------------------------------
+# Template parameters → Parquet (template_params, template_param_index) and
+# the heavy-value counts → Postgres (template_value_counts)
+# ---------------------------------------------------------------------------
+
+# A (template, key, value) with at least this many citations gets its report
+# total precomputed in template_value_counts.
+TEMPLATE_COUNT_MIN = int(os.getenv('TEMPLATE_COUNT_MIN', '1000'))
+# Rows per partition of the sha1-keyed join behind template_params; each
+# partition is one hash join, so memory follows this, not the table size.
+TEMPLATE_ROWS_PER_PARTITION = int(os.getenv('LOAD_ROWS_PER_PARTITION', '20000000'))
 
 
-def load_template_data(session, staging_dir):
-    filepath = find_deduped_parquet(staging_dir, 'template_data')
-    if not filepath:
+def _duck(temp_dir=None):
+    con = duckdb.connect()
+    mem = os.environ.get('LOAD_MEMORY_LIMIT')
+    if mem:
+        con.execute(f"SET memory_limit = '{mem}'")
+    if temp_dir:
+        con.execute(f"SET temp_directory = '{temp_dir}'")
+    con.execute("SET preserve_insertion_order = false")
+    try:
+        con.execute(f"SET partitioned_write_max_open_files = {PAGE_BUCKETS * 4}")
+    except duckdb.Error:
+        pass
+    return con
+
+
+def _q(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _partitions(root, first, second):
+    """``[(domain, n, dir)]`` for ``root/domain=*/<second>=*`` directories."""
+    import glob as _glob
+    out = []
+    for d in sorted(_glob.glob(os.path.join(root, f'{first}=*', f'{second}=*'))):
+        domain = os.path.basename(os.path.dirname(d)).split('=', 1)[1]
+        out.append((domain, int(os.path.basename(d).split('=', 1)[1]), d))
+    return out
+
+
+def _install(work_dataset, parquet_base, name):
+    """Move each domain of a dataset built under ``work_dataset`` into the tier,
+    replacing that domain's partitions (the step owns them, as stage0-load owns
+    revisions/)."""
+    import shutil
+    for d in sorted(os.listdir(work_dataset)):
+        target = os.path.join(layout.dataset_dir(parquet_base, name), d)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        if os.path.exists(target):
+            shutil.rmtree(target)
+        os.replace(os.path.join(work_dataset, d), target)
+
+
+def write_template_parquet(session, staging_dir, parquet_base):
+    """Write ``template_param_index`` and ``template_params`` from the deduped
+    ``template_data`` (and ``citation_instances``, for the pages), and the
+    heavy-value totals to ``template_value_counts``.
+
+    Both datasets are built in passes with bounded memory: the rows are first
+    split into Parquet partitions on disk, then each partition is sorted (and,
+    for template_params, joined) on its own. The finished domains replace the
+    domains in the tier at the end."""
+    import math
+    import shutil
+
+    td_path = find_deduped_parquet(staging_dir, 'template_data')
+    ci_path = find_deduped_parquet(staging_dir, 'citation_instances')
+    if not td_path:
         return
-    log(f"template_data: loading from {filepath}")
-    rows = session.execute(text(
-        "SELECT d.value, w.name, w.id FROM wiki_templates w JOIN domains d ON d.id = w.domain"
-    )).all()
-    templates = pa.table({
-        'domain_label': pa.array([r[0] for r in rows], pa.string()),
-        'template_name': pa.array([r[1] for r in rows], pa.string()),
-        'wiki_template_id': pa.array([r[2] for r in rows], pa.int32()),
-    })
-    path_literal = filepath.replace("'", "''")
-    staged, written = copy_parquet_in_chunks(
-        session,
-        source_sql=f"""
-            SELECT t.wiki_template_id, s.normalized_sha1, s.offset_start, s.parameter_key, s.parameter_value
-            FROM read_parquet('{path_literal}') s
-            JOIN templates t ON t.domain_label = s.domain_label AND t.template_name = s.template_name
-            WHERE s.offset_start IS NOT NULL AND s.parameter_key IS NOT NULL""",
-        duck_tables={'templates': templates},
-        temp_table='_load_template_data',
-        temp_ddl='wiki_template_id integer, normalized_sha1 char(40), offset_start integer, '
-                 'parameter_key text, parameter_value text',
-        columns=['wiki_template_id', 'normalized_sha1', 'offset_start', 'parameter_key', 'parameter_value'],
-        insert_sql=_TEMPLATE_DATA_INSERT,
-    )
-    total = duckdb.connect().execute(f"SELECT count(*) FROM read_parquet('{path_literal}')").fetchone()[0]
-    if total != written:
-        log(f"template_data: warning: {total - written} rows skipped (unknown domain, template or normalized citation)")
-    log(f"template_data: {written} rows loaded")
+    work = os.path.join(staging_dir, '.template-work')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    con = _duck(temp_dir=os.path.join(work, 'duckdb-tmp'))
+    td = f"read_parquet('{_q(td_path)}')"
+    td_where = ("domain_label IS NOT NULL AND template_name IS NOT NULL AND parameter_key IS NOT NULL "
+                "AND normalized_sha1 IS NOT NULL")
+    try:
+        # -- template_param_index: split by search bucket, then one sorted, distinct file per bucket
+        t = time.time()
+        bucket = template_search_bucket_sql('template_name', 'parameter_key', 'parameter_value')
+        con.execute(f"""COPY (SELECT domain_label AS domain, {bucket} AS search_bucket, template_name, parameter_key,
+                                     parameter_value, normalized_sha1 FROM {td} WHERE {td_where})
+                        TO '{_q(os.path.join(work, 'index-split'))}' (FORMAT PARQUET, PARTITION_BY (domain, search_bucket))""")
+        counts = []   # (domain, template_name, key, value, n)
+        out_root = os.path.join(work, 'template_param_index')
+        n_index = 0
+        index_parts = _partitions(os.path.join(work, 'index-split'), 'domain', 'search_bucket')
+        domains = sorted({p[0] for p in index_parts})
+        for domain, b, d in index_parts:
+            dest = os.path.join(out_root, f'domain={domain}', f'search_bucket={b}')
+            os.makedirs(dest)
+            src = f"read_parquet('{_q(d)}/*.parquet', hive_partitioning=false)"
+            out_file = os.path.join(dest, 'data.parquet')
+            con.execute(f"""COPY (SELECT DISTINCT template_name, parameter_key, parameter_value, normalized_sha1 FROM {src}
+                                  ORDER BY template_name, parameter_key, parameter_value, normalized_sha1)
+                            TO '{_q(out_file)}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)""")
+            for name, key, value, n in con.execute(
+                    f"""SELECT template_name, parameter_key, parameter_value, count(*) FROM read_parquet('{_q(out_file)}')
+                        WHERE parameter_value IS NOT NULL GROUP BY ALL HAVING count(*) >= {TEMPLATE_COUNT_MIN}""").fetchall():
+                counts.append((domain, name, key, value, n))
+            n_index += con.execute(f"SELECT count(*) FROM read_parquet('{_q(out_file)}')").fetchone()[0]
+        shutil.rmtree(os.path.join(work, 'index-split'))
+        log(f"template_param_index: {n_index} rows in {time.time() - t:.0f}s")
+
+        # -- template_params: rows keyed by citation, joined to the pages that cite it, one file per page bucket
+        t = time.time()
+        pages_root = os.path.join(work, 'pages-split')
+        if ci_path:
+            n_rows = con.execute(f"SELECT coalesce(sum(num_rows), 0) FROM parquet_file_metadata('{_q(td_path)}')").fetchone()[0]
+            parts = max(1, math.ceil(n_rows / TEMPLATE_ROWS_PER_PARTITION))
+            ci = f"read_parquet('{_q(ci_path)}')"
+            key = f"CAST(hash(normalized_sha1) % {parts} AS INTEGER)"
+            con.execute(f"""COPY (SELECT {key} AS k, domain_label AS domain, normalized_sha1, template_name, offset_start,
+                                         parameter_key, parameter_value FROM {td} WHERE {td_where})
+                            TO '{_q(os.path.join(work, 'td-split'))}' (FORMAT PARQUET, PARTITION_BY (k))""")
+            con.execute(f"""COPY (SELECT DISTINCT {key} AS k, domain, page_id, normalized_sha1 FROM {ci}
+                                  WHERE domain IS NOT NULL AND page_id IS NOT NULL AND normalized_sha1 IS NOT NULL)
+                            TO '{_q(os.path.join(work, 'ci-split'))}' (FORMAT PARQUET, PARTITION_BY (k))""")
+            for k in range(parts):
+                tdk, cik = os.path.join(work, 'td-split', f'k={k}'), os.path.join(work, 'ci-split', f'k={k}')
+                if not (os.path.isdir(tdk) and os.path.isdir(cik)):
+                    continue
+                con.execute(f"""COPY (SELECT c.domain, CAST(c.page_id % {PAGE_BUCKETS} AS INTEGER) AS page_bucket, c.page_id,
+                                             t.normalized_sha1, t.template_name, t.offset_start, t.parameter_key, t.parameter_value
+                                      FROM read_parquet('{_q(tdk)}/*.parquet', hive_partitioning=false) t
+                                      JOIN read_parquet('{_q(cik)}/*.parquet', hive_partitioning=false) c
+                                        ON c.domain = t.domain AND c.normalized_sha1 = t.normalized_sha1)
+                                TO '{_q(pages_root)}' (FORMAT PARQUET, PARTITION_BY (domain, page_bucket),
+                                                       OVERWRITE_OR_IGNORE true, FILENAME_PATTERN 'k{k}_{{i}}')""")
+            shutil.rmtree(os.path.join(work, 'td-split'))
+            shutil.rmtree(os.path.join(work, 'ci-split'))
+        params_root = os.path.join(work, 'template_params')
+        n_params = 0
+        if os.path.isdir(pages_root):
+            for domain, b, d in _partitions(pages_root, 'domain', 'page_bucket'):
+                dest = os.path.join(params_root, f'domain={domain}', f'page_bucket={b}')
+                os.makedirs(dest)
+                out_file = os.path.join(dest, 'data.parquet')
+                con.execute(f"""COPY (SELECT page_id, normalized_sha1, template_name, offset_start, parameter_key, parameter_value
+                                      FROM read_parquet('{_q(d)}/*.parquet', hive_partitioning=false)
+                                      ORDER BY page_id, normalized_sha1, offset_start, parameter_key)
+                                TO '{_q(out_file)}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)""")
+                n_params += con.execute(f"SELECT count(*) FROM read_parquet('{_q(out_file)}')").fetchone()[0]
+            shutil.rmtree(pages_root)
+        log(f"template_params: {n_params} rows in {time.time() - t:.0f}s")
+
+        for name in ('template_param_index', 'template_params'):
+            if os.path.isdir(os.path.join(work, name)):
+                _install(os.path.join(work, name), parquet_base, name)
+    finally:
+        con.close()
+        shutil.rmtree(work, ignore_errors=True)
+    _write_template_counts(session, domains, counts)
+
+
+def _write_template_counts(session, domains, counts):
+    """Replace ``template_value_counts`` for ``domains`` (those this run wrote
+    template parameters for) with the heavy values found; other domains keep theirs."""
+    ids = {(d, n): i for d, n, i in session.execute(text(
+        "SELECT d.value, w.name, w.id FROM wiki_templates w JOIN domains d ON d.id = w.domain")).all()}
+    rows = [{"w": ids[(d, n)], "k": k, "v": v, "n": c} for d, n, k, v, c in counts if (d, n) in ids]
+    session.execute(text(
+        "DELETE FROM template_value_counts WHERE wiki_template_id IN "
+        "(SELECT w.id FROM wiki_templates w JOIN domains d ON d.id = w.domain WHERE d.value = ANY(:d))"), {"d": domains})
+    if rows:
+        session.execute(text(
+            "INSERT INTO template_value_counts (wiki_template_id, parameter_key, parameter_value_md5, parameter_value, n_citations) "
+            "VALUES (:w, :k, md5(:v), :v, :n)"), rows)
+    session.commit()
+    skipped = len(counts) - len(rows)
+    log(f"template_value_counts: {len(rows)} heavy values (>= {TEMPLATE_COUNT_MIN} citations)"
+        + (f"; {skipped} skipped (template not in wiki_templates)" if skipped else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +595,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='Load staged Parquet files into PostgreSQL')
     parser.add_argument('-d', '--staging-dir', default=os.environ.get('STAGING_DIR', './staging'),
                         help='Staging directory (default: STAGING_DIR env or ./staging)')
+    parser.add_argument('--parquet-dir', default=os.environ.get('PARQUET_DIR'),
+                        help='Parquet tier base for template_params / template_param_index (default: PARQUET_DIR); '
+                             'required for the template_data phase')
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE,
                         help=f'Rows per INSERT batch (default: {BATCH_SIZE})')
 
@@ -477,7 +609,8 @@ def main(argv=None):
         ('normalized_citations', ('Phase 5: normalized_citations',  lambda s, d, ctx: load_normalized_citations(s, d))),
         ('citation_instances',   ('Phase 6: citation_instances',    lambda s, d, ctx: load_citation_instances(s, d))),
         ('ncwr',                 ('Phase 7: ncwr',                  lambda s, d, ctx: load_ncwr(s, d))),
-        ('template_data',        ('Phase 8: template_data',         lambda s, d, ctx: load_template_data(s, d))),
+        ('template_data',        ('Phase 8: template parameters → Parquet',
+                                  lambda s, d, ctx: write_template_parquet(s, d, ctx['parquet_dir']))),
     ])
 
     parser.add_argument('--tables', nargs='+', metavar='TABLE',
@@ -499,8 +632,11 @@ def main(argv=None):
         (k, all_phases[k]) for k in (args.tables if args.tables else all_phases)
     )
 
+    if 'template_data' in phases_to_run and not args.parquet_dir:
+        raise SystemExit("--parquet-dir (or PARQUET_DIR) is required for the template_data phase")
+
     try:
-        ctx = {}  # shared context between phases
+        ctx = {'parquet_dir': args.parquet_dir}  # shared context between phases
         for name, (label, loader) in phases_to_run.items():
             log(label)
             loader(session, staging_dir, ctx)

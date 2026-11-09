@@ -148,7 +148,7 @@ def build_database(dsn: str, work: str | Path, domain: str = "en.wikipedia.org",
     staging = work / "staging"
     extract.main([str(bundle), "-o", str(staging / "synthetic"), "--domain", domain, "--parquet-dir", str(parquet)])
     dedup.main(["-d", str(staging)])
-    load.main(["-d", str(staging)])
+    load.main(["-d", str(staging), "--parquet-dir", str(parquet)])
     pg_dsn = "postgresql://" + dsn.split("://", 1)[1]
     stage4.run(pg_dsn, domain)
     materialize.export_citation_instances_denorm(pg_dsn, domain, str(parquet))
