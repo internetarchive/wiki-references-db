@@ -1,7 +1,11 @@
 """Stage 3 (first half): consolidate and deduplicate the staged Parquet tables.
 
-DuckDB handles out-of-core dedup automatically (spills to disk when RAM is
-tight). Only the staging tables of ``wcd_schema.staging`` pass through here;
+The large tables are deduplicated in key partitions (``_partitioned_copy``):
+staged rows are already nearly unique after Stage 1's per-page dedup, so one
+GROUP BY over a whole table holds a group per row (~330M for enwiki's
+citation_instances), and DuckDB keeps MIN(varchar) state outside its memory
+limit; it was OOM-killed at 28 GB with a 20 GB limit. Each key falls in exactly
+one partition, so the output is the same as one GROUP BY over everything. Only the staging tables of ``wcd_schema.staging`` pass through here;
 the per-revision datasets (citation_history, named_ref_uses,
 revision_signals) are written by Stage 1 in their final layout.
 
@@ -24,6 +28,13 @@ import time
 import duckdb
 from .config import load_dotenv  # noqa: F401  (loads .env on import)
 
+
+
+# Staged rows per key partition for the large tables (DEDUP_ROWS_PER_PARTITION);
+# ~20M groups peaked at ~7 GB with a 4 GB DuckDB limit on enwiki.
+ROWS_PER_PARTITION = int(os.environ.get('DEDUP_ROWS_PER_PARTITION', '20000000'))
+# Where partition files go (main sets it to --temp-dir, else the deduped dir).
+PARTITION_BASE = None
 
 
 def log(msg):
@@ -84,6 +95,68 @@ def _parse_bool(value):
     raise argparse.ArgumentTypeError(
         f"Invalid boolean value '{value}'. Use true/false."
     )
+
+
+def _partitioned_copy(con, glob, part_expr, query, out, row_group_size, table_name):
+    """Write ``query`` (SQL with a ``{src}`` placeholder for the staged rows) to
+    ``out``, one key partition at a time when the table is large.
+
+    ``part_expr`` maps a row to an integer by the columns every row of a group
+    shares (e.g. ``page_id`` or ``hash(normalized_sha1)``). With more than one
+    partition the staged rows are first split into Parquet partitions in one
+    pass; ``query`` then runs per partition and the results are streamed into a
+    single file, written under a temporary name and renamed when complete.
+    """
+    import math
+    import shutil
+
+    import pyarrow.parquet as pq
+
+    n_rows = con.execute(f"SELECT coalesce(sum(num_rows), 0) FROM parquet_file_metadata('{glob}')").fetchone()[0]
+    parts = max(1, math.ceil(n_rows / ROWS_PER_PARTITION))
+    if parts == 1:
+        con.execute(f"""COPY ({query.format(src=f"'{glob}'")}) TO '{out}'
+                        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {row_group_size})""")
+        return
+    base = PARTITION_BASE or os.path.dirname(out)
+    split = os.path.join(base, f'.partitions-{table_name}')
+    shutil.rmtree(split, ignore_errors=True)
+    os.makedirs(split)
+    tmp_out = out + '.partial'
+    try:
+        t = time.time()
+        try:
+            con.execute(f"SET partitioned_write_max_open_files = {parts + 64}")
+        except duckdb.Error:
+            pass
+        con.execute(f"""COPY (SELECT *, CAST(coalesce({part_expr}, 0) % {parts} AS INTEGER) AS __part FROM '{glob}')
+                        TO '{split}' (FORMAT PARQUET, PARTITION_BY (__part), COMPRESSION ZSTD)""")
+        log(f"{table_name}: {n_rows} staged rows split into {parts} key partitions in {time.time() - t:.0f}s")
+        writer = None
+        for i in range(parts):
+            part_glob = os.path.join(split, f'__part={i}', '*.parquet')
+            if not os.path.isdir(os.path.dirname(part_glob)):
+                continue
+            src = f"read_parquet('{part_glob}', hive_partitioning=false)"
+            result = con.execute(query.format(src=src))
+            # to_arrow_reader() replaces fetch_record_batch() in newer DuckDB; the dependency allows >= 1.0
+            reader = (getattr(result, 'to_arrow_reader', None) or result.fetch_record_batch)(row_group_size)
+            for batch in reader:
+                if batch.num_rows == 0:
+                    continue
+                if writer is None:
+                    writer = pq.ParquetWriter(tmp_out, batch.schema, compression='zstd')
+                writer.write_batch(batch, row_group_size=row_group_size)
+        if writer is None:  # nothing passed the filters: an empty file with the right columns
+            con.execute(f"""COPY (SELECT * FROM ({query.format(src=f"'{glob}'")}) LIMIT 0) TO '{tmp_out}'
+                            (FORMAT PARQUET, COMPRESSION ZSTD)""")
+        else:
+            writer.close()
+        os.replace(tmp_out, out)
+    finally:
+        shutil.rmtree(split, ignore_errors=True)
+        if os.path.exists(tmp_out):
+            os.remove(tmp_out)
 
 
 def _has_files(con, glob_pattern):
@@ -148,18 +221,14 @@ def dedup_citation_instances(con, staging_dir, deduped_dir):
     if not _has_files(con, glob):
         return
     out = _out(deduped_dir, "citation_instances")
-    con.execute(f"""
-        COPY (
+    _partitioned_copy(con, glob, "page_id", """
             SELECT citation_instance_id, domain, page_id, raw_sha1,
                    MIN(normalized_sha1) AS normalized_sha1,
                    MIN(reference_type) AS reference_type,
                    MIN(reference_name) AS reference_name
-            FROM '{glob}'
+            FROM {src}
             WHERE domain IS NOT NULL AND page_id IS NOT NULL AND raw_sha1 IS NOT NULL
-            GROUP BY citation_instance_id, domain, page_id, raw_sha1
-        ) TO '{out}'
-        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)
-    """)
+            GROUP BY citation_instance_id, domain, page_id, raw_sha1""", out, 500000, "citation_instances")
     n_ids, n_keys = con.execute(f"""
         SELECT count(DISTINCT citation_instance_id), count(*) FROM '{out}'
     """).fetchone()
@@ -178,33 +247,25 @@ def dedup_normalized_citations(con, staging_dir, deduped_dir):
     glob = _glob(staging_dir, 'normalized_citations')
     if not _has_files(con, glob):
         return
-    con.execute(f"""
-        COPY (
+    _partitioned_copy(con, glob, "hash(normalized_sha1)", """
             SELECT normalized_sha1,
                    MIN(reference_normalized) AS reference_normalized,
                    MIN(appears_on_page_id) AS appears_on_page_id,
                    MIN(appears_on_domain) AS appears_on_domain,
                    MIN(citation_type) AS citation_type
-            FROM '{glob}'
+            FROM {src}
             WHERE normalized_sha1 IS NOT NULL
-            GROUP BY normalized_sha1
-        ) TO '{_out(deduped_dir, "normalized_citations")}'
-        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)
-    """)
+            GROUP BY normalized_sha1""", _out(deduped_dir, "normalized_citations"), 500000, "normalized_citations")
 
 
 def dedup_ncwr(con, staging_dir, deduped_dir):
     glob = _glob(staging_dir, 'ncwr')
     if not _has_files(con, glob):
         return
-    con.execute(f"""
-        COPY (
+    _partitioned_copy(con, glob, "hash(normalized_sha1)", """
             SELECT DISTINCT normalized_sha1, url
-            FROM '{glob}'
-            WHERE normalized_sha1 IS NOT NULL AND url IS NOT NULL
-        ) TO '{_out(deduped_dir, "ncwr")}'
-        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)
-    """)
+            FROM {src}
+            WHERE normalized_sha1 IS NOT NULL AND url IS NOT NULL""", _out(deduped_dir, "ncwr"), 500000, "ncwr")
 
 
 def dedup_wiki_templates(con, staging_dir, deduped_dir):
@@ -225,16 +286,13 @@ def dedup_template_data(con, staging_dir, deduped_dir):
     glob = _glob(staging_dir, 'template_data')
     if not _has_files(con, glob):
         return
-    con.execute(f"""
-        COPY (
+    _partitioned_copy(con, glob, "hash(normalized_sha1)", """
             SELECT domain_label, template_name, normalized_sha1, offset_start,
                    parameter_key, MIN(parameter_value) AS parameter_value
-            FROM '{glob}'
+            FROM {src}
             WHERE domain_label IS NOT NULL AND template_name IS NOT NULL
-            GROUP BY domain_label, template_name, normalized_sha1, offset_start, parameter_key
-        ) TO '{_out(deduped_dir, "template_data")}'
-        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)
-    """)
+            GROUP BY domain_label, template_name, normalized_sha1, offset_start, parameter_key""",
+                      _out(deduped_dir, "template_data"), 500000, "template_data")
 
 
 ALL_TABLES = [
@@ -250,6 +308,7 @@ ALL_TABLES = [
 
 
 def main(argv=None):
+    global ROWS_PER_PARTITION, PARTITION_BASE
     parser = argparse.ArgumentParser(
         description='Deduplicate staged Parquet files using DuckDB')
     parser.add_argument('-d', '--staging-dir',
@@ -270,6 +329,9 @@ def main(argv=None):
     parser.add_argument('--max-temp-dir-size',
                         default=os.environ.get('DEDUP_MAX_TEMP_DIRECTORY_SIZE'),
                         help='DuckDB max_temp_directory_size (default: DEDUP_MAX_TEMP_DIRECTORY_SIZE)')
+    parser.add_argument('--rows-per-partition', type=int, default=ROWS_PER_PARTITION,
+                        help='Staged rows per key partition for the large tables '
+                             '(default: DEDUP_ROWS_PER_PARTITION or 20000000); lower it if a partition runs out of memory')
     parser.add_argument('--tables', nargs='+', metavar='TABLE',
                         choices=[t for t, _ in ALL_TABLES],
                         help='Dedup only the specified table(s)')
@@ -282,6 +344,8 @@ def main(argv=None):
 
     deduped_dir = os.path.join(staging_dir, 'deduped')
     os.makedirs(deduped_dir, exist_ok=True)
+    ROWS_PER_PARTITION = args.rows_per_partition
+    PARTITION_BASE = args.temp_dir or deduped_dir
 
     con = duckdb.connect()
     con.execute(f"SET memory_limit = '{args.memory_limit}'")
