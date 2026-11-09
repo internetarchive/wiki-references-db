@@ -538,3 +538,49 @@ Verified on the sample, before and after: every deduped table and all three Parq
 **Follow-up: the full enwiki Stage 1** (`8af7a75`; `wcd extract-all -j 28` on the 28-core VM, in a systemd scope with `MemoryMax=40G`; 2026-11-07 01:37 → 2026-11-08 22:54). All 980 shards finished, none failed, in **45 h 17 min**, using **1,186 core-hours** of CPU (user + system) against the sample's estimate of 1,202 (interval 1,161–1,242). `revision_signals` has exactly one row per revision (895,604,187, none missing). `citation_history` holds 27.84 billion rows and `named_ref_uses` 6.77 billion. All 28 workers stayed busy until 42.4 h; the remaining 27 shards then drained over 2.8 h, the last one alone for 1 h. This run used the old smallest-first order (`be9ee55` changes it to largest-first); the simulation had predicted 44.1 h for smallest-first and 43.6 h for largest-first. The scope's memory peaked at 39.5 GB of its 40 GB cap, and the host never had less than 23.5 GB available.
 
 **Sizes, corrected.** Staging came to **78.5 GB** and the Stage-1 Parquet tier to **33.3 GB** (`citation_history` 16.5 GB, `named_ref_uses` 11.9 GB, `revision_signals` 4.9 GB), against the 27 GB and 17 GB estimated above. The estimate scaled output by text bytes. After the per-page dedup, though, staging grows with the number of distinct references per page, and the per-revision datasets with references × revisions, and small pages have more of both per byte than the heavy-weighted sample. The CPU estimate, which does scale with bytes, held to within 1.3 %. The tier is ~1,150 files per bucket for `citation_history` (589,258 files) and ~940 for `named_ref_uses` (483,055), as the §18 follow-up predicted.
+
+## 20. Stage 3 at enwiki scale: dedup in key partitions, template parameters to Parquet, and where the build stands (2026-11-09)
+
+**dedup.** After Stage 1's per-page staging (§19), the staged rows are already nearly unique. On 400 shards, 123,581,762 `citation_instances` rows dedup to 123,576,307. A single `GROUP BY` over a table therefore holds one group per row (~330M for `citation_instances`), and DuckDB keeps `MIN(varchar)` state outside its memory limit. The first enwiki attempt (32 GB DuckDB limit) was stopped by Claude Code's memory-pressure guard. The second (20 GB limit, in a 28 GB systemd scope) was OOM-killed inside the scope within a minute. On 124M groups the process peaked at 11.1 GB under a 4 GB limit. A DISTINCT-first rewrite does not help, because there is nothing to remove. `dedup` now runs the four large tables in key partitions (`2fac6c6`): one pass splits the staged rows to Parquet by a column every row of a group shares (`page_id`, `hash(normalized_sha1)`), then the unchanged `GROUP BY` runs per partition and streams into the single `deduped/<table>.parquet`. The partition count comes from Parquet row counts (`--rows-per-partition`, default 20M). The output is identical: on the 400 shards, 5.9 GB peak against 11.1 GB, in the same time. On enwiki (8 GB DuckDB limit, 28 GB scope) it peaked at 14.9 GB RSS. Results:
+
+| table | staged rows | deduped rows | time |
+|---|---|---|---|
+| citation_instances | 338,075,299 | 338,050,560 (collision gate passed) | 10.5 min |
+| normalized_citations | 322,401,267 | 284,514,231 | 19.5 min |
+| ncwr | 321,663,432 | 289,840,001 | 7.4 min |
+| template_data | 2,841,094,631 | 2,511,487,354 | 57 min (143 partitions) |
+| web_resources / domains / wiki_templates | — | 107,961,812 / 7,509,746 / 311,839 | — |
+
+`template_data`'s first attempt ran out of disk in its split pass; the failure was clean, and the user then approved deleting the first Stage-0 run's bundles and metadata (233 GB). The deduped files total 160 GB and are 1–4× their staged inputs: hash partitioning scatters rows that compressed well side by side, and pyarrow's zstd level is lower than DuckDB's. Sorting within a partition, or a higher compression level, would recover this; not done.
+
+**Template parameters to Parquet** (`edd0cfb`, docs `0742d59`). As a Postgres table with its keys and two secondary indexes, `template_data` would be ~750 GB (estimated from sampled row widths), three quarters of the load. It is now two Parquet datasets written by `wcd load` (`template_params` by page bucket, for the page and citation endpoints; `template_param_index` by `search_bucket` = md5(template, key, value) mod 512, for the report). There is also a small Postgres table, `template_value_counts`, holding report totals for values with ≥ 1,000 citations. Prototype latency on real enwiki partitions, server-style: report 19–36 ms, 160 ms for a 1.48M-match value before precomputation; page lookup 20 ms, 619 ms for the heaviest page (392,784 template rows across its history). The report now lists citations in `normalized_sha1` order. All tiers: 366 passed. The ci goldens were re-recorded, with only the template snapshots changed.
+
+**Disk: the build does not fit on this VM.** The estimates below (sampled row widths for Stage 3; Stages 4–8 scaled from the ci fixture by enwiki's row counts, ±20–30 %) assume everything is kept (7z dumps, staging, deduped files):
+
+| remaining | estimate |
+|---|---|
+| Stage 3 Postgres without `template_data`, all indexes | ~265 GB |
+| template Parquet (both layouts) | ~60 GB |
+| Stage 4 `normalized_citation_parts` (~300M rows, 9 indexes) | ~270 GB |
+| Stage 7 `citation_source_resolution`, `global_sources`, `page_source_summary`, `page_summary_cache` | ~155–170 GB |
+| Stage 5 `ref_name_links` | ~25 GB |
+| Parquet: denorm, matching intermediates, revision stats, scores | ~60–190 GB |
+| WAL and stage spill while running | +30–80 GB |
+
+That is ~850–950 GB against 182 GB free: **~750 GB more disk (range 600–950 GB); provision 1–1.5 TB.** `normalized_citation_parts` is now the largest single item, and the next place to look for savings: it holds the UVA normalizers' output for every normalized citation, every historical version included.
+
+**Where the build stands** (enwiki-20261001, namespace 0):
+
+| stage | state |
+|---|---|
+| 0 RevisionChest + `stage0-load` | done: bundles (85 GB), metadata (47 GB), Postgres `revisions` / `page_metadata` / article `web_resources`, revisions Parquet; gate 0 passed |
+| 1 `extract-all` | done: 980/980 shards; staging (raw shards ~67 GB) and the Parquet tier (`citation_history`, `named_ref_uses`, `revision_signals`, 33 GB) |
+| 3 `dedup` | done: 8/8 tables in `staging/deduped/` (160 GB) |
+| 3 `load`, gate 3, `init-db --add-indexes` | **next**, after the disk is added: `wcd load -d $STAGING --parquet-dir $PARQUET_DIR` |
+| 4–8 | not started |
+
+The database already has the new schema (`template_data` dropped, `template_value_counts` created) and holds only Stage-0 data (95 GB). Postgres needs the settings from the runbook. Run memory-heavy steps inside a `systemd-run --scope -p MemoryMax=…`, with the step's own DuckDB limit set, as above.
+
+**Decisions taken without asking:** `dedup` partitioned by `page_id` / `hash(normalized_sha1)` with a 20M-row default; template rows keyed by name and `normalized_sha1` (not Postgres ids), so `load` never resolves 2.5 billion ids; md5 for the search bucket (DuckDB's `hash()` is not stable across versions); a 1,000-citation threshold for precomputed totals; report order by `normalized_sha1`.
+
+**Open:** add the disk, then Stage 3 `load` onward; the deduped files' compression; whether `normalized_citation_parts` needs every historical normalized citation; response caching for the API (the build-id-keyed LRU of the discussion, not built); Stage 1's ~1,200 files per Parquet bucket (§18).
