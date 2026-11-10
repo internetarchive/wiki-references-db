@@ -20,9 +20,10 @@ from sqlalchemy.pool import NullPool
 from wcd_schema import parquet as layout
 from wcd_schema.ids import part_sha1
 from wcd_schema.postgres import (
-    Base, CitationInstance, Domain, NormalizedCitation, RefNameLink, Revision,
+    CitationInstance, Domain, NormalizedCitation, RefNameLink, Revision,
 )
 
+from . import fkeys
 from .config import database_url, load_dotenv  # noqa: F401
 
 
@@ -115,18 +116,8 @@ def stage3(session: Session, domain: str, parquet_base: str, sample_buckets: int
         failures.append(f"{null_types} normalized_citations rows have NULL citation_type")
 
     # load may drop these tables' foreign keys while it fills them (--defer-fks)
-    for table in ("web_resources", "normalized_citations", "citation_instances",
-                  "normalized_citation_web_resources"):
-        declared = {f"{table}_{fk.parent.name}_fkey" for fk in Base.metadata.tables[table].foreign_keys}
-        present = dict(session.execute(text(
-            "SELECT conname, convalidated FROM pg_constraint WHERE conrelid = CAST(:t AS regclass) AND contype = 'f'"
-        ), {"t": table}).all())
-        missing = sorted(declared - present.keys())
-        unvalidated = sorted(n for n in declared & present.keys() if not present[n])
-        if missing:
-            failures.append(f"{table}: foreign key(s) missing (an interrupted load? re-run it): {', '.join(missing)}")
-        if unvalidated:
-            failures.append(f"{table}: foreign key(s) not validated (re-run load): {', '.join(unvalidated)}")
+    failures += fkeys.problems(session, ("web_resources", "normalized_citations", "citation_instances",
+                                         "normalized_citation_web_resources"))
 
     con = duckdb.connect()
     buckets = layout.list_buckets(parquet_base, "citation_history", domain)
@@ -165,7 +156,8 @@ def stage3(session: Session, domain: str, parquet_base: str, sample_buckets: int
 def stage4(session: Session, domain: str, sample: int = 1000, seed: int = 0) -> list[str]:
     """every normalized citation of the domain has ≥ 1 part; bare_url /
     external_link parts carry extracted_url; template parts carry
-    template_name; part_sha1 = sha1(content) on a sample."""
+    template_name; part_sha1 = sha1(content) on a sample; the foreign key
+    to normalized_citations exists and is validated."""
     failures = []
     domain_id = _domain_id(session, domain)
     if domain_id is None:
@@ -194,6 +186,8 @@ def stage4(session: Session, domain: str, sample: int = 1000, seed: int = 0) -> 
     bad = sum(1 for sha, content in rows if part_sha1(content) != sha)
     if bad:
         failures.append(f"{bad} of {len(rows)} sampled parts have part_sha1 <> sha1(content)")
+    # parts may drop the table's foreign key while it fills it (--defer-fks)
+    failures += fkeys.problems(session, ("normalized_citation_parts",))
     return failures
 
 

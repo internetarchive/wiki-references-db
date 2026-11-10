@@ -310,6 +310,20 @@ def test_stage4_parts(db, staged: Path):
                        "FROM normalized_citation_parts p JOIN normalized_citations nc ON nc.id = p.normalized_id")) == before
     # --resume touches nothing when every citation has parts
     assert stage4.run(dsn, DOMAIN, resume=True)["citations"] == 0
+    # from empty, in parallel units of 2 ids (foreign key dropped, then validated): the same parts
+    with db.begin() as con:
+        con.execute(text("TRUNCATE normalized_citation_parts CASCADE"))
+    old_unit = stage4.UNIT_IDS
+    stage4.UNIT_IDS = 2
+    try:
+        stage4.run(dsn, DOMAIN, jobs=3)
+    finally:
+        stage4.UNIT_IDS = old_unit
+    assert sorted(q(db, "SELECT nc.citation_type, p.part_index, p.part_type, p.norm_subtype, p.template_name, p.author_key, "
+                       "p.year, p.extracted_isbn, p.extracted_url, p.content, p.part_sha1 "
+                       "FROM normalized_citation_parts p JOIN normalized_citations nc ON nc.id = p.normalized_id")) == before
+    with db.connect() as con_pg:
+        assert gates.stage4(Session(con_pg), DOMAIN) == []
 
 
 def test_stage4_gate_detects_missing_parts(db, staged: Path):

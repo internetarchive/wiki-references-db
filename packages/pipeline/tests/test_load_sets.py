@@ -216,3 +216,22 @@ def test_loaders_leave_no_sorted_copies(engine, tmp_path):
     _stage(tmp_path, row_group_size=1)
     load.main(["-d", str(tmp_path), "--jobs", "2", "--tables", *TABLES])
     assert not any((tmp_path / ".load-sort").rglob("*"))
+
+
+def test_add_indexes_for_some_tables(engine):
+    """``init-db --add-indexes --table …`` builds only those tables' secondary indexes."""
+    from wcd_pipeline import init_db
+
+    def secondary(table):
+        with engine.connect() as con:
+            return {r[0] for r in con.execute(text(
+                "SELECT c.relname FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid "
+                "WHERE x.indrelid = CAST(:t AS regclass) AND NOT x.indisunique AND NOT x.indisprimary"), {"t": table})}
+
+    init_db.main(["--drop-indexes"])
+    assert not secondary("citation_instances") and not secondary("normalized_citation_parts")
+    init_db.main(["--add-indexes", "--table", "citation_instances", "web_resources"])
+    assert secondary("citation_instances") == {"idx_ci_page", "idx_ci_normalized", "idx_ci_norm_named"}
+    assert secondary("web_resources") and not secondary("normalized_citation_parts")
+    with pytest.raises(SystemExit):
+        init_db.main(["--add-indexes", "--table", "no_such_table"])

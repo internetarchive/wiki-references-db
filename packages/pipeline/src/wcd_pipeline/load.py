@@ -40,11 +40,12 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 from wcd_schema.ids import instance_id_sql
 from wcd_schema.postgres import (
-    Base, Container, Domain, WikiTemplate,
+    Container, Domain, WikiTemplate,
 )
 from wcd_schema import parquet as layout
 from wcd_schema.ids import PAGE_BUCKETS, template_search_bucket_sql
 
+from . import fkeys
 from .config import database_url
 
 def make_session():
@@ -406,59 +407,6 @@ def _analyze(session, *tables, vacuum=False):
     log(f"vacuumed {', '.join(tables)} in {time.time() - t0:.0f}s")
 
 
-def _foreign_keys(table):
-    """The foreign keys the schema declares on ``table``, as (constraint name,
-    column, referenced table, referenced column); names are Postgres' defaults,
-    which is what ``init-db`` creates."""
-    t = Base.metadata.tables[table]
-    return sorted((f"{table}_{fk.parent.name}_fkey", fk.parent.name, fk.column.table.name, fk.column.name)
-                  for fk in t.foreign_keys)
-
-
-def _present_foreign_keys(session, table):
-    """{constraint name: validated} for the foreign keys ``table`` has now."""
-    return dict(session.execute(text(
-        "SELECT conname, convalidated FROM pg_constraint WHERE conrelid = CAST(:t AS regclass) AND contype = 'f'"
-    ), {"t": table}).all())
-
-
-def _drop_foreign_keys_if_empty(session, table):
-    """Drop ``table``'s foreign keys if it has no rows (a load into an empty
-    table). Each row's check otherwise locks the referenced row (``FOR KEY
-    SHARE``), which writes into the referenced heap: on enwiki that turned
-    normalized_citations' 68 GB heap into random writes while
-    citation_instances loaded. ``_restore_foreign_keys`` adds them back."""
-    if session.execute(text(f"SELECT EXISTS (SELECT 1 FROM {table})")).scalar_one():
-        session.commit()
-        return
-    present = _present_foreign_keys(session, table)
-    for name, *_ in _foreign_keys(table):
-        if name in present:
-            session.execute(text(f"ALTER TABLE {table} DROP CONSTRAINT {name}"))
-    session.commit()
-    log(f"{table}: foreign keys dropped for the load: {', '.join(sorted(present)) or '(none)'}")
-
-
-def _restore_foreign_keys(session, table):
-    """Add back any of ``table``'s declared foreign keys that are missing
-    (``NOT VALID``, which takes no row locks) and validate every one that is
-    not yet validated: one set-based check per key instead of one lookup per
-    row. Runs after every load phase, so a load interrupted after dropping
-    them restores them on its re-run (gate 3 checks that they are there)."""
-    present = _present_foreign_keys(session, table)
-    for name, col, ref_table, ref_col in _foreign_keys(table):
-        if name not in present:
-            session.execute(text(f"ALTER TABLE {table} ADD CONSTRAINT {name} FOREIGN KEY ({col}) "
-                                 f"REFERENCES {ref_table} ({ref_col}) NOT VALID"))
-            session.commit()
-            present[name] = False
-        if not present[name]:
-            t0 = time.time()
-            session.execute(text(f"ALTER TABLE {table} VALIDATE CONSTRAINT {name}"))
-            session.commit()
-            log(f"{table}: validated {name} in {time.time() - t0:.0f}s")
-
-
 def _copy_load(session, name, filepath, target=None, defer_fks=False, **kwargs):
     """``copy_parquet_parallel`` with progress lines (every 40 units) and a
     summary; ``source_sql`` reads one row group as ``src``. ``target`` is the
@@ -472,7 +420,7 @@ def _copy_load(session, name, filepath, target=None, defer_fks=False, **kwargs):
     took 9.4 min. normalized_citations, whose only key references a domain,
     loaded no faster without it and its validation cost 7.5 min (plan §22)."""
     if target and defer_fks and DEFER_FKS:
-        _drop_foreign_keys_if_empty(session, target)
+        fkeys.drop_if_empty(session, target, log)
     session.commit()  # earlier phases' rows are visible to the other connections
     t0 = time.time()
 
@@ -490,7 +438,7 @@ def _copy_load(session, name, filepath, target=None, defer_fks=False, **kwargs):
     log(f"{name}: {staged:,} rows staged, {written:,} written in {dt:.1f}s "
         f"({staged / dt if dt else 0:,.0f} rows/s, {LOAD_JOBS} jobs)")
     if target:
-        _restore_foreign_keys(session, target)
+        fkeys.restore(session, target, log)
     return staged, written
 
 
