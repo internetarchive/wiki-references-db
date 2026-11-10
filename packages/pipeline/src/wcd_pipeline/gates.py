@@ -154,8 +154,9 @@ def stage3(session: Session, domain: str, parquet_base: str, sample_buckets: int
 # ---------------------------------------------------------------------------
 
 def stage4(session: Session, domain: str, sample: int = 1000, seed: int = 0) -> list[str]:
-    """every normalized citation of the domain has ≥ 1 part; bare_url /
-    external_link parts carry extracted_url; template parts carry
+    """every normalized citation of the domain has ≥ 1 part; every bare_url /
+    external_link citation whose text has a URL with a host has a part carrying
+    extracted_url; template parts carry
     template_name; part_sha1 = sha1(content) on a sample; the foreign key
     to normalized_citations exists and is validated."""
     failures = []
@@ -167,12 +168,17 @@ def stage4(session: Session, domain: str, sample: int = 1000, seed: int = 0) -> 
         "WHERE nc.appears_on_domain_id = :d AND p.normalized_id IS NULL"), {"d": domain_id}).scalar_one()
     if no_parts:
         failures.append(f"{no_parts} normalized_citations rows have no part")
+    # per citation: an embedded template ({{Citation needed}}) is a part of its own
+    # without a URL; a citation whose "URL" has no host (http://'"…) has none to give
     no_url = session.execute(text(
-        "SELECT count(*) FROM normalized_citation_parts p JOIN normalized_citations nc ON nc.id = p.normalized_id "
-        "WHERE nc.appears_on_domain_id = :d AND nc.citation_type IN ('bare_url', 'external_link') AND p.extracted_url IS NULL"),
+        "SELECT count(*) FROM normalized_citations nc "
+        "WHERE nc.appears_on_domain_id = :d AND nc.citation_type IN ('bare_url', 'external_link') "
+        "AND regexp_replace(nc.reference_normalized, '''{2,}', '', 'g') ~ '(https?|ftps?|git)://[[:alnum:]]' "
+        "AND NOT EXISTS (SELECT 1 FROM normalized_citation_parts p "
+        "                WHERE p.normalized_id = nc.id AND p.extracted_url IS NOT NULL)"),
         {"d": domain_id}).scalar_one()
     if no_url:
-        failures.append(f"{no_url} bare_url/external_link parts have no extracted_url")
+        failures.append(f"{no_url} bare_url/external_link citations with a URL have no part carrying extracted_url")
     no_tpl = session.execute(text(
         "SELECT count(*) FROM normalized_citation_parts p JOIN normalized_citations nc ON nc.id = p.normalized_id "
         "WHERE nc.appears_on_domain_id = :d AND p.part_type = 'template' AND p.template_name IS NULL"),
