@@ -82,6 +82,34 @@ def expected_count(pg, domain_id: int) -> int:
         return cur.fetchone()[0]
 
 
+def _repartition_in_groups(con, flat: str, groups_dir: str, parquet_base: str, domain: str) -> int:
+    """``tier.repartition`` of one large flat file, ``DENORM_GROUPS`` (16) passes
+    of PAGE_BUCKETS / groups buckets each. In one pass, the sort of enwiki's
+    ~350M wide rows and the 512-way partitioned write ran DuckDB out of memory
+    at 16 GB. First the file is split by bucket group (no sort, a handful of
+    partitions, small row groups), then each group is sorted and partitioned
+    on its own. Returns the row count."""
+    groups = int(os.environ.get("DENORM_GROUPS", "16"))
+    per = layout.PAGE_BUCKETS // groups
+    shutil.rmtree(groups_dir, ignore_errors=True)
+    con.execute("SET preserve_insertion_order = false")
+    con.execute(f"""COPY (SELECT *, (page_id % {layout.PAGE_BUCKETS}) // {per} AS bucket_group
+                          FROM read_parquet('{flat}'))
+                    TO '{groups_dir}' (FORMAT PARQUET, PARTITION_BY (bucket_group), COMPRESSION ZSTD,
+                                       ROW_GROUP_SIZE 20000)""")
+    con.execute("SET preserve_insertion_order = true")
+    domain_dir = layout.partition_dir(parquet_base, DATASET, domain)
+    if domain_dir.exists():
+        shutil.rmtree(domain_dir)
+    n = 0
+    for g in sorted(os.listdir(groups_dir)):
+        n += tier.repartition(con, os.path.join(groups_dir, g, "*.parquet"), parquet_base, DATASET, domain, STEM,
+                              order_by="page_id, citation_instance_id, part_index")
+        log(f"repartitioned {g}: {n:,} rows so far")
+    shutil.rmtree(groups_dir, ignore_errors=True)
+    return n
+
+
 def export_citation_instances_denorm(dsn: str, domain: str, parquet_base: str, resolved: bool = False,
                                      scratch_dir: str | None = None, reuse_export: bool = False) -> dict:
     """Replace the domain's ``citation_instances_denorm`` partitions. Returns counts;
@@ -120,30 +148,28 @@ def export_citation_instances_denorm(dsn: str, domain: str, parquet_base: str, r
                     cur.copy_expert(f"COPY ({sql}) TO STDOUT WITH (FORMAT csv, HEADER true)", f)
             os.replace(csv_path + ".partial", csv_path)
             log(f"exported {os.path.getsize(csv_path) / 2**30:.1f} GiB of CSV ({time.time() - t0:.0f}s)")
-        for stale in glob.glob(os.path.join(glob.escape(scratch), "*.flat.parquet")):
-            os.remove(stale)
         flat = os.path.join(scratch, f"{STEM}-{DATASET}-0000.flat.parquet")
         con = duckdb_connect()
         try:
-            with open(csv_path, encoding="utf-8") as f:
-                names = f.readline().rstrip("\n").split(",")   # COPY's header: bare column names
-            if names != _COLUMNS:
-                raise RuntimeError(f"{DATASET}: the export's columns are not in schema order: {names} vs {_COLUMNS}")
-            # explicit types; an unquoted empty field is NULL, a quoted one an empty string
-            types = ", ".join(f"'{f.name}': '{_DUCK_TYPES[str(f.type)]}'" for f in SCHEMAS[DATASET])
-            # a row carries a reference's text several times (content, norm_content,
-            # title, …); enwiki has one of 2.8 MB, over DuckDB's 2 MB default
-            max_line = int(os.environ.get("DENORM_MAX_LINE_SIZE", str(DEFAULT_MAX_LINE_SIZE)))
-            con.execute(f"""COPY (SELECT * FROM read_csv('{csv_path}', header = true, columns = {{{types}}},
-                                                       quote = '"', escape = '"', allow_quoted_nulls = false,
-                                                       max_line_size = {max_line}, buffer_size = {2 * max_line}))
-                            TO '{flat}' (FORMAT PARQUET, COMPRESSION ZSTD)""")
-            log(f"converted to Parquet ({time.time() - t0:.0f}s)")
-            domain_dir = layout.partition_dir(parquet_base, DATASET, domain)
-            if domain_dir.exists():
-                shutil.rmtree(domain_dir)
-            n = tier.repartition(con, os.path.join(scratch, "*.flat.parquet"), parquet_base, DATASET, domain, STEM,
-                                 order_by="page_id, citation_instance_id, part_index")
+            if reuse_export and os.path.exists(flat):
+                log(f"reusing the converted Parquet ({os.path.getsize(flat) / 2**30:.1f} GiB)")
+            else:
+                with open(csv_path, encoding="utf-8") as f:
+                    names = f.readline().rstrip("\n").split(",")   # COPY's header: bare column names
+                if names != _COLUMNS:
+                    raise RuntimeError(f"{DATASET}: the export's columns are not in schema order: {names} vs {_COLUMNS}")
+                # explicit types; an unquoted empty field is NULL, a quoted one an empty string
+                types = ", ".join(f"'{f.name}': '{_DUCK_TYPES[str(f.type)]}'" for f in SCHEMAS[DATASET])
+                # a row carries a reference's text several times (content, norm_content,
+                # title, …); enwiki has one of 2.8 MB, over DuckDB's 2 MB default
+                max_line = int(os.environ.get("DENORM_MAX_LINE_SIZE", str(DEFAULT_MAX_LINE_SIZE)))
+                con.execute(f"""COPY (SELECT * FROM read_csv('{csv_path}', header = true, columns = {{{types}}},
+                                                           quote = '"', escape = '"', allow_quoted_nulls = false,
+                                                           max_line_size = {max_line}, buffer_size = {2 * max_line}))
+                                TO '{flat}.partial' (FORMAT PARQUET, COMPRESSION ZSTD)""")
+                os.replace(flat + ".partial", flat)
+                log(f"converted to Parquet ({time.time() - t0:.0f}s)")
+            n = _repartition_in_groups(con, flat, os.path.join(scratch, "groups"), parquet_base, domain)
         finally:
             con.close()
         log(f"repartitioned {n:,} rows ({time.time() - t0:.0f}s)")
