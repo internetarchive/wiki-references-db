@@ -60,6 +60,11 @@ _RESOLVED = ("csr.global_source_id, csr.source_type, csr.match_type, csr.confide
              "AND csr.part_index = p.part_index AND csr.domain_id = ci.domain_id AND csr.page_id = ci.page_id")
 
 
+# Arrow type of a denorm column → the DuckDB type its CSV field is read as
+_DUCK_TYPES = {"bool": "BOOLEAN", "double": "DOUBLE", "int8": "TINYINT", "int16": "SMALLINT",
+               "int32": "INTEGER", "int64": "BIGINT", "string": "VARCHAR"}
+
+
 def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [denorm] {msg}", flush=True)
 
@@ -86,36 +91,38 @@ def export_citation_instances_denorm(dsn: str, domain: str, parquet_base: str, r
                 raise SystemExit(f"domain {domain!r} is not in domains")
             domain_id = row[0]
         os.makedirs(scratch, exist_ok=True)
-        writer = tier.FlatWriter(scratch, DATASET, STEM, rows_per_file=1_000_000, row_group=50_000)
         resolution, join = _RESOLVED if resolved else _UNRESOLVED
+        csv_path = os.path.join(scratch, f"{STEM}.csv")
         with pg.cursor() as cur:
-            # a cursor is planned for its first 10 % of rows by default, which picks
-            # index nested loops; this reads all of it, so plan for all of it
-            cur.execute("SET cursor_tuple_fraction = 1.0")
             cur.execute(f"SET work_mem = '{os.environ.get('DENORM_WORK_MEM', '1GB')}'")
-        n_rows = 0
-        with pg.cursor(name="denorm_export") as cur:
-            cur.itersize = 50_000
-            cur.execute(_SELECT.format(resolution=resolution, join=join), {"d": domain_id})
-            while True:
-                rows = cur.fetchmany(50_000)
-                if not rows:
-                    break
-                if n_rows == 0 and [d.name for d in cur.description] != _COLUMNS:
-                    raise RuntimeError(f"{DATASET}: the export's columns are not in schema order: "
-                                       f"{[d.name for d in cur.description]} vs {_COLUMNS}")
-                writer.write_tuples(rows)
-                n_rows += len(rows)
-                if n_rows % 10_000_000 < 50_000:
-                    log(f"{n_rows:,} rows exported ({time.time() - t0:.0f}s)")
-        writer.close()
-        domain_dir = layout.partition_dir(parquet_base, DATASET, domain)
-        if domain_dir.exists():
-            shutil.rmtree(domain_dir)
+            # COPY (query) runs a parallel plan; a server-side cursor never does, and on
+            # enwiki the serial 3-way join spilled 95 GB of hash batches before its first row
+            sql = _SELECT.format(resolution=resolution, join=join).replace("%(d)s", str(int(domain_id)))
+            with open(csv_path, "wb") as f:
+                cur.copy_expert(f"COPY ({sql}) TO STDOUT WITH (FORMAT csv, HEADER true)", f)
+        log(f"exported {os.path.getsize(csv_path) / 2**30:.1f} GiB of CSV ({time.time() - t0:.0f}s)")
+        flat = os.path.join(scratch, f"{STEM}-{DATASET}-0000.flat.parquet")
         con = duckdb_connect()
-        n = tier.repartition(con, writer.glob, parquet_base, DATASET, domain, STEM,
-                             order_by="page_id, citation_instance_id, part_index")
-        con.close()
+        try:
+            header = con.execute(f"SELECT Columns FROM sniff_csv('{csv_path}', header = true, sample_size = 1)").fetchone()[0]
+            names = [c["name"] for c in header]
+            if names != _COLUMNS:
+                raise RuntimeError(f"{DATASET}: the export's columns are not in schema order: {names} vs {_COLUMNS}")
+            # explicit types; an unquoted empty field is NULL, a quoted one an empty string
+            types = ", ".join(f"'{f.name}': '{_DUCK_TYPES[str(f.type)]}'" for f in SCHEMAS[DATASET])
+            con.execute(f"""COPY (SELECT * FROM read_csv('{csv_path}', header = true, columns = {{{types}}},
+                                                       quote = '"', escape = '"', allow_quoted_nulls = false))
+                            TO '{flat}' (FORMAT PARQUET, COMPRESSION ZSTD)""")
+            os.remove(csv_path)
+            log(f"converted to Parquet ({time.time() - t0:.0f}s)")
+            domain_dir = layout.partition_dir(parquet_base, DATASET, domain)
+            if domain_dir.exists():
+                shutil.rmtree(domain_dir)
+            n = tier.repartition(con, os.path.join(scratch, "*.flat.parquet"), parquet_base, DATASET, domain, STEM,
+                                 order_by="page_id, citation_instance_id, part_index")
+        finally:
+            con.close()
+        log(f"repartitioned {n:,} rows ({time.time() - t0:.0f}s)")
         want = expected_count(pg, domain_id)
         if n != want:
             raise RuntimeError(f"{DATASET}: wrote {n} rows but citation_instances ⋈ parts has {want} for {domain}")
