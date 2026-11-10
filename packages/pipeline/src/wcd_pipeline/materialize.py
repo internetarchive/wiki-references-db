@@ -49,8 +49,10 @@ JOIN normalized_citations nc ON nc.id = ci.normalized_id
 JOIN normalized_citation_parts p ON p.normalized_id = nc.id
 {join}
 WHERE ci.domain_id = %(d)s
-ORDER BY ci.page_id, ci.id, p.part_index
 """
+# No ORDER BY: tier.repartition sorts by (page_id, citation_instance_id,
+# part_index), a unique key, so a Postgres sort of the whole join (one backend,
+# ~100+ GB of wide rows on enwiki) would only be redone.
 _UNRESOLVED = ("NULL::varchar AS global_source_id, NULL::varchar AS source_type, NULL::varchar AS match_type, "
                "NULL::double precision AS confidence", "")
 _RESOLVED = ("csr.global_source_id, csr.source_type, csr.match_type, csr.confidence",
@@ -86,6 +88,12 @@ def export_citation_instances_denorm(dsn: str, domain: str, parquet_base: str, r
         os.makedirs(scratch, exist_ok=True)
         writer = tier.FlatWriter(scratch, DATASET, STEM, rows_per_file=1_000_000, row_group=50_000)
         resolution, join = _RESOLVED if resolved else _UNRESOLVED
+        with pg.cursor() as cur:
+            # a cursor is planned for its first 10 % of rows by default, which picks
+            # index nested loops; this reads all of it, so plan for all of it
+            cur.execute("SET cursor_tuple_fraction = 1.0")
+            cur.execute(f"SET work_mem = '{os.environ.get('DENORM_WORK_MEM', '1GB')}'")
+        n_rows = 0
         with pg.cursor(name="denorm_export") as cur:
             cur.itersize = 50_000
             cur.execute(_SELECT.format(resolution=resolution, join=join), {"d": domain_id})
@@ -93,7 +101,13 @@ def export_citation_instances_denorm(dsn: str, domain: str, parquet_base: str, r
                 rows = cur.fetchmany(50_000)
                 if not rows:
                     break
-                writer.write(dict(zip(_COLUMNS, r)) for r in rows)
+                if n_rows == 0 and [d.name for d in cur.description] != _COLUMNS:
+                    raise RuntimeError(f"{DATASET}: the export's columns are not in schema order: "
+                                       f"{[d.name for d in cur.description]} vs {_COLUMNS}")
+                writer.write_tuples(rows)
+                n_rows += len(rows)
+                if n_rows % 10_000_000 < 50_000:
+                    log(f"{n_rows:,} rows exported ({time.time() - t0:.0f}s)")
         writer.close()
         domain_dir = layout.partition_dir(parquet_base, DATASET, domain)
         if domain_dir.exists():

@@ -46,19 +46,33 @@ class StreamWriter:
             if len(self._buffer) >= self.row_group:
                 self._flush()
 
+    def write_tuples(self, rows: list[tuple]) -> None:
+        """Write ``rows`` (tuples in schema column order) as one row group,
+        converted column by column: no per-row dict, which is the expensive
+        part at hundreds of millions of rows."""
+        if not rows:
+            return
+        self._flush()
+        columns = list(zip(*rows))
+        self._write_table(pa.Table.from_arrays(
+            [pa.array(c, type=f.type) for c, f in zip(columns, self.schema)], schema=self.schema))
+
     def _flush(self) -> None:
         if not self._buffer:
             return
+        self._write_table(pa.Table.from_pylist([{n: r.get(n) for n in self._names} for r in self._buffer],
+                                               schema=self.schema))
+        self._buffer.clear()
+
+    def _write_table(self, table: pa.Table) -> None:
         if self._writer is None:
             path = self._path_for(self._index)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             self._writer = pq.ParquetWriter(path, self.schema, compression="zstd")
             self.paths.append(path)
-        self._writer.write_table(pa.Table.from_pylist([{n: r.get(n) for n in self._names} for r in self._buffer],
-                                                      schema=self.schema))
-        self.rows += len(self._buffer)
-        self._rows_in_file += len(self._buffer)
-        self._buffer.clear()
+        self._writer.write_table(table)
+        self.rows += table.num_rows
+        self._rows_in_file += table.num_rows
         if self._rows_in_file >= self.rows_per_file:
             self._writer.close()
             self._writer = None
