@@ -44,3 +44,16 @@ def test_parts_urls_shorthand_and_noise():
     noise = parts_of(7, "<ref>&nbsp;see above</ref>", "ref_tag")
     assert len(noise) == 1 and noise[0]["norm_subtype"] == "noise" and noise[0]["part_index"] == 0
     assert parts_of(8, "<ref></ref>", "ref_tag")[0]["norm_subtype"] == "noise"
+
+
+def test_long_letter_run_is_cut_for_the_normalizer_only():
+    """A vandalised ref of one 50,000-letter 'word' (enwiki has a 227,137-char one)
+    is classified quickly; the part keeps its full content and sha1."""
+    import time
+
+    content = "[http://example.org/x Music Trust – More" + "a" * 50_000 + "]"
+    t = time.process_time()
+    part = parts_of(9, f"<ref>{content}</ref>", "ref_tag")[0]
+    assert time.process_time() - t < 5     # unguarded: ~4 CPU-min (quadratic backtracking)
+    assert part["content"] == content and part["part_sha1"] == part_sha1(content)
+    assert part["extracted_url"] == "https://example.org/x"   # the normalizer upgrades the scheme
