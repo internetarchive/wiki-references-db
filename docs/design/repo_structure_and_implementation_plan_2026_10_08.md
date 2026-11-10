@@ -584,3 +584,40 @@ The database already has the new schema (`template_data` dropped, `template_valu
 **Decisions taken without asking:** `dedup` partitioned by `page_id` / `hash(normalized_sha1)` with a 20M-row default; template rows keyed by name and `normalized_sha1` (not Postgres ids), so `load` never resolves 2.5 billion ids; md5 for the search bucket (DuckDB's `hash()` is not stable across versions); a 1,000-citation threshold for precomputed totals; report order by `normalized_sha1`.
 
 **Open:** add the disk, then Stage 3 `load` onward; the deduped files' compression; whether `normalized_citation_parts` needs every historical normalized citation; response caching for the API (the build-id-keyed LRU of the discussion, not built); Stage 1's ~1,200 files per Parquet bucket (§18).
+
+## 21. Stage 3 `load` at enwiki scale: COPY, parallel units, key order, and where it stops (2026-11-09/10)
+
+The disk was grown to 2.5 TB (1.6 TB free), enough for the rest of the build by §20's estimate. This section benchmarks `wcd load` on enwiki-20261001 namespace 0. All runs used the 28 GB systemd scope, `LOAD_MEMORY_LIMIT=8GB`, and the Postgres settings in the runbook. Before each run, the tables were reset to the post-Stage-0 state: the cited `web_resources` rows were deleted (`numeric_page_id IS NULL`; all 19,314,502 Stage-0 rows have it set) and `normalized_citations` was truncated with its cascade. Logs and a per-minute row sampler are in `/home/jh/wcd-data/stage3-load/`.
+
+**Baseline (39424d5: Python lookups plus multi-row `INSERT … VALUES`).** `domains` took 5 min 50 s for 7,509,746 rows (21.5k rows/s). `web_resources` ran at a steady 7.8k rows/s over 16 minutes, about 3.85 h for its 107,961,812 rows; the four citation tables hold ~1.02 billion rows. The `ncwr` loader looked URLs up by `web_resources.url`, which has no index (only `url_hash` does), so on enwiki it would have scanned ~127M rows per 1,000 URLs and never finished. The run was stopped during `web_resources`.
+
+**COPY and `INSERT … SELECT` (454a3c6).** `web_resources`, `normalized_citations`, `citation_instances` and `ncwr` now go through the COPY path that §20 wrote for template data. DuckDB reads the deduped Parquet and computes `url_hash` (`md5(url)`) and the checked `citation_instance_id` (`instance_id_sql`; a mismatch raises). COPY fills a temp table, and one `INSERT … SELECT` per unit resolves the natural keys in Postgres. `ncwr` resolves URLs through `url_hash`. The skip rules, the upsert onto Stage-0 article rows, and the id check are unchanged; `test_load_sets` covers them, and the ci fixture golden run is identical. With one connection, `web_resources` took 3,653 s (29.6k rows/s), with that one backend at 100 % of a core and the machine otherwise idle.
+
+**Parallel units (6052d06).** `copy_parquet_parallel` loads one Parquet row group per unit on `--jobs` connections (`LOAD_JOBS`, default 8), each unit committed on its own, as Stage 0 loads revisions. The deduped tables have one row per conflict key, so units never write the same key, and an interrupted load resumes on re-run. With 16 jobs, `web_resources` took 1,039 s (103.9k rows/s). `normalized_citations` started at ~114k rows/s and fell steadily to ~12k (9,822 s for 284,514,231 rows, 29.0k rows/s on average). Its `normalized_sha1` unique index (18 GB; random keys leave pages ~70 % full) outgrew the cache, so every insert became a random read: 14 of 16 backends in `IO:DataFileRead`, the disk 87 % busy at ~5.7k IOPS. `citation_instances` then committed no unit (500k rows) in 16.6 min, while an insert-triggered, throttled autovacuum read `normalized_citations`' 68 GB heap.
+
+**Key-ordered units and a VACUUM before the lookups (0b1cbe1, 13d7532).** With `sort_by`, DuckDB first writes a copy of the deduped file in key order (in `<staging>/.load-sort`, removed afterwards; a SIGTERM skips that cleanup). The units are its row groups, started in key order, so the 16 in flight cover adjacent key ranges. Keys: `md5(url)` for `web_resources`, `normalized_sha1` for `normalized_citations`, `(domain, page_id, raw_sha1)` for `citation_instances` (the order of its largest index), and `(normalized_sha1, url)` for `ncwr`. `VACUUM (ANALYZE)` now runs on the lookup tables before `citation_instances` and `ncwr`, unthrottled and only once. Results with 16 jobs:
+
+| phase | unsorted, 16 jobs | sorted, 16 jobs |
+|---|---|---|
+| `web_resources` (108.0M) | 1,039 s | 127 s sort + 1,077 s load = 1,204 s |
+| `normalized_citations` (284.5M) | 9,822 s, 114k → 12k rows/s | 2,558 s sort + 3,543 s load (80k rows/s, no decline) = 6,101 s |
+| VACUUM `normalized_citations` | — (throttled autovacuum during the next phase) | 387 s |
+| `citation_instances` (338.1M) | no unit committed in 16.6 min | 606 s sort; no unit committed in 22 min |
+
+Sorting gains nothing for `web_resources`, whose 9 GB `url_hash` index stays cached. It removes the collapse for `normalized_citations`, but the sort itself (43 min, mostly DuckDB writing the ordered run on about one core) eats much of the gain. With sorted units, 10–14 of 16 backends wait on `LWLock:BufferContent`. The likely cause is that every connection takes ids from the same sequence and appends to the rightmost leaf of the primary key.
+
+**Why `citation_instances` still stalls.** An `EXPLAIN (ANALYZE, BUFFERS)` of the real INSERT on 20,000 sorted rows, in one extra connection beside the 16 loaders, took 241 s (83 rows/s):
+
+- 44.5 s (2.2 ms per row) went on the `normalized_sha1` lookups: 52k pages read, and 45k dirty pages that backend had to write out first to get free buffers.
+- Most of the rest went to the INSERT itself, mostly waiting for buffers to be written back. Each write is a synchronous random 8 kB write (this disk: ~30 ms write latency, ~240 MB/s writes, ~25k read IOPS).
+
+The dirt comes from the foreign key on `normalized_id`. Each check takes a `FOR KEY SHARE` lock on the referenced row, which writes `xmax` into a random page of the 68 GB `normalized_citations` heap. Across 338M rows, the whole referenced heap becomes random writes. No single input order fixes this: `citation_instances` is keyed by page, the lookup by normalized citation. `ncwr` has the same pattern against `web_resources`. The run was stopped there. The database keeps `web_resources` (127,276,314 rows) and `normalized_citations` (284,514,231) fully loaded; `citation_instances` and `ncwr` are empty.
+
+**Decisions taken without asking:** the COPY and parallel rewrite of the four loaders (output identical, re-run behaviour unchanged); index lookups forced per unit (`index_lookups`: hash and merge joins off) for `citation_instances` and `ncwr`; key-ordered units; VACUUM before the probing phases; `LOAD_JOBS` default 8 (16 on enwiki). All tiers: 370 passed, 3 skipped.
+
+**Open (needs a decision):**
+1. **Defer the foreign keys of `citation_instances` (`normalized_id`, `domain_id`) and `ncwr` when loading into empty tables:** drop, load, then `ADD CONSTRAINT … NOT VALID` plus `VALIDATE CONSTRAINT`, one set-based join without row locks. §18 measured this on `revisions` and did not adopt it. There the referenced tables were small. Here the referenced table is 68 GB and the per-row lock is the bottleneck. A crash between drop and re-add has to be handled on re-run.
+2. **Resolve `normalized_sha1` to an id without a heap fetch per row:** `INCLUDE (id)` on the unique `normalized_sha1` index (index-only lookups), or resolution in DuckDB from an exported `(normalized_sha1, id)` file.
+3. **The hot rightmost primary-key leaf:** have the loader assign each unit a disjoint id range (offset plus row position in the sorted file, then `setval`), as Stage 0's units have disjoint `rev_id` ranges.
+4. **The sort's cost:** have `dedup` write the citation tables in key order (it already partitions by key), or sort only the key and a row index.
+5. **I/O:** a larger `max_wal_size` (57 requested checkpoints during `normalized_citations`) and the disk's throughput limit.

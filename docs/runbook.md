@@ -15,6 +15,7 @@ repository root with `.env` filled in (`example.env`).
 | `STAGING_DIR` | Stages 0, 1, 3 | per-shard staging Parquet, consumed by `dedup`/`load`, disposable afterwards; Stage 0's default `--work-dir` |
 | `STAGE0_MEMORY_LIMIT` | Stage 0 | DuckDB memory limit for `stage0-load` (default for `--memory-limit`) |
 | `DEDUP_ROWS_PER_PARTITION` | Stage 3 | staged rows per key partition in `dedup` (memory follows it) |
+| `LOAD_JOBS` | Stage 3 | connections for the citation tables in `load` (`--jobs`; one Parquet row group per unit) |
 | `LOAD_MEMORY_LIMIT`, `LOAD_ROWS_PER_PARTITION`, `TEMPLATE_COUNT_MIN` | Stage 3 | DuckDB memory limit and join partition size for the template Parquet written by `load`; the citation count from which a template value's report total is precomputed |
 | `REVISION_BUNDLES_DIR` | Stage 1 | the `.mwrev.zst` bundles, one directory per domain |
 | `API_*`, `WIKIPEDIA_API_*` | the API | CORS, default domain, pool size, User-Agent for title lookups |
@@ -69,7 +70,7 @@ uv run wcd extract-all -d $BUNDLES/en.wikipedia.org -o $STAGING --domain en.wiki
 
 # 3  dedup (instance-id collision gate) → load → gate 3 → indexes
 uv run wcd dedup -d $STAGING
-uv run wcd load -d $STAGING --parquet-dir $PARQUET_DIR
+uv run wcd load -d $STAGING --parquet-dir $PARQUET_DIR --jobs 16
 uv run wcd gate 3 --domain en.wikipedia.org
 uv run wcd init-db --add-indexes
 
@@ -179,6 +180,25 @@ page boundaries first. A worker that crashes or is killed leaves
 `STARTED.txt` + `FAILED.txt` and no `DONE.txt`; `extract-all` reports it,
 exits non-zero, and the next run clears and redoes that shard only.
 
+### Stage 3 load: parallelism, order, disk
+
+`wcd load` loads `web_resources`, `normalized_citations`, `citation_instances`
+and `ncwr` with COPY and `INSERT … SELECT` on `--jobs` connections
+(`LOAD_JOBS`). Each unit is one row group of a copy of the deduped file sorted
+by the table's random key, written to `$STAGING_DIR/.load-sort/` and removed
+afterwards. Budget disk for the largest sorted copy plus its spill (~150 GB for
+enwiki's `normalized_citations`). A load killed by a signal leaves its
+`load-sort-*` directory behind; delete it. Units commit on their own, so a
+re-run upserts the committed ones again.
+
+Measured on enwiki-20261001 with 16 jobs (plan §21): `web_resources` (108M
+rows) in 20 min, `normalized_citations` (285M) in 1 h 42 min including a
+43-minute sort. **`citation_instances` does not finish in a usable time**:
+each row's foreign-key check locks a row of the 68 GB `normalized_citations`
+heap, so the referenced heap becomes random writes (an open decision, plan §21).
+The disk was the limit throughout; give Postgres the runbook's
+`max_wal_size` or more, and watch `pg_stat_bgwriter.checkpoints_req`.
+
 ## What each step owns, and the unit of re-run
 
 | Step | Writes | Replaces | Re-run unit |
@@ -187,7 +207,7 @@ exits non-zero, and the next run clears and redoes that shard only.
 | `stage0-load` | `domains`, `revision_bundles`, `revisions`, `page_metadata`, article `web_resources`; `revisions/` Parquet | Postgres rows upserted / `ON CONFLICT DO NOTHING`, committed per page batch and per `rev_id` unit (an interrupted load resumes on re-run); the domain's `revisions/` partitions rebuilt from **everything under `--metadata`** | domain |
 | `extract` (`extract-all`) | staging files of the shard; `citation_history/`, `named_ref_uses/`, `revision_signals/` files named after the shard | that shard's files only (`<shard>-<i>.parquet` in every bucket) | shard (one bundle) |
 | `dedup` | `$STAGING/deduped/*.parquet` | per table (`.done` markers; delete `deduped/` to redo) | staging set |
-| `load` | `containers`, `domains`, `web_resources` (cited), `wiki_templates`, `normalized_citations`, `citation_instances`, `normalized_citation_web_resources`, `template_value_counts`; Parquet `template_params/`, `template_param_index/` | upserts — idempotent; the template datasets' domain partitions and that domain's `template_value_counts` replaced | staging set |
+| `load` | `containers`, `domains`, `web_resources` (cited), `wiki_templates`, `normalized_citations`, `citation_instances`, `normalized_citation_web_resources`, `template_value_counts`; Parquet `template_params/`, `template_param_index/` | upserts — idempotent, the citation tables committed per Parquet row group (an interrupted load resumes on re-run); the template datasets' domain partitions and that domain's `template_value_counts` replaced | staging set |
 | `parts` | `normalized_citation_parts` | DELETE + INSERT per batch; `--resume` skips citations that already have parts | domain (or all) |
 | `denorm-export` | `citation_instances_denorm/` | the domain's partitions | domain |
 | `ref-name-links` | `ref_name_links` table and Parquet | the domain | domain |
