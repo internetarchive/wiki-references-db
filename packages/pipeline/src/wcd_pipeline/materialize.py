@@ -18,14 +18,13 @@ import os
 import shutil
 import time
 
-import duckdb
 import psycopg2
 
 from wcd_schema import parquet as layout
 from wcd_schema.parquet import SCHEMAS
 
 from . import tier
-from .config import load_dotenv, psycopg_dsn  # noqa: F401
+from .config import duckdb_connect, load_dotenv, psycopg_dsn  # noqa: F401
 
 DATASET = "citation_instances_denorm"
 STEM = "denorm"
@@ -99,7 +98,7 @@ def export_citation_instances_denorm(dsn: str, domain: str, parquet_base: str, r
         domain_dir = layout.partition_dir(parquet_base, DATASET, domain)
         if domain_dir.exists():
             shutil.rmtree(domain_dir)
-        con = duckdb.connect()
+        con = duckdb_connect()
         n = tier.repartition(con, writer.glob, parquet_base, DATASET, domain, STEM,
                              order_by="page_id, citation_instance_id, part_index")
         con.close()

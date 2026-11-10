@@ -37,7 +37,7 @@ from wcd_schema.parquet import SCHEMAS
 from wcd_semantic.profile import build_source_profile
 from wcd_semantic.scoring import compute_score
 
-from .config import load_dotenv, psycopg_dsn  # noqa: F401
+from .config import duckdb_connect, load_dotenv, psycopg_dsn  # noqa: F401
 from .materialize import export_citation_instances_denorm
 
 MI = "matching_intermediate/"
@@ -467,7 +467,7 @@ def gate(pg, con, domain: str, domain_id: int, parquet_base: str) -> list[str]:
 
 def run(dsn: str, domain: str, parquet_base: str, steps=STEPS, force: bool = False) -> dict:
     pg = psycopg2.connect(dsn)
-    con = duckdb.connect()
+    con = duckdb_connect()
     counts = {}
     try:
         domain_id = _domain_id(pg, domain)
@@ -520,7 +520,7 @@ def main(argv=None) -> int:
     log(f"done: {counts}")
     if not args.no_gate and steps == list(STEPS):
         pg = psycopg2.connect(dsn)
-        con = duckdb.connect()
+        con = duckdb_connect()
         try:
             failures = gate(pg, con, args.domain, _domain_id(pg, args.domain), args.parquet_dir)
         finally:

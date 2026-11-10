@@ -50,6 +50,24 @@ def staging_dir(default: str = "./staging") -> str:
     return os.getenv("STAGING_DIR", default)
 
 
+def duckdb_connect(*args, **kwargs):
+    """``duckdb.connect`` with the limits from the environment: ``DUCKDB_MEMORY_LIMIT``
+    (e.g. ``6GB``; per connection, so per worker process in a ``--jobs`` pool) and
+    ``DUCKDB_TEMP_DIRECTORY`` (where it spills). Unset, DuckDB's defaults apply: 80 %
+    of RAM per connection, which on a full-size build overruns a memory-capped run as
+    soon as two connections are busy, or one is beside Postgres."""
+    import duckdb
+
+    con = duckdb.connect(*args, **kwargs)
+    mem = os.getenv("DUCKDB_MEMORY_LIMIT")
+    if mem:
+        con.execute(f"SET memory_limit = '{mem}'")
+    tmp = os.getenv("DUCKDB_TEMP_DIRECTORY")
+    if tmp:
+        con.execute(f"SET temp_directory = '{tmp}'")
+    return con
+
+
 def psycopg_dsn() -> str:
     """The same database as ``database_url()``, as a libpq / psycopg2 DSN."""
     url = database_url()

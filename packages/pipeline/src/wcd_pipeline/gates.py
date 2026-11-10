@@ -24,7 +24,7 @@ from wcd_schema.postgres import (
 )
 
 from . import fkeys
-from .config import database_url, load_dotenv  # noqa: F401
+from .config import database_url, duckdb_connect, load_dotenv  # noqa: F401
 
 
 def log(msg: str) -> None:
@@ -79,7 +79,7 @@ def stage0(session: Session | None, domain: str, parquet_base: str | None) -> li
         if ts_type not in ("timestamp without time zone", "timestamp with time zone"):
             failures.append(f"revisions.revision_timestamp is {ts_type!r}, not TIMESTAMP")
     if parquet_base is not None:
-        con = duckdb.connect()
+        con = duckdb_connect()
         pq_count = _parquet_count(con, layout.partition_glob(parquet_base, "revisions", domain))
         if pq_count == 0:
             failures.append(f"no revisions Parquet for domain {domain} under {parquet_base}")
@@ -119,7 +119,7 @@ def stage3(session: Session, domain: str, parquet_base: str, sample_buckets: int
     failures += fkeys.problems(session, ("web_resources", "normalized_citations", "citation_instances",
                                          "normalized_citation_web_resources"))
 
-    con = duckdb.connect()
+    con = duckdb_connect()
     buckets = layout.list_buckets(parquet_base, "citation_history", domain)
     if not buckets:
         failures.append(f"no citation_history Parquet for domain {domain} under {parquet_base}")
@@ -197,7 +197,8 @@ def stage4(session: Session, domain: str, sample: int = 1000, seed: int = 0) -> 
 
 def stage5(session: Session, domain: str, parquet_base: str | None = None) -> list[str]:
     """no overlapping revision ranges per (domain_id, page_id, ref_name); every
-    defining_instance_id exists; the Parquet copy matches Postgres."""
+    defining_instance_id exists; the Parquet copy matches Postgres; the
+    foreign keys exist and are validated."""
     failures = []
     domain_id = _domain_id(session, domain)
     if domain_id is None:
@@ -217,9 +218,11 @@ def stage5(session: Session, domain: str, parquet_base: str | None = None) -> li
         failures.append(f"{dangling} ref_name_links rows point at a missing citation instance")
     if parquet_base is not None:
         pg_n = session.execute(select(func.count()).select_from(RefNameLink).where(RefNameLink.domain_id == domain_id)).scalar_one()
-        pq_n = _parquet_count(duckdb.connect(), layout.partition_glob(parquet_base, "ref_name_links", domain))
+        pq_n = _parquet_count(duckdb_connect(), layout.partition_glob(parquet_base, "ref_name_links", domain))
         if pg_n != pq_n:
             failures.append(f"ref_name_links Parquet has {pq_n} rows but Postgres has {pg_n} for the domain")
+    # ref-name-links may drop the table's foreign keys while it fills it (--defer-fks)
+    failures += fkeys.problems(session, ("ref_name_links",))
     return failures
 
 
@@ -243,13 +246,12 @@ def run(stage: str, session: Session, domain: str, parquet_base: str | None, **k
         from .stage6 import gate as stage6
         return stage6(parquet_base, domain)
     if stage == "7":
-        import duckdb as _duckdb
         import psycopg2
         from .config import psycopg_dsn
         from .stage7 import _domain_id, gate as stage7
         pg = psycopg2.connect(psycopg_dsn())
         try:
-            return stage7(pg, _duckdb.connect(), domain, _domain_id(pg, domain), parquet_base)
+            return stage7(pg, duckdb_connect(), domain, _domain_id(pg, domain), parquet_base)
         finally:
             pg.close()
     if stage == "8":

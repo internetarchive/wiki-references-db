@@ -21,7 +21,7 @@ import duckdb
 from wcd_schema import parquet as layout
 from wcd_schema.duckdb import bind_bucket_views
 
-from .config import load_dotenv  # noqa: F401
+from .config import duckdb_connect, load_dotenv  # noqa: F401
 
 STATS_SQL = """
 WITH resolved AS (
@@ -87,7 +87,7 @@ def log(msg: str) -> None:
 
 def build_bucket(parquet_base: str, domain: str, bucket: int) -> dict:
     t0 = time.time()
-    con = duckdb.connect()
+    con = duckdb_connect()
     try:
         bind_bucket_views(con, parquet_base, domain, bucket,
                           ("revisions", "citation_history", "named_ref_uses", "citation_instances_denorm"))
@@ -104,7 +104,7 @@ def build_bucket(parquet_base: str, domain: str, bucket: int) -> dict:
 
 def gate(parquet_base: str, domain: str) -> list[str]:
     """one stats row per revision of the domain."""
-    con = duckdb.connect()
+    con = duckdb_connect()
     try:
         n_rev = con.execute(f"SELECT count(*) FROM read_parquet('{layout.partition_glob(parquet_base, 'revisions', domain)}', hive_partitioning=true)").fetchone()[0]
         try:

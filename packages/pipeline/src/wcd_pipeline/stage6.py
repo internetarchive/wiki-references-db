@@ -39,7 +39,7 @@ from wcd_schema.duckdb import bind_bucket_views
 from wcd_schema.parquet import SCHEMAS
 from wcd_semantic import match_global, match_reftag, match_template, merge_types
 
-from .config import load_dotenv  # noqa: F401
+from .config import duckdb_connect, load_dotenv  # noqa: F401
 
 MI = "matching_intermediate/"
 BUCKET_DATASETS = ("sources", "citation_source_map", "template_sources", "template_citation_source_map",
@@ -225,7 +225,7 @@ def bucket_done(parquet_base: str, domain: str, bucket: int) -> bool:
 
 def run_bucket(parquet_base: str, domain: str, bucket: int) -> dict:
     t0 = time.time()
-    con = duckdb.connect()
+    con = duckdb_connect()
     try:
         df = load_bucket_inputs(con, parquet_base, domain, bucket)
     finally:
@@ -253,7 +253,7 @@ def run_bucket(parquet_base: str, domain: str, bucket: int) -> dict:
 
 def run_global(parquet_base: str, domain: str) -> dict:
     t0 = time.time()
-    con = duckdb.connect()
+    con = duckdb_connect()
     try:
         pattern = layout.partition_glob(parquet_base, MI + "merged_sources", domain)
         df = con.execute(f"SELECT * EXCLUDE (domain, page_bucket) FROM read_parquet('{pattern}', hive_partitioning=true) "
@@ -300,7 +300,7 @@ def gate(parquet_base: str, domain: str) -> list[str]:
     """all six intermediate datasets exist; merged_citation_source_map > 0; every
     merged_source_id in global_source_map exists in merged_sources."""
     failures = []
-    con = duckdb.connect()
+    con = duckdb_connect()
     for ds in BUCKET_DATASETS:
         if not layout.list_buckets(parquet_base, MI + ds, domain):
             failures.append(f"no {ds} partitions for {domain}")
