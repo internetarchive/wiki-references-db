@@ -94,7 +94,10 @@ def export_citation_instances_denorm(dsn: str, domain: str, parquet_base: str, r
         resolution, join = _RESOLVED if resolved else _UNRESOLVED
         csv_path = os.path.join(scratch, f"{STEM}.csv")
         with pg.cursor() as cur:
-            cur.execute(f"SET work_mem = '{os.environ.get('DENORM_WORK_MEM', '1GB')}'")
+            # per process and doubled by hash_mem_multiplier: with 8 parallel workers
+            # 1GB took Postgres past RAM on enwiki (the kernel killed a worker and the
+            # server restarted); 256MB keeps the hash join under ~5 GB
+            cur.execute(f"SET work_mem = '{os.environ.get('DENORM_WORK_MEM', '256MB')}'")
             # COPY (query) runs a parallel plan; a server-side cursor never does, and on
             # enwiki the serial 3-way join spilled 95 GB of hash batches before its first row
             sql = _SELECT.format(resolution=resolution, join=join).replace("%(d)s", str(int(domain_id)))
