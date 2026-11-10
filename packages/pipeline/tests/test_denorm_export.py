@@ -18,7 +18,9 @@ from wcd_pipeline.config import database_url, psycopg_dsn
 pytestmark = pytest.mark.skipif(not os.environ.get("WCD_TEST_DATABASE_URL"),
                                 reason="set WCD_TEST_DATABASE_URL to a scratch Postgres database")
 
-AWKWARD = ['plain', '', 'quote " inside', 'comma, and\nnewline', 'back\\slash', 'ünïcödé — ✓', 'NULL', '\\N', None]
+# the last but one makes a CSV row over DuckDB's default 2 MB line limit (enwiki has a 2.8 MB row)
+AWKWARD = ['plain', '', 'quote " inside', 'comma, and\nnewline', 'back\\slash', 'ünïcödé — ✓', 'NULL', '\\N',
+           'http://en.wikipedia.org/wiki/x' * 50_000, None]
 
 
 def test_export_round_trips_values(tmp_path):
