@@ -88,7 +88,7 @@ Permanent failures (schema mismatch, constraint violation, disk full, **instance
 |---|---|---|
 | Stage 0 | `revisions` has rows for the domain; `page_metadata` has a row for every `(domain_id, page_id)` in `revisions`; `revision_timestamp` is `TIMESTAMP` | 1 |
 | Stage 3 dedup | **Instance-id collision gate**: `COUNT(DISTINCT id) = COUNT(DISTINCT (domain, page_id, raw_sha1))` over staged `citation_instances`; abort on mismatch (switch id to UUID before rebuilding) | load |
-| Stage 3 load | `citation_instances`, `normalized_citations` non-empty; no NULL `citation_type`; every `citation_history` `citation_instance_id` (sampled per bucket) exists in `citation_instances`; `revisions` Parquet row count = `pg.revisions` count for the domain | 4 |
+| Stage 3 load | `citation_instances`, `normalized_citations` non-empty; no NULL `citation_type`; every declared foreign key of `web_resources`, `normalized_citations`, `citation_instances`, `normalized_citation_web_resources` exists and is validated (`load --defer-fks` drops and re-adds them); every `citation_history` `citation_instance_id` (sampled per bucket) exists in `citation_instances`; `revisions` Parquet row count = `pg.revisions` count for the domain | 4 |
 | Stage 4 | every `normalized_citations` row has ≥1 part; every `bare_url` / `external_link` part has `extracted_url`; every `template` part has `template_name`; `part_sha1 = sha1(content)` on a sample | 4.6 |
 | Stage 4.6 | denorm row count = `citation_instances ⋈ parts` count for the domain | 5, 6 |
 | Stage 5 | no overlapping revision ranges per `(domain_id, page_id, ref_name)`; every `defining_instance_id` exists | 6a |

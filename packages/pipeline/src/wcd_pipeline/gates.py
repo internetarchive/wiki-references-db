@@ -20,7 +20,7 @@ from sqlalchemy.pool import NullPool
 from wcd_schema import parquet as layout
 from wcd_schema.ids import part_sha1
 from wcd_schema.postgres import (
-    CitationInstance, Domain, NormalizedCitation, RefNameLink, Revision,
+    Base, CitationInstance, Domain, NormalizedCitation, RefNameLink, Revision,
 )
 
 from .config import database_url, load_dotenv  # noqa: F401
@@ -113,6 +113,20 @@ def stage3(session: Session, domain: str, parquet_base: str, sample_buckets: int
                                  .where(NormalizedCitation.citation_type.is_(None))).scalar_one()
     if null_types:
         failures.append(f"{null_types} normalized_citations rows have NULL citation_type")
+
+    # load may drop these tables' foreign keys while it fills them (--defer-fks)
+    for table in ("web_resources", "normalized_citations", "citation_instances",
+                  "normalized_citation_web_resources"):
+        declared = {f"{table}_{fk.parent.name}_fkey" for fk in Base.metadata.tables[table].foreign_keys}
+        present = dict(session.execute(text(
+            "SELECT conname, convalidated FROM pg_constraint WHERE conrelid = CAST(:t AS regclass) AND contype = 'f'"
+        ), {"t": table}).all())
+        missing = sorted(declared - present.keys())
+        unvalidated = sorted(n for n in declared & present.keys() if not present[n])
+        if missing:
+            failures.append(f"{table}: foreign key(s) missing (an interrupted load? re-run it): {', '.join(missing)}")
+        if unvalidated:
+            failures.append(f"{table}: foreign key(s) not validated (re-run load): {', '.join(unvalidated)}")
 
     con = duckdb.connect()
     buckets = layout.list_buckets(parquet_base, "citation_history", domain)

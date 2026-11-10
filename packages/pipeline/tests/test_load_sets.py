@@ -104,13 +104,30 @@ def _snapshot(engine):
         }
 
 
-@pytest.mark.parametrize("row_group_size,jobs", [(None, 1), (1, 1), (1, 4)])
-def test_set_based_loaders(engine, tmp_path, row_group_size, jobs):
-    """One row group, or one row per row group (one unit each) on 1 or 4 connections."""
+def _foreign_keys(engine):
+    with engine.connect() as con:
+        return sorted(tuple(r) for r in con.execute(text(
+            "SELECT conrelid::regclass::text, conname, convalidated FROM pg_constraint WHERE contype = 'f' "
+            "AND conrelid::regclass::text IN ('web_resources', 'normalized_citations', 'citation_instances', "
+            "'normalized_citation_web_resources')")))
+
+
+@pytest.mark.parametrize("row_group_size,jobs,flags", [
+    (None, 1, []), (1, 1, []), (1, 4, []),
+    (1, 4, ["--defer-fks", "--id-ranges"]), (None, 1, ["--defer-fks", "--no-id-ranges"]),
+])
+def test_set_based_loaders(engine, tmp_path, row_group_size, jobs, flags):
+    """One row group, or one row per row group (one unit each) on 1 or 4
+    connections; foreign keys deferred and ids assigned per unit, or not."""
+    fks = _foreign_keys(engine)
     _article_row(engine)
     _stage(tmp_path, row_group_size=row_group_size)
-    args = ["-d", str(tmp_path), "--jobs", str(jobs), "--tables", *TABLES]
+    args = ["-d", str(tmp_path), "--jobs", str(jobs), *flags, "--tables", *TABLES]
     load.main(args)
+    assert _foreign_keys(engine) == fks   # all back, all validated
+    with engine.begin() as con:   # the sequences are past every id, assigned or not
+        for t in ("web_resources", "normalized_citations"):
+            assert con.execute(text(f"SELECT nextval(pg_get_serial_sequence('{t}', 'id')) > MAX(id) FROM {t}")).scalar()
     got = _snapshot(engine)
 
     def md5(u):
@@ -156,11 +173,43 @@ def test_sorted_copy_orders_row_groups(tmp_path, monkeypatch):
     pq.write_table(pa.table({"k": keys, "v": list(range(n))}), src, row_group_size=997)
     # DuckDB rounds row groups to whole vectors (2,048 rows)
     monkeypatch.setattr(load, "SORTED_GROUP", 4096)
-    out = load._sorted_copy(str(src), "k", str(tmp_path / "work"))
+    out, _ = load._sorted_copy(str(src), "k", str(tmp_path / "work"))
     f = pq.ParquetFile(out)
     assert f.metadata.num_row_groups >= 4
     got = [k for i in range(f.metadata.num_row_groups) for k in f.read_row_group(i).column("k").to_pylist()]
     assert got == sorted(keys)
+
+
+def test_sorted_copy_is_reused_until_its_source_changes(tmp_path):
+    src = tmp_path / "t.parquet"
+    pq.write_table(pa.table({"k": ["b", "a"]}), src)
+    work = str(tmp_path / "work")
+    first, reused = load._sorted_copy(str(src), "k", work)
+    assert not reused
+    assert load._sorted_copy(str(src), "k", work) == (first, True)
+    pq.write_table(pa.table({"k": ["c", "b", "a"]}), src)   # new source: new copy, old one removed
+    second, reused = load._sorted_copy(str(src), "k", work)
+    assert not reused and second != first
+    assert sorted(os.listdir(work)) == [os.path.basename(second)]
+
+
+def test_interrupted_deferred_load_restores_foreign_keys(engine, tmp_path):
+    """A load killed after dropping citation_instances' foreign keys leaves the
+    table without them; gate 3 says so, and the next load adds them back."""
+    from wcd_pipeline import gates
+    from sqlalchemy.orm import Session
+
+    fks = _foreign_keys(engine)
+    _stage(tmp_path)
+    load.main(["-d", str(tmp_path), "--tables", "domains", "normalized_citations"])
+    with engine.begin() as con:
+        con.execute(text("ALTER TABLE citation_instances DROP CONSTRAINT citation_instances_normalized_id_fkey"))
+    with Session(engine) as s:
+        assert any("citation_instances_normalized_id_fkey" in f for f in gates.stage3(s, EN, str(tmp_path)))
+    load.main(["-d", str(tmp_path), "--no-defer-fks", "--tables", "citation_instances"])
+    assert _foreign_keys(engine) == fks
+    with Session(engine) as s:
+        assert not any("foreign key" in f for f in gates.stage3(s, EN, str(tmp_path)))
 
 
 def test_loaders_leave_no_sorted_copies(engine, tmp_path):
