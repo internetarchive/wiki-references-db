@@ -187,9 +187,15 @@ _YEAR_RE = re.compile(r"\b(1[5-9]\d{2}|20[0-2]\d)\b")
 
 # Reliable year patterns: year is unambiguously a publication year, not
 # embedded in a title or historical date context.
+# DEVIATION (wcd, NOTICE 2): the two name alternatives start only where a word
+# starts ((?<![A-Za-z])). Unanchored, search() retried them at every letter of a
+# word and scanned to its end each time, quadratic in the word's length (85 CPU-
+# minutes for one 227,137-character vandalised enwiki ref). A match can never
+# start mid-word without also matching from the word's first letter, which
+# search() finds first, so every result is unchanged.
 _RELIABLE_YEAR_RE = re.compile(
     # Author (YYYY): capital name + paren year: "Smith (1995)"
-    r'[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s*\(\s*(1[5-9]\d{2}|20[0-2]\d)\s*[,\.\)]'
+    r'(?<![A-Za-z])[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s*\(\s*(1[5-9]\d{2}|20[0-2]\d)\s*[,\.\)]'
     # (Month/Season YYYY)
     r'|\((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
     r'Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|'
@@ -200,7 +206,7 @@ _RELIABLE_YEAR_RE = re.compile(
     # harvnb/sfn positional year param
     r'|\{\{(?:harvnb|sfn|harv|harvp|sfnp)\s*\|[^}]*\|\s*(1[5-9]\d{2}|20[0-2]\d)\s*[|\}]'
     # Surname YYYY: bare author-date: "Sandburg 1974,"
-    r'|[A-Z][a-z]{2,}\s+(1[5-9]\d{2}|20[0-2]\d)\s*[,\.]',
+    r'|(?<![A-Za-z])[A-Z][a-z]{2,}\s+(1[5-9]\d{2}|20[0-2]\d)\s*[,\.]',
     re.IGNORECASE
 )
 

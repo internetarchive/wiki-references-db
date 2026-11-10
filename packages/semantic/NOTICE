@@ -28,6 +28,14 @@ Documented deviations from upstream logic:
      set; upstream's set iteration made the extracted URL of a cite template
      inside a ref depend on the Python hash seed. The golden generator applies
      the same tuple to upstream before recording.
+  2. reftag.py `_RELIABLE_YEAR_RE`: the two alternatives that begin with a
+     name ([A-Z][a-z]…, under IGNORECASE) start only where a word starts
+     ((?<![A-Za-z])). Upstream's search() retried them at every letter of a
+     word, quadratic in the word's length: on enwiki one 227,137-character
+     vandalised <ref> took ~85 CPU-minutes in classify(). Results are
+     unchanged (a match cannot begin mid-word without also matching from the
+     word's first letter, which search() reaches first); the goldens are
+     unchanged and tests/test_additions.py compares both patterns.
 
 Additions over upstream (all marked "ADDED (wcd)" in the source and covered
 by tests/test_additions.py; the golden comparison strips their output keys):

@@ -90,24 +90,14 @@ def _template_part(parsed: dict) -> dict:
     }
 
 
-# The ref-tag normalizer's prose regexes (wcd_semantic.reftag, vendored) backtrack
-# quadratically on a long run of letters: 40 CPU-s at 20,000 letters, ~85 CPU-min
-# for a 227,137-character vandalised <ref> ("Moreaaaa…") on enwiki. No word is
-# longer than this, so the normalizer sees such runs cut to MAX_WORD letters; the
-# part's content and part_sha1 are unchanged (an adapted input, not an edited
-# upstream function).
-MAX_WORD = 200
-_LONG_WORD_RE = re.compile(r"[^\W\d_]{%d,}" % (MAX_WORD + 1))
-
-
-def _classifiable(content: str) -> str:
-    return _LONG_WORD_RE.sub(lambda m: m.group(0)[:MAX_WORD], content)
-
-
-def _reftag_part(content: str, part_type: str, noise: bool = False) -> dict:
-    r = classify(_classifiable(content))
+def _reftag_part(content: str, part_type: str, noise: bool = False, url_citation: bool = False) -> dict:
+    """A ref-tag part. For a citation that is a URL (``bare_url`` /
+    ``external_link``) whose normalizer output has no URL, the first URL in
+    the content is taken: the normalizer only extracts http(s), and enwiki has
+    ~2,400 ftp:// bare-URL citations (gate 4 requires their extracted_url)."""
+    r = classify(content)
     url = r.get("extracted_url")
-    if url is None and part_type == "external_link":
+    if url is None and (part_type == "external_link" or url_citation):
         m = _URL_RE.search(content)
         url = m.group(0) if m else None
     return {
@@ -130,15 +120,16 @@ def _parts_for_content(content: str, citation_type: str) -> tuple:
     """The parts of one content string, as a tuple of dicts (cached: the same
     content recurs across pages)."""
     ref_part_type = "external_link" if citation_type == "external_link" else "ref_tag"
+    url_citation = citation_type in ("bare_url", "external_link")
     parts = []
     for parsed in iter_citations(None, content):
         if parsed["citation_type"] == "template":
             parts.append(_template_part(parsed))
         else:
-            parts.append(_reftag_part(parsed["content"], ref_part_type))
+            parts.append(_reftag_part(parsed["content"], ref_part_type, url_citation=url_citation))
     if not parts:
         # footnote filter rejected it (or empty content): keep it, typed as noise
-        parts.append(_reftag_part(content, ref_part_type, noise=True))
+        parts.append(_reftag_part(content, ref_part_type, noise=True, url_citation=url_citation))
     return tuple(parts)
 
 

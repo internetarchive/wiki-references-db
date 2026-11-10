@@ -46,14 +46,28 @@ def test_parts_urls_shorthand_and_noise():
     assert parts_of(8, "<ref></ref>", "ref_tag")[0]["norm_subtype"] == "noise"
 
 
-def test_long_letter_run_is_cut_for_the_normalizer_only():
+def test_long_letter_run_is_classified_quickly_and_whole():
     """A vandalised ref of one 50,000-letter 'word' (enwiki has a 227,137-char one)
-    is classified quickly; the part keeps its full content and sha1."""
+    is classified in linear time (wcd_semantic NOTICE deviation 2), and a long
+    letters-only URL parameter reaches the normalizer uncut."""
     import time
 
     content = "[http://example.org/x Music Trust – More" + "a" * 50_000 + "]"
     t = time.process_time()
     part = parts_of(9, f"<ref>{content}</ref>", "ref_tag")[0]
-    assert time.process_time() - t < 5     # unguarded: ~4 CPU-min (quadratic backtracking)
+    assert time.process_time() - t < 5     # upstream regex: ~4 CPU-min (quadratic backtracking)
     assert part["content"] == content and part["part_sha1"] == part_sha1(content)
     assert part["extracted_url"] == "https://example.org/x"   # the normalizer upgrades the scheme
+    gs = "https://www.google.com/search?q=x&gs_lp=" + "Egxnd" * 60
+    assert parts_of(10, gs, "external_link")[0]["extracted_url"] == gs
+
+
+def test_ftp_url_citations_keep_their_url():
+    """The ref-tag normalizer extracts only http(s); a bare-URL or external-link
+    citation of an ftp:// URL still gets extracted_url (gate 4)."""
+    bare = parts_of(11, "<ref>[ftp://ftp.example.org/pub/a.pdf A manual]</ref>", "bare_url")[0]
+    assert bare["extracted_url"] == "ftp://ftp.example.org/pub/a.pdf"
+    plain = parts_of(12, "<ref>ftp://ftp.example.org/pub/b.txt</ref>", "bare_url")[0]
+    assert plain["extracted_url"] == "ftp://ftp.example.org/pub/b.txt"
+    # a prose ref_tag citation is not a URL citation: no fallback
+    assert parts_of(13, "<ref>Text, see ftp://ftp.example.org/c</ref>", "ref_tag")[0]["extracted_url"] is None
