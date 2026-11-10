@@ -15,7 +15,7 @@ repository root with `.env` filled in (`example.env`).
 | `STAGING_DIR` | Stages 0, 1, 3 | per-shard staging Parquet, consumed by `dedup`/`load`, disposable afterwards; Stage 0's default `--work-dir` |
 | `STAGE0_MEMORY_LIMIT` | Stage 0 | DuckDB memory limit for `stage0-load` (default for `--memory-limit`) |
 | `DEDUP_ROWS_PER_PARTITION` | Stage 3 | staged rows per key partition in `dedup` (memory follows it) |
-| `LOAD_JOBS` | Stage 3 | connections for the citation tables in `load` (`--jobs`; one Parquet row group per unit) |
+| `LOAD_JOBS`, `LOAD_DEFER_FKS`, `LOAD_KEEP_SORTED` | Stage 3 | connections for the citation tables in `load` (`--jobs`; one Parquet row group per unit); deferred foreign keys for `citation_instances` / `ncwr` (`--defer-fks`, default on); keep the key-sorted copies after a successful load |
 | `LOAD_MEMORY_LIMIT`, `LOAD_ROWS_PER_PARTITION`, `TEMPLATE_COUNT_MIN` | Stage 3 | DuckDB memory limit and join partition size for the template Parquet written by `load`; the citation count from which a template value's report total is precomputed |
 | `REVISION_BUNDLES_DIR` | Stage 1 | the `.mwrev.zst` bundles, one directory per domain |
 | `API_*`, `WIKIPEDIA_API_*` | the API | CORS, default domain, pool size, User-Agent for title lookups |
@@ -185,19 +185,37 @@ exits non-zero, and the next run clears and redoes that shard only.
 `wcd load` loads `web_resources`, `normalized_citations`, `citation_instances`
 and `ncwr` with COPY and `INSERT … SELECT` on `--jobs` connections
 (`LOAD_JOBS`). Each unit is one row group of a copy of the deduped file sorted
-by the table's random key, written to `$STAGING_DIR/.load-sort/` and removed
-afterwards. Budget disk for the largest sorted copy plus its spill (~150 GB for
-enwiki's `normalized_citations`). A load killed by a signal leaves its
-`load-sort-*` directory behind; delete it. Units commit on their own, so a
-re-run upserts the committed ones again.
+by the table's random key, written to `$STAGING_DIR/.load-sort/` and deleted
+after a successful load. Budget disk for the largest sorted copy plus its spill
+(~150 GB for enwiki's `normalized_citations`). A failed or killed load keeps
+its copy and the next load reuses it (the copy is named after its source's
+size and mtime, so a re-deduped file is sorted again); delete
+`$STAGING_DIR/.load-sort/` to reclaim the space. Units commit on their own, so
+a re-run upserts the committed ones again.
 
-Measured on enwiki-20261001 with 16 jobs (plan §21): `web_resources` (108M
-rows) in 20 min, `normalized_citations` (285M) in 1 h 42 min including a
-43-minute sort. **`citation_instances` does not finish in a usable time**:
-each row's foreign-key check locks a row of the 68 GB `normalized_citations`
-heap, so the referenced heap becomes random writes (an open decision, plan §21).
-The disk was the limit throughout; give Postgres the runbook's
-`max_wal_size` or more, and watch `pg_stat_bgwriter.checkpoints_req`.
+`citation_instances` and `ncwr` load into empty tables without their foreign
+keys (`--defer-fks`, default on), which are then added `NOT VALID` and
+validated in one pass each. Checked row by row, each check locks a row of the
+68 GB `normalized_citations` heap, and the load stalls. The keys are restored
+after every load, also after an interrupted one, and gate 3 fails while any is
+missing or unvalidated. `normalized_citations` keeps its key; deferring it
+saved nothing.
+
+Measured on enwiki-20261001 with 16 jobs (plan §22), phase by phase; `wcd load`
+end to end ≈ 6 h 25 min (sum of the phases, plus ~5 min of VACUUM before
+`citation_instances`):
+
+| phase | rows | time |
+|---|---|---|
+| `domains` | 7.5M | 6–8 min |
+| `web_resources` (cited) | 108M | 20 min (2 min sort) |
+| `normalized_citations` | 285M | 1 h 42 min (43–48 min sort) |
+| `citation_instances` | 338M | 1 h 28 min (10 min sort, 9.4 min validation) |
+| `ncwr` | 290M | 49 min (11 min sort, 13.4 min validation) |
+| template Parquet + `template_value_counts` | 2.5B → 1.37B / 6.44B | 1 h 51 min |
+
+The disk was the limit throughout (WAL, then checkpoints); give Postgres the
+runbook's `max_wal_size` or more, and watch `pg_stat_bgwriter.checkpoints_req`.
 
 ## What each step owns, and the unit of re-run
 

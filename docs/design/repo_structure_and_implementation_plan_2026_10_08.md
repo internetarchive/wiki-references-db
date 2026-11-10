@@ -621,3 +621,54 @@ The dirt comes from the foreign key on `normalized_id`. Each check takes a `FOR 
 3. **The hot rightmost primary-key leaf:** have the loader assign each unit a disjoint id range (offset plus row position in the sorted file, then `setval`), as Stage 0's units have disjoint `rev_id` ranges.
 4. **The sort's cost:** have `dedup` write the citation tables in key order (it already partitions by key), or sort only the key and a row index.
 5. **I/O:** a larger `max_wal_size` (57 requested checkpoints during `normalized_citations`) and the disk's throughput limit.
+
+## 22. Stage 3 `load`: deferred foreign keys, `INCLUDE (id)`, per-unit id ranges, measured; Stage 3 complete on enwiki (2026-11-10)
+
+This section follows up §21's open items 1–3, which the user asked to try alone and in combination. All runs used 16 jobs, the 28 GB scope, and the key-sorted units of §21. The sorted copies were kept between runs (`LOAD_KEEP_SORTED=1`, `52b3f82`: copies are named after their source and reused). Times below are load time, without the sort, unless a row says otherwise. Partial runs compare the first 200 units. Logs: `/home/jh/wcd-data/stage3-load/exp-*.log`.
+
+**normalized_citations (284.5M rows).**
+
+| variant | first 200 units | full load | notes |
+|---|---|---|---|
+| sorted, sequence ids, FK kept (§21) | 1,246 s | 3,543 s | 10–14 of 16 backends on `LWLock:BufferContent` |
+| per-unit id ranges | 1,212 s | — | the BufferContent waits are gone; backends now wait on `WALInsert` / `WALWrite` |
+| deferred FK | 1,302 s | 3,578 s, + 449 s to validate | — |
+
+With id ranges, each unit takes ids `max(id) + 1 + row position`, so the units append to separate ranges of the primary key. That removes the contention on its rightmost leaf, but the load is WAL-bound and throughput did not change. The FK on `appears_on_domain_id` references a single domain row, and deferring it saves nothing while its validation costs 7.5 min. Neither was adopted; the id-range code was removed and stays in `52b3f82`.
+
+**citation_instances (338.1M rows).**
+
+| variant | rate | notes |
+|---|---|---|
+| FKs kept, plain `normalized_sha1` index (§21) | < 6k rows/s | no unit committed in 22 min |
+| `INCLUDE (id)`, FKs kept | ≈ 0 | no unit committed in 13 min; 541 read IOPS but 3.7k random write IOPS at 89 % busy (the FK row locks dirtying `normalized_citations`' heap) |
+| FKs deferred, plain index | 42–54k rows/s | 20–38k read IOPS: the `normalized_sha1` leaf plus a heap fetch for `id`, per row |
+| FKs deferred, `INCLUDE (id)` | 81.8k rows/s average (up to ~140k) | full run: 4,132 s, + 225 s and 336 s to validate the two keys |
+
+Building the `INCLUDE (id)` index on the loaded table took 8.6 min (18 GB, the size of the old index, which inserts had left ~70 % full). Both changes are needed: the per-row FK lock is the bottleneck, and once it is gone the heap fetch for `id` is.
+
+**ncwr (289.8M rows), keys deferred:** 650 s sort, ~1,460 s load (255k rows/s steady, 617 read IOPS: `web_resources` stays cached, so `url_hash` needs no `INCLUDE`), and 655 s + 148 s to validate: 49 min in all. Every row resolved.
+
+**Template parameters (phase 8, first run at enwiki scale):** `template_param_index` 1,365,988,136 rows in 24 min; `template_params` 6,438,109,681 rows in 86 min (one row per template parameter per page that uses the citation); `template_value_counts` 122,757 heavy values. 1 h 51 min in all, peak RSS 11.6 GB (`LOAD_MEMORY_LIMIT=8GB`). The Parquet takes 35 GB and 25 GB.
+
+**Adopted (`9003000`):**
+
+- `load` defers the foreign keys of `citation_instances` and `normalized_citation_web_resources` when the table is empty at the start of its phase (`--defer-fks`, `LOAD_DEFER_FKS`, default on). Afterwards it adds every missing declared key `NOT VALID` and validates every unvalidated one. This runs after every load phase, so a load killed in between restores the keys on its re-run, and gate 3 fails while any is missing or unvalidated (`test_interrupted_deferred_load_restores_foreign_keys`).
+- `normalized_citations`' natural key is now `UNIQUE INDEX normalized_citations_normalized_sha1_key (normalized_sha1) INCLUDE (id)`, which replaces the unique constraint under the same name. `ON CONFLICT (normalized_sha1)` infers it, and `init-db` always creates unique indexes. An existing database needs the swap by hand: create the new index, drop the constraint, rename.
+
+**Stage 3 on enwiki, end to end** (phase by phase across these runs; the sum is ≈ 6 h 25 min for `load`):
+
+| phase | rows | time |
+|---|---|---|
+| domains | 7.5M | 6–8 min |
+| web_resources (cited) | 108.0M | 20 min |
+| normalized_citations | 284.5M | 1 h 42 min (incl. 43–48 min sort) |
+| citation_instances | 338.1M | 1 h 28 min (10 min sort, 69 min load, 9.4 min validation) |
+| ncwr | 289.8M | 49 min |
+| template Parquet | 2.5B → 1.37B + 6.44B | 1 h 51 min |
+
+Against the §21 baseline (row-by-row upserts at ~7.8k rows/s, with ncwr never finishing), the four Postgres phases went from 36+ hours (projected) to ~4.3 h. **Gate 3 passes** (11 min; it now includes the foreign-key check), so Stage 3 is complete for enwiki-20261001.
+
+**Decisions taken without asking:** dropping id ranges after measuring no gain; keeping `normalized_citations`' FK; making deferral the default for the two tables; no `INCLUDE` on `url_hash`; reusing a kept sorted copy, matched by source size and mtime.
+
+**Open:** the sort is now the largest single cost (43–48 min of DuckDB writing the ordered run on about one core for `normalized_citations`). Having `dedup` write the citation tables in key order, or sorting only the key and a row index, would remove most of it. `init-db --add-indexes` (Stage 3's secondary indexes) has not been run yet. WAL and checkpoint I/O is the remaining Postgres limit (§21 item 5).
