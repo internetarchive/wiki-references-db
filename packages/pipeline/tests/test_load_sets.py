@@ -114,11 +114,11 @@ def _foreign_keys(engine):
 
 @pytest.mark.parametrize("row_group_size,jobs,flags", [
     (None, 1, []), (1, 1, []), (1, 4, []),
-    (1, 4, ["--defer-fks", "--id-ranges"]), (None, 1, ["--defer-fks", "--no-id-ranges"]),
+    (1, 4, ["--defer-fks"]), (None, 1, ["--no-defer-fks"]),
 ])
 def test_set_based_loaders(engine, tmp_path, row_group_size, jobs, flags):
     """One row group, or one row per row group (one unit each) on 1 or 4
-    connections; foreign keys deferred and ids assigned per unit, or not."""
+    connections; foreign keys deferred or not."""
     fks = _foreign_keys(engine)
     _article_row(engine)
     _stage(tmp_path, row_group_size=row_group_size)

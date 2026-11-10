@@ -290,12 +290,22 @@ class NormalizedCitation(Base):
     included). Semantic columns are on ``normalized_citation_parts``."""
     __tablename__ = 'normalized_citations'
     id = Column(Integer, primary_key=True, nullable=False, autoincrement=True)
-    normalized_sha1 = Column(CHAR(40), nullable=False, unique=True)
+    normalized_sha1 = Column(CHAR(40), nullable=False)
     reference_normalized = Column(Text, nullable=False)
     appears_on_domain_id = Column(Integer, ForeignKey('domains.id'), nullable=False)
     appears_on_page_id = Column(Integer, nullable=False)
     # ref_tag | template | bare_url | endnote | shorthand | external_link (Stage 1)
     citation_type = Column(String, nullable=False)
+
+    # The natural key, with the id in the index: Stage 3 resolves every
+    # citation instance's normalized_sha1 to an id, and with INCLUDE that is
+    # an index-only lookup instead of an index probe plus a heap fetch in a
+    # 68 GB table (enwiki; plan §22). Named like the unique constraint it
+    # replaces; ON CONFLICT (normalized_sha1) infers it.
+    __table_args__ = (
+        Index('normalized_citations_normalized_sha1_key', 'normalized_sha1', unique=True,
+              postgresql_include=['id']),
+    )
 
     @staticmethod
     def bulk_upsert(session: Session, rows):

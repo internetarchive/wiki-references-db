@@ -34,7 +34,6 @@ from collections import OrderedDict
 
 
 import duckdb
-import pyarrow as pa
 import pyarrow.csv as pa_csv
 from sqlalchemy import create_engine, select as sa_select, text
 from sqlalchemy.orm import sessionmaker
@@ -64,12 +63,10 @@ LOAD_JOBS = int(os.getenv('LOAD_JOBS', '8'))
 SORTED_GROUP = 500_000
 # Keep the key-sorted copies after a successful load (for repeated loads of the same staging)
 KEEP_SORTED = os.getenv('LOAD_KEEP_SORTED', '') not in ('', '0', 'false')
-# Drop a table's foreign keys when it is empty at the start of its phase, and add them back
-# (NOT VALID, then VALIDATE) after it; --defer-fks / --no-defer-fks override
-DEFER_FKS = os.getenv('LOAD_DEFER_FKS', '0') not in ('', '0', 'false')
-# Assign normalized_citations / web_resources ids per unit (max(id) + row position) instead of
-# from the sequence; --id-ranges / --no-id-ranges override
-ID_RANGES = os.getenv('LOAD_ID_RANGES', '0') not in ('', '0', 'false')
+# Drop the foreign keys of citation_instances / normalized_citation_web_resources when the table
+# is empty at the start of its phase, and add them back (NOT VALID, then VALIDATE) after it;
+# --defer-fks / --no-defer-fks override
+DEFER_FKS = os.getenv('LOAD_DEFER_FKS', '1') not in ('', '0', 'false')
 
 
 # ---------------------------------------------------------------------------
@@ -263,9 +260,6 @@ def copy_parquet_parallel(engine, filepath, source_sql, temp_table, temp_ddl, co
     over. Unsorted, enwiki's ``normalized_citations`` fell from ~114k to ~14k
     rows/s as its ``normalized_sha1`` index (18 GB) outgrew the cache and
     every insert became a random read.
-
-    ``src`` carries one extra column, ``_row``: the row's 0-based position in
-    the (sorted) file, for loaders that assign ids themselves.
     """
     jobs = jobs or LOAD_JOBS
     sorted_file = None
@@ -289,13 +283,10 @@ def _run_units(engine, filepath, source_sql, temp_table, temp_ddl, columns, inse
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import pyarrow.parquet as pq
 
-    meta = pq.ParquetFile(filepath).metadata
-    n_units = meta.num_row_groups
-    starts = list(itertools.accumulate((meta.row_group(i).num_rows for i in range(n_units)), initial=0))
+    n_units = pq.ParquetFile(filepath).metadata.num_row_groups
 
     def unit(i):
         table = pq.ParquetFile(filepath).read_row_group(i)
-        table = table.append_column('_row', pa.array(range(starts[i], starts[i] + table.num_rows), pa.int64()))
         con = duckdb.connect()
         try:
             con.register('src', table)
@@ -468,26 +459,19 @@ def _restore_foreign_keys(session, table):
             log(f"{table}: validated {name} in {time.time() - t0:.0f}s")
 
 
-def _id_base(session, table):
-    """The id after which a load assigns ``table``'s new ids itself."""
-    base = session.execute(text(f"SELECT COALESCE(MAX(id), 0) FROM {table}")).scalar_one()
-    session.commit()
-    return base
-
-
-def _sync_id_sequence(session, table):
-    """Move ``table``'s id sequence past the ids a load assigned itself."""
-    session.execute(text(f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
-                         f"GREATEST((SELECT MAX(id) FROM {table}), 1))"))
-    session.commit()
-
-
-def _copy_load(session, name, filepath, target=None, **kwargs):
+def _copy_load(session, name, filepath, target=None, defer_fks=False, **kwargs):
     """``copy_parquet_parallel`` with progress lines (every 40 units) and a
-    summary; ``source_sql`` reads one row group as ``src``. With ``target``
-    (the table written), its foreign keys are dropped first if it is empty and
-    ``DEFER_FKS`` is set, and restored and validated afterwards in any case."""
-    if target and DEFER_FKS:
+    summary; ``source_sql`` reads one row group as ``src``. ``target`` is the
+    table written: its foreign keys are restored and validated afterwards in
+    any case, and with ``defer_fks`` (and ``DEFER_FKS``) dropped first if it is
+    empty.
+
+    Deferral is for tables whose keys reference large tables: on enwiki
+    citation_instances went from <6k to ~82k rows/s with it (plus
+    ``INCLUDE (id)`` on normalized_citations' normalized_sha1), and validating
+    took 9.4 min. normalized_citations, whose only key references a domain,
+    loaded no faster without it and its validation cost 7.5 min (plan §22)."""
+    if target and defer_fks and DEFER_FKS:
         _drop_foreign_keys_if_empty(session, target)
     session.commit()  # earlier phases' rows are visible to the other connections
     t0 = time.time()
@@ -519,48 +503,20 @@ def load_web_resources(session, staging_dir):
         return
     log(f"web_resources: loading from {filepath}")
     _analyze(session, 'domains')
-    ids = _IdColumn(session, 'web_resources', 'bigint')
     _copy_load(
         session, 'web_resources', filepath, target='web_resources',
         # md5 of the UTF-8 bytes as lowercase hex, as WebResource.compute_url_hash
-        source_sql=f"SELECT {ids.select}url, md5(url) AS url_hash, domain_label FROM src "
-                   "WHERE url IS NOT NULL",
-        temp_table='_wr_stage', temp_ddl=f'{ids.ddl}url text, url_hash char(32), domain_label text',
-        columns=ids.columns + ['url', 'url_hash', 'domain_label'],
-        insert_sql=f"""
-            INSERT INTO web_resources ({ids.insert}url, url_hash, domain_id)
-            SELECT {ids.value}s.url, s.url_hash, d.id
+        source_sql="SELECT url, md5(url) AS url_hash, domain_label FROM src WHERE url IS NOT NULL",
+        temp_table='_wr_stage', temp_ddl='url text, url_hash char(32), domain_label text',
+        columns=['url', 'url_hash', 'domain_label'],
+        insert_sql="""
+            INSERT INTO web_resources (url, url_hash, domain_id)
+            SELECT s.url, s.url_hash, d.id
             FROM _wr_stage s LEFT JOIN domains d ON d.value = s.domain_label
             ON CONFLICT (url_hash) DO UPDATE SET
                 url = EXCLUDED.url,
                 domain_id = COALESCE(EXCLUDED.domain_id, web_resources.domain_id)""",
         sort_by='md5(url)')  # url_hash order
-    ids.done()
-
-
-class _IdColumn:
-    """SQL fragments for a loader whose table takes ids from a sequence. With
-    ``ID_RANGES`` each row gets ``max(id) at the start + 1 + its position in
-    the sorted file`` (``_row``), so the units in flight append to separate
-    ranges of the primary key instead of all to its rightmost leaf page, and
-    the sequence is moved past them afterwards (``done``). Otherwise every
-    fragment is empty and the sequence assigns ids. A row that conflicts
-    keeps its id; its assigned one is left unused."""
-
-    def __init__(self, session, table, sql_type):
-        self.session, self.table = session, table
-        on = ID_RANGES
-        base = _id_base(session, table) if on else 0
-        self.select = f"{base} + _row + 1 AS id, " if on else ""
-        self.ddl = f"id {sql_type}, " if on else ""
-        self.columns = ['id'] if on else []
-        self.insert = "id, " if on else ""
-        self.value = "s.id, " if on else ""
-        self.on = on
-
-    def done(self):
-        if self.on:
-            _sync_id_sequence(self.session, self.table)
 
 
 def _domain_ids(session, labels):
@@ -607,23 +563,20 @@ def load_normalized_citations(session, staging_dir):
         return
     log(f"normalized_citations: loading from {filepath}")
     _analyze(session, 'domains')
-    ids = _IdColumn(session, 'normalized_citations', 'integer')
     staged, written = _copy_load(
         session, 'normalized_citations', filepath, target='normalized_citations',
-        source_sql=f"SELECT {ids.select}normalized_sha1, reference_normalized, appears_on_domain, "
-                   "appears_on_page_id, citation_type FROM src WHERE normalized_sha1 IS NOT NULL",
+        source_sql="SELECT normalized_sha1, reference_normalized, appears_on_domain, appears_on_page_id, "
+                   "citation_type FROM src WHERE normalized_sha1 IS NOT NULL",
         temp_table='_nc_stage',
-        temp_ddl=f'{ids.ddl}normalized_sha1 char(40), reference_normalized text, appears_on_domain text, '
+        temp_ddl='normalized_sha1 char(40), reference_normalized text, appears_on_domain text, '
                  'appears_on_page_id integer, citation_type text',
-        columns=ids.columns + ['normalized_sha1', 'reference_normalized', 'appears_on_domain',
-                               'appears_on_page_id', 'citation_type'],
+        columns=['normalized_sha1', 'reference_normalized', 'appears_on_domain', 'appears_on_page_id',
+                 'citation_type'],
         # rows with an unknown domain, no page id or no citation_type are skipped
-        insert_sql=f"""
+        insert_sql="""
             INSERT INTO normalized_citations
-                ({ids.insert}normalized_sha1, reference_normalized, appears_on_domain_id, appears_on_page_id,
-                 citation_type)
-            SELECT {ids.value}s.normalized_sha1, s.reference_normalized, d.id, s.appears_on_page_id,
-                   s.citation_type
+                (normalized_sha1, reference_normalized, appears_on_domain_id, appears_on_page_id, citation_type)
+            SELECT s.normalized_sha1, s.reference_normalized, d.id, s.appears_on_page_id, s.citation_type
             FROM _nc_stage s JOIN domains d ON d.value = s.appears_on_domain
             WHERE s.appears_on_page_id IS NOT NULL AND s.citation_type <> ''
             ON CONFLICT (normalized_sha1) DO UPDATE SET
@@ -632,7 +585,6 @@ def load_normalized_citations(session, staging_dir):
                 appears_on_page_id = EXCLUDED.appears_on_page_id,
                 citation_type = EXCLUDED.citation_type""",
         sort_by='normalized_sha1')
-    ids.done()
     if staged != written:
         log(f"normalized_citations: warning: {staged - written} rows skipped "
             f"(unknown domain, missing page id or citation_type)")
@@ -650,7 +602,7 @@ def load_citation_instances(session, staging_dir):
     _analyze(session, 'domains', 'normalized_citations', vacuum=True)
     computed = instance_id_sql('domain', 'page_id', 'raw_sha1')
     staged, written = _copy_load(
-        session, 'citation_instances', filepath, target='citation_instances',
+        session, 'citation_instances', filepath, target='citation_instances', defer_fks=True,
         source_sql=f"""
             SELECT CASE WHEN citation_instance_id IS NOT NULL AND citation_instance_id <> computed
                         THEN error('citation_instance_id mismatch for (' || domain || ', ' || page_id || ', '
@@ -692,7 +644,7 @@ def load_ncwr(session, staging_dir):
     log(f"ncwr: loading from {filepath}")
     _analyze(session, 'normalized_citations', 'web_resources', vacuum=True)
     staged, written = _copy_load(
-        session, 'ncwr', filepath, target='normalized_citation_web_resources',
+        session, 'ncwr', filepath, target='normalized_citation_web_resources', defer_fks=True,
         # URLs resolve through url_hash, the indexed unique key (there is no index on url)
         source_sql="SELECT normalized_sha1, md5(url) AS url_hash FROM src "
                    "WHERE normalized_sha1 IS NOT NULL AND url IS NOT NULL",
@@ -894,7 +846,7 @@ def _write_template_counts(session, domains, counts):
 # ---------------------------------------------------------------------------
 
 def main(argv=None):
-    global BATCH_SIZE, LOAD_JOBS, DEFER_FKS, ID_RANGES
+    global BATCH_SIZE, LOAD_JOBS, DEFER_FKS
     parser = argparse.ArgumentParser(description='Load staged Parquet files into PostgreSQL')
     parser.add_argument('-d', '--staging-dir', default=os.environ.get('STAGING_DIR', './staging'),
                         help='Staging directory (default: STAGING_DIR env or ./staging)')
@@ -907,11 +859,9 @@ def main(argv=None):
                         help='Connections loading web_resources, normalized_citations, citation_instances '
                              f'and ncwr in parallel, one Parquet row group per unit (default: LOAD_JOBS or {LOAD_JOBS})')
     parser.add_argument('--defer-fks', action=argparse.BooleanOptionalAction, default=DEFER_FKS,
-                        help='Drop the foreign keys of a citation table that is empty when its phase starts, '
-                             'and add and validate them after it (default: LOAD_DEFER_FKS)')
-    parser.add_argument('--id-ranges', action=argparse.BooleanOptionalAction, default=ID_RANGES,
-                        help='Assign normalized_citations / web_resources ids per unit instead of from the '
-                             'sequence (default: LOAD_ID_RANGES)')
+                        help='Drop the foreign keys of citation_instances / normalized_citation_web_resources '
+                             'when the table is empty at the start of its phase, and add and validate them '
+                             'after it (default: on; LOAD_DEFER_FKS=0 turns it off)')
 
     all_phases = OrderedDict([
         ('containers',           ('Phase 1: containers',            lambda s, d, ctx: load_containers(s, d))),
@@ -940,8 +890,7 @@ def main(argv=None):
         raise SystemExit("--jobs must be at least 1")
     LOAD_JOBS = args.jobs
     DEFER_FKS = args.defer_fks
-    ID_RANGES = args.id_ranges
-    log(f"jobs {LOAD_JOBS}, defer foreign keys {DEFER_FKS}, id ranges {ID_RANGES}")
+    log(f"jobs {LOAD_JOBS}, defer foreign keys {DEFER_FKS}")
 
     session = make_session()
     t0 = time.time()
