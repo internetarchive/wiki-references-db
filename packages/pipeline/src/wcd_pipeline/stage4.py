@@ -90,16 +90,38 @@ def _template_part(parsed: dict) -> dict:
     }
 
 
+_TEMPLATE_RE = re.compile(r"\{\{[^{}]*\}\}")
+_WIKI_QUOTES_RE = re.compile(r"'{2,}")
+_HOST_START_RE = re.compile(r"://[^\W_]")   # a host, not a bare scheme like https://'
+
+
+def _fallback_url(content: str) -> str | None:
+    """The first URL in ``content`` as written, for URL citations the
+    normalizer gives none: embedded templates removed (``http://a.b{{Citation
+    needed}}c/`` → ``http://a.bc/``), wiki italic/bold quote runs removed
+    (``http://''www.x.com/''``), and nothing without a host after ``://``
+    (``https://'``)."""
+    text = content
+    while True:
+        stripped = _TEMPLATE_RE.sub("", text)
+        if stripped == text:
+            break
+        text = stripped
+    m = _URL_RE.search(_WIKI_QUOTES_RE.sub("", text))
+    if not m or not _HOST_START_RE.search(m.group(0)):
+        return None
+    return m.group(0)
+
+
 def _reftag_part(content: str, part_type: str, noise: bool = False, url_citation: bool = False) -> dict:
     """A ref-tag part. For a citation that is a URL (``bare_url`` /
-    ``external_link``) whose normalizer output has no URL, the first URL in
-    the content is taken: the normalizer only extracts http(s), and enwiki has
-    ~2,400 ftp:// bare-URL citations (gate 4 requires their extracted_url)."""
+    ``external_link``) whose normalizer output has no URL, ``_fallback_url``
+    is taken: the normalizer only extracts http(s), and enwiki has ~2,400
+    ftp:// bare-URL citations (gate 4 requires their extracted_url)."""
     r = classify(content)
     url = r.get("extracted_url")
     if url is None and (part_type == "external_link" or url_citation):
-        m = _URL_RE.search(content)
-        url = m.group(0) if m else None
+        url = _fallback_url(content)
     return {
         "content": content, "part_type": part_type,
         "norm_subtype": "noise" if noise else r["norm_subtype"], "norm_content": r["norm_content"],
@@ -130,6 +152,13 @@ def _parts_for_content(content: str, citation_type: str) -> tuple:
     if not parts:
         # footnote filter rejected it (or empty content): keep it, typed as noise
         parts.append(_reftag_part(content, ref_part_type, noise=True, url_citation=url_citation))
+    if url_citation and not any(p.get("extracted_url") for p in parts):
+        # The splitter can keep only an embedded template and drop the URL text
+        # (`[http://… Title{{Citation needed}}]`, 127 citations on enwiki): the URL
+        # becomes a part of its own, normalized like a bare URL.
+        url = _fallback_url(content)
+        if url:
+            parts.append(_reftag_part(url, ref_part_type, url_citation=True))
     return tuple(parts)
 
 

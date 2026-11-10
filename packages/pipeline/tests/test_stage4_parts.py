@@ -71,3 +71,26 @@ def test_ftp_url_citations_keep_their_url():
     assert plain["extracted_url"] == "ftp://ftp.example.org/pub/b.txt"
     # a prose ref_tag citation is not a URL citation: no fallback
     assert parts_of(13, "<ref>Text, see ftp://ftp.example.org/c</ref>", "ref_tag")[0]["extracted_url"] is None
+
+
+def test_url_citation_keeps_its_url_when_only_a_template_part_is_split_out():
+    """`[http://… Title{{Citation needed}}]`: the splitter keeps only the template;
+    the URL becomes a part of its own (templates and wiki quotes removed)."""
+    parts = parts_of(14, "<ref>[http://ellen.warne{{Citation needed}}rbros.com/2010/a.html Title{{Citation needed}}]</ref>",
+                     "bare_url")
+    if parts[0]["part_type"] == "template":     # the vendored splitter's behaviour this guards against
+        assert [p["part_index"] for p in parts] == [0, 1]
+        url_part = parts[1]
+        assert url_part["content"] == "http://ellen.warnerbros.com/2010/a.html"
+        assert url_part["part_sha1"] == part_sha1(url_part["content"])
+    assert any(p["extracted_url"] and "ellen.warnerbros.com/2010/a.html" in p["extracted_url"] for p in parts)
+    ext = parts_of(15, "[https://2cm.es/1g4SC In 2015 he signed.{{Citation needed|date=October 2024}}]", "external_link")
+    assert any(p["extracted_url"] for p in ext)
+
+
+def test_fallback_url_drops_wiki_quotes_and_bare_schemes():
+    assert parts_of(16, "<ref>http://'''Www.usa.com/weather.htm'''</ref>", "bare_url")[0]["extracted_url"] \
+        == "http://Www.usa.com/weather.htm"
+    assert parts_of(17, "<ref>[http://''www.radiotimes.com/episode/x'']</ref>", "bare_url")[0]["extracted_url"] \
+        == "http://www.radiotimes.com/episode/x"
+    assert all(p["extracted_url"] is None for p in parts_of(18, "<ref>https://'</ref>", "bare_url"))
