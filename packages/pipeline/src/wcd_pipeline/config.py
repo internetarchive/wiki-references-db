@@ -52,10 +52,11 @@ def staging_dir(default: str = "./staging") -> str:
 
 def duckdb_connect(*args, **kwargs):
     """``duckdb.connect`` with the limits from the environment: ``DUCKDB_MEMORY_LIMIT``
-    (e.g. ``6GB``; per connection, so per worker process in a ``--jobs`` pool) and
-    ``DUCKDB_TEMP_DIRECTORY`` (where it spills). Unset, DuckDB's defaults apply: 80 %
-    of RAM per connection, which on a full-size build overruns a memory-capped run as
-    soon as two connections are busy, or one is beside Postgres."""
+    (e.g. ``6GB``) and ``DUCKDB_THREADS``, both per connection, so per worker process
+    in a ``--jobs`` pool, and ``DUCKDB_TEMP_DIRECTORY`` (where it spills). Unset,
+    DuckDB's defaults apply: 80 % of RAM and every core per connection, which on a
+    full-size build overruns a memory-capped run as soon as two connections are busy,
+    or one is beside Postgres."""
     import duckdb
 
     con = duckdb.connect(*args, **kwargs)
@@ -65,6 +66,12 @@ def duckdb_connect(*args, **kwargs):
     tmp = os.getenv("DUCKDB_TEMP_DIRECTORY")
     if tmp:
         con.execute(f"SET temp_directory = '{tmp}'")
+    # DUCKDB_THREADS: per connection, so per worker in a --jobs pool. On enwiki, Stage 6
+    # materialising a bucket with all 28 threads under an 8 GB limit ran out of memory,
+    # and DuckDB 1.5.6 segfaulted in .df() instead of raising; 1–4 threads did not.
+    threads = os.getenv("DUCKDB_THREADS")
+    if threads:
+        con.execute(f"SET threads = {int(threads)}")
     return con
 
 

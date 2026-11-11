@@ -89,6 +89,7 @@ SELECT dn.page_id, dn.part_sha1,
        min(dn.reference_name)         AS ref_name
 FROM citation_instances_denorm dn
 JOIN citation_history ch ON ch.citation_instance_id = dn.citation_instance_id
+WHERE (dn.page_id // {buckets}) % {slices} = {slice}
 GROUP BY dn.page_id, dn.part_sha1, dn.part_type = 'template'
 ORDER BY dn.page_id, dn.part_sha1
 """
@@ -98,9 +99,16 @@ def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [match] {msg}", flush=True)
 
 
-def load_bucket_inputs(con: duckdb.DuckDBPyConnection, parquet_base: str, domain: str, bucket: int) -> pd.DataFrame:
+# A bucket is matched in this many page slices ((page_id // PAGE_BUCKETS) % slices):
+# its whole input as one pandas frame (~600k wide rows on enwiki) did not fit an
+# 8 GB DuckDB limit, and pages are matched independently (MATCH_PAGE_SLICES).
+PAGE_SLICES = int(os.getenv("MATCH_PAGE_SLICES", "4"))
+
+
+def load_bucket_inputs(con: duckdb.DuckDBPyConnection, parquet_base: str, domain: str, bucket: int,
+                       slice_: int = 0, slices: int = 1) -> pd.DataFrame:
     bind_bucket_views(con, parquet_base, domain, bucket, ("citation_instances_denorm", "citation_history"))
-    df = con.execute(_INPUT_SQL).df()
+    df = con.execute(_INPUT_SQL.format(buckets=layout.PAGE_BUCKETS, slices=slices, slice=slice_)).df()
     # pandas turns nullable ints into floats; the matchers compare raw values
     for c in ("id_tier", "n_revisions", "first_rev_id", "page_id"):
         if c in df.columns:
@@ -225,29 +233,32 @@ def bucket_done(parquet_base: str, domain: str, bucket: int) -> bool:
 
 def run_bucket(parquet_base: str, domain: str, bucket: int) -> dict:
     t0 = time.time()
-    con = duckdb_connect()
-    try:
-        df = load_bucket_inputs(con, parquet_base, domain, bucket)
-    finally:
-        con.close()
     outputs = {ds: [] for ds in BUCKET_DATASETS}
-    n_pages = 0
-    if not df.empty:
-        # one pass over the bucket (each group keeps its rows in their original
+    n_pages = n_parts = 0
+    for s in range(PAGE_SLICES):
+        con = duckdb_connect()
+        try:
+            df = load_bucket_inputs(con, parquet_base, domain, bucket, s, PAGE_SLICES)
+        finally:
+            con.close()
+        n_parts += len(df)
+        if df.empty:
+            continue
+        # one pass over the slice (each group keeps its rows in their original
         # order); a boolean mask per page rescanned all of it for every page:
         # ~37k pages × ~680k rows per enwiki bucket
         pages = dict(iter(df.groupby("page_id", sort=False)))
         sizes = df.groupby("page_id").size().sort_values(ascending=False)
+        del df
         for page_id in sizes.index:
-            page_df = pages[page_id]
-            res = match_one_page(page_df, int(page_id))
+            res = match_one_page(pages.pop(page_id), int(page_id))
             for ds in BUCKET_DATASETS:
                 if not res[ds].empty:
                     outputs[ds].append(res[ds])
             n_pages += 1
     frames = {ds: (pd.concat(v, ignore_index=True) if v else pd.DataFrame()) for ds, v in outputs.items()}
     write_bucket(frames, parquet_base, domain, bucket)
-    return {"bucket": bucket, "pages": n_pages, "parts": int(len(df)),
+    return {"bucket": bucket, "pages": n_pages, "parts": n_parts,
             "merged_sources": int(len(frames["merged_sources"])), "seconds": round(time.time() - t0, 1)}
 
 
