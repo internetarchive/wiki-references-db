@@ -102,7 +102,7 @@ def log(msg: str) -> None:
 # A bucket is matched in this many page slices ((page_id // PAGE_BUCKETS) % slices):
 # its whole input as one pandas frame (~600k wide rows on enwiki) did not fit an
 # 8 GB DuckDB limit, and pages are matched independently (MATCH_PAGE_SLICES).
-PAGE_SLICES = int(os.getenv("MATCH_PAGE_SLICES", "4"))
+PAGE_SLICES = int(os.getenv("MATCH_PAGE_SLICES", "8"))
 
 
 def load_bucket_inputs(con: duckdb.DuckDBPyConnection, parquet_base: str, domain: str, bucket: int,
@@ -217,13 +217,29 @@ def _to_table(df: pd.DataFrame, dataset: str) -> pa.Table:
     return pa.Table.from_pylist(rows, schema=schema)
 
 
-def write_bucket(outputs: dict[str, pd.DataFrame], parquet_base: str, domain: str, bucket: int) -> None:
+def clear_bucket(parquet_base: str, domain: str, bucket: int) -> None:
+    """Empty the bucket's output directories (marker included) before a run."""
     for ds in BUCKET_DATASETS:
         d = layout.partition_dir(parquet_base, MI + ds, domain, bucket)
         if d.exists():
             shutil.rmtree(d)
         d.mkdir(parents=True)
-        pq.write_table(_to_table(outputs.get(ds, pd.DataFrame()), ds), d / "data.parquet", compression="zstd")
+
+
+def write_slice(outputs: dict[str, list], parquet_base: str, domain: str, bucket: int, slice_: int) -> int:
+    """Write one page slice's outputs as ``data-<slice>.parquet`` in each dataset's
+    bucket directory (readers glob ``*.parquet``); returns its merged_sources rows."""
+    n = 0
+    for ds in BUCKET_DATASETS:
+        frame = pd.concat(outputs[ds], ignore_index=True) if outputs[ds] else pd.DataFrame()
+        if ds == "merged_sources":
+            n = len(frame)
+        d = layout.partition_dir(parquet_base, MI + ds, domain, bucket)
+        pq.write_table(_to_table(frame, ds), d / f"data-{slice_}.parquet", compression="zstd")
+    return n
+
+
+def finish_bucket(parquet_base: str, domain: str, bucket: int) -> None:
     (layout.partition_dir(parquet_base, MI + "merged_citation_source_map", domain, bucket) / MARKER).touch()
 
 
@@ -233,8 +249,8 @@ def bucket_done(parquet_base: str, domain: str, bucket: int) -> bool:
 
 def run_bucket(parquet_base: str, domain: str, bucket: int) -> dict:
     t0 = time.time()
-    outputs = {ds: [] for ds in BUCKET_DATASETS}
-    n_pages = n_parts = 0
+    clear_bucket(parquet_base, domain, bucket)
+    n_pages = n_parts = n_merged = 0
     for s in range(PAGE_SLICES):
         con = duckdb_connect()
         try:
@@ -242,24 +258,25 @@ def run_bucket(parquet_base: str, domain: str, bucket: int) -> dict:
         finally:
             con.close()
         n_parts += len(df)
-        if df.empty:
-            continue
-        # one pass over the slice (each group keeps its rows in their original
-        # order); a boolean mask per page rescanned all of it for every page:
-        # ~37k pages × ~680k rows per enwiki bucket
-        pages = dict(iter(df.groupby("page_id", sort=False)))
-        sizes = df.groupby("page_id").size().sort_values(ascending=False)
-        del df
-        for page_id in sizes.index:
-            res = match_one_page(pages.pop(page_id), int(page_id))
-            for ds in BUCKET_DATASETS:
-                if not res[ds].empty:
-                    outputs[ds].append(res[ds])
-            n_pages += 1
-    frames = {ds: (pd.concat(v, ignore_index=True) if v else pd.DataFrame()) for ds, v in outputs.items()}
-    write_bucket(frames, parquet_base, domain, bucket)
+        outputs = {ds: [] for ds in BUCKET_DATASETS}
+        if not df.empty:
+            # one pass over the slice (each group keeps its rows in their original
+            # order); a boolean mask per page rescanned all of it for every page:
+            # ~37k pages × ~680k rows per enwiki bucket
+            pages = dict(iter(df.groupby("page_id", sort=False)))
+            sizes = df.groupby("page_id").size().sort_values(ascending=False)
+            del df
+            for page_id in sizes.index:
+                res = match_one_page(pages.pop(page_id), int(page_id))
+                for ds in BUCKET_DATASETS:
+                    if not res[ds].empty:
+                        outputs[ds].append(res[ds])
+                n_pages += 1
+        # each slice's output goes to disk before the next one is loaded
+        n_merged += write_slice(outputs, parquet_base, domain, bucket, s)
+    finish_bucket(parquet_base, domain, bucket)
     return {"bucket": bucket, "pages": n_pages, "parts": n_parts,
-            "merged_sources": int(len(frames["merged_sources"])), "seconds": round(time.time() - t0, 1)}
+            "merged_sources": n_merged, "seconds": round(time.time() - t0, 1)}
 
 
 # ---------------------------------------------------------------------------
