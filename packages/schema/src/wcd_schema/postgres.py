@@ -36,6 +36,7 @@ from sqlalchemy import (
     Boolean,
     CHAR,
     Column,
+    Computed,
     DateTime,
     Float,
     ForeignKey,
@@ -498,7 +499,9 @@ class NormalizedCitationPart(Base):
     __table_args__ = (
         PrimaryKeyConstraint('normalized_id', 'part_index', name='pk_normalized_citation_parts'),
         Index('idx_ncp_part_sha1', 'part_sha1'),
-        Index('idx_ncp_doi', 'extracted_doi', postgresql_where=text('extracted_doi IS NOT NULL')),
+        # hash, not B-tree: equality lookups only, and enwiki has extracted DOIs over the
+        # B-tree entry limit (~2.7 KB; one of 3,984 bytes, from a garbled citation)
+        Index('idx_ncp_doi', 'extracted_doi', postgresql_using='hash', postgresql_where=text('extracted_doi IS NOT NULL')),
         Index('idx_ncp_isbn', 'extracted_isbn', postgresql_where=text('extracted_isbn IS NOT NULL')),
         Index('idx_ncp_pmid', 'extracted_pmid', postgresql_where=text('extracted_pmid IS NOT NULL')),
         Index('idx_ncp_pmc', 'extracted_pmc', postgresql_where=text('extracted_pmc IS NOT NULL')),
@@ -519,11 +522,15 @@ class RefNameLink(Base):
     domain_id = Column(Integer, ForeignKey('domains.id'), nullable=False)
     page_id = Column(Integer, nullable=False)
     ref_name = Column(String, nullable=False)
+    # The key carries md5(ref_name), not the name: a B-tree entry is limited to
+    # ~2.7 KB and enwiki has ref names up to 83 KB (vandalism). Postgres computes
+    # it; writers leave the column out.
+    ref_name_md5 = Column(CHAR(32), Computed('md5(ref_name)', persisted=True), nullable=False)
     defining_instance_id = Column(BigInteger, ForeignKey('citation_instances.id'), nullable=False)
     first_revision_id = Column(BigInteger, nullable=False)
     last_revision_id = Column(BigInteger)  # NULL = still current
     __table_args__ = (
-        PrimaryKeyConstraint('domain_id', 'page_id', 'ref_name', 'first_revision_id', name='pk_ref_name_links'),
+        PrimaryKeyConstraint('domain_id', 'page_id', 'ref_name_md5', 'first_revision_id', name='pk_ref_name_links'),
         Index('idx_rnl_instance', 'defining_instance_id'),
     )
 
@@ -553,7 +560,7 @@ class GlobalSource(Base):
     reliability_score = Column(Float)  # Stage 7f (UVA scorer)
     verdict = Column(String)           # high_confidence | medium_confidence | low_confidence | questionable | likely_not_citation
     __table_args__ = (
-        Index('idx_gs_doi', 'extracted_doi', postgresql_where=text('extracted_doi IS NOT NULL')),
+        Index('idx_gs_doi', 'extracted_doi', postgresql_using='hash', postgresql_where=text('extracted_doi IS NOT NULL')),  # see idx_ncp_doi
         Index('idx_gs_isbn', 'extracted_isbn', postgresql_where=text('extracted_isbn IS NOT NULL')),
         Index('idx_gs_pmid', 'extracted_pmid', postgresql_where=text('extracted_pmid IS NOT NULL')),
         Index('idx_gs_pmc', 'extracted_pmc', postgresql_where=text('extracted_pmc IS NOT NULL')),
