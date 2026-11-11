@@ -131,15 +131,29 @@ def main(argv=None) -> int:
         ap.error(f"no revisions partitions for {args.domain} under {args.parquet_dir}")
     t0 = time.time()
     total = 0
+    # a bucket that fails is logged and the others go on; the run exits non-zero naming
+    # the failures (re-run them with --buckets)
+    failed = []
     if args.jobs > 1 and len(buckets) > 1:
         with ProcessPoolExecutor(max_workers=args.jobs) as pool:
-            for f in as_completed([pool.submit(build_bucket, args.parquet_dir, args.domain, b) for b in buckets]):
-                r = f.result()
-                total += r["rows"]
+            futures = {pool.submit(build_bucket, args.parquet_dir, args.domain, b): b for b in buckets}
+            for f in as_completed(futures):
+                try:
+                    total += f.result()["rows"]
+                except Exception as e:  # noqa: BLE001 — reported, and the run fails at the end
+                    failed.append(futures[f])
+                    log(f"bucket {futures[f]} FAILED: {type(e).__name__}: {e}")
     else:
         for b in buckets:
-            total += build_bucket(args.parquet_dir, args.domain, b)["rows"]
+            try:
+                total += build_bucket(args.parquet_dir, args.domain, b)["rows"]
+            except Exception as e:  # noqa: BLE001
+                failed.append(b)
+                log(f"bucket {b} FAILED: {type(e).__name__}: {e}")
     log(f"{total} rows over {len(buckets)} bucket(s) in {time.time() - t0:.1f}s")
+    if failed:
+        log(f"{len(failed)} bucket(s) failed: {sorted(failed)}; re-run them with --buckets")
+        return 1
     if not args.no_gate and not args.buckets:
         failures = gate(args.parquet_dir, args.domain)
         if failures:
