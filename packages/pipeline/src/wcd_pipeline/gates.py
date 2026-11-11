@@ -201,6 +201,46 @@ def stage4(session: Session, domain: str, sample: int = 1000, seed: int = 0) -> 
 # Stage 5 (after ref_name_links)
 # ---------------------------------------------------------------------------
 
+_RANGE_OVERLAP_SQL = """
+WITH r AS (
+    SELECT l.page_id, l.ref_name, l.first_revision_id AS fid, f.revision_timestamp AS fts,
+           l.last_revision_id AS lid, e.revision_timestamp AS lts
+    FROM {links} l
+    JOIN {revisions} f ON f.revision_id = l.first_revision_id
+    LEFT JOIN {revisions} e ON e.revision_id = l.last_revision_id
+    {where}
+), o AS (
+    SELECT fid, fts,
+           lag(fid) OVER w AS p_fid, lag(lid) OVER w AS p_lid, lag(lts) OVER w AS p_lts
+    FROM r WINDOW w AS (PARTITION BY page_id, ref_name ORDER BY fts, fid)
+)
+SELECT count(*) FROM o
+WHERE p_fid IS NOT NULL AND (p_lid IS NULL OR p_lts > fts OR (p_lts = fts AND p_lid >= fid))
+"""
+
+
+def _ref_name_overlaps(session: Session, domain: str, domain_id: int, parquet_base: str | None) -> int:
+    """Ranges of ``ref_name_links`` that start before the previous range of
+    their (page, name) ends, in revision order: per bucket from the Parquet
+    copies when ``parquet_base`` is given, else in Postgres."""
+    if parquet_base is None:
+        return session.execute(text(_RANGE_OVERLAP_SQL.format(
+            links="ref_name_links", revisions="revisions", where="WHERE l.domain_id = :d"
+        )), {"d": domain_id}).scalar_one()
+    from wcd_schema.duckdb import bind_bucket_views
+
+    con = duckdb_connect()
+    try:
+        total = 0
+        for b in layout.list_buckets(parquet_base, "ref_name_links", domain):
+            bind_bucket_views(con, parquet_base, domain, b, ("ref_name_links", "revisions"))
+            total += con.execute(_RANGE_OVERLAP_SQL.format(
+                links="ref_name_links", revisions="revisions", where="")).fetchone()[0]
+        return total
+    finally:
+        con.close()
+
+
 def stage5(session: Session, domain: str, parquet_base: str | None = None) -> list[str]:
     """no overlapping revision ranges per (domain_id, page_id, ref_name); every
     defining_instance_id exists; the Parquet copy matches Postgres; the
@@ -209,14 +249,14 @@ def stage5(session: Session, domain: str, parquet_base: str | None = None) -> li
     domain_id = _domain_id(session, domain)
     if domain_id is None:
         return [f"domain {domain!r} is not in domains"]
-    overlaps = session.execute(text("""
-        SELECT count(*) FROM ref_name_links a JOIN ref_name_links b
-          ON a.domain_id = b.domain_id AND a.page_id = b.page_id AND a.ref_name = b.ref_name
-         AND a.first_revision_id < b.first_revision_id
-         AND (a.last_revision_id IS NULL OR a.last_revision_id >= b.first_revision_id)
-        WHERE a.domain_id = :d"""), {"d": domain_id}).scalar_one()
+    # Ranges are in revision order, (revision_timestamp, revision_id), as Stage 5
+    # walks them; revision ids alone are not (imported/merged histories: on enwiki
+    # an id comparison reported 703 overlapping pairs on 126 pages, none real).
+    # Sorted by start, a set of ranges overlaps iff some range starts no later
+    # than its predecessor ends.
+    overlaps = _ref_name_overlaps(session, domain, domain_id, parquet_base)
     if overlaps:
-        failures.append(f"{overlaps} overlapping ref_name_links range pair(s)")
+        failures.append(f"{overlaps} ref_name_links range(s) overlap the previous range of their name (revision order)")
     dangling = session.execute(text(
         "SELECT count(*) FROM ref_name_links r LEFT JOIN citation_instances ci ON ci.id = r.defining_instance_id "
         "WHERE r.domain_id = :d AND ci.id IS NULL"), {"d": domain_id}).scalar_one()

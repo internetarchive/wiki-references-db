@@ -387,7 +387,7 @@ def test_stage5_gate_detects_overlap(db, staged: Path):
     with db.connect() as con_pg:
         con_pg.execute(text("UPDATE ref_name_links SET last_revision_id = NULL WHERE first_revision_id = 1001"))
         failures = gates.stage5(Session(con_pg), DOMAIN)
-        assert any("overlapping" in f for f in failures), failures
+        assert any("overlap the previous range" in f for f in failures), failures
         con_pg.rollback()
 
 
