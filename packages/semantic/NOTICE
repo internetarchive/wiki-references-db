@@ -36,6 +36,12 @@ Documented deviations from upstream logic:
      unchanged (a match cannot begin mid-word without also matching from the
      word's first letter, which search() reaches first); the goldens are
      unchanged and tests/test_additions.py compares both patterns.
+  3. merge_types.py `build_merged_sources`, Pass 3: the template side's
+     (key, lowercased title, lowercased author) are built once per page by the
+     same iterrows() and expressions, instead of once for every unmerged
+     ref_tag source inside the loop. Constructing a pandas Series per (rt, tm)
+     pair was ~56 % of Stage 6's time on enwiki (27 min for one of 512
+     buckets). Results are unchanged; the goldens are unchanged.
 
 Additions over upstream (all marked "ADDED (wcd)" in the source and covered
 by tests/test_additions.py; the golden comparison strips their output keys):
