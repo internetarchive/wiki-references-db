@@ -233,9 +233,13 @@ def run_bucket(parquet_base: str, domain: str, bucket: int) -> dict:
     outputs = {ds: [] for ds in BUCKET_DATASETS}
     n_pages = 0
     if not df.empty:
+        # one pass over the bucket (each group keeps its rows in their original
+        # order); a boolean mask per page rescanned all of it for every page:
+        # ~37k pages × ~680k rows per enwiki bucket
+        pages = dict(iter(df.groupby("page_id", sort=False)))
         sizes = df.groupby("page_id").size().sort_values(ascending=False)
         for page_id in sizes.index:
-            page_df = df[df["page_id"] == page_id]
+            page_df = pages[page_id]
             res = match_one_page(page_df, int(page_id))
             for ds in BUCKET_DATASETS:
                 if not res[ds].empty:
