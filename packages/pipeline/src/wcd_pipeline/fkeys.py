@@ -21,11 +21,17 @@ from wcd_schema.postgres import Base
 
 def declared(table: str) -> list[tuple[str, str, str, str]]:
     """The foreign keys the schema declares on ``table``, as (constraint name,
-    column, referenced table, referenced column); names are Postgres'
-    defaults, which is what ``init-db`` creates."""
+    columns, referenced table, referenced columns), the column lists
+    comma-separated (``fk_csr_part`` is composite). A named constraint keeps
+    its name; an unnamed one has Postgres' default name, which is what
+    ``init-db`` creates."""
     t = Base.metadata.tables[table]
-    return sorted((f"{table}_{fk.parent.name}_fkey", fk.parent.name, fk.column.table.name, fk.column.name)
-                  for fk in t.foreign_keys)
+    out = []
+    for fkc in t.foreign_key_constraints:
+        cols = [c.name for c in fkc.columns]
+        name = fkc.name or f"{table}_{'_'.join(cols)}_fkey"
+        out.append((name, ", ".join(cols), fkc.referred_table.name, ", ".join(e.column.name for e in fkc.elements)))
+    return sorted(out)
 
 
 def present(session, table: str) -> dict[str, bool]:

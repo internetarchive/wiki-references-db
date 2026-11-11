@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from wcd_semantic.profile import build_source_profile
 from wcd_semantic.scoring import compute_score
 
 from .config import duckdb_connect, load_dotenv, psycopg_dsn  # noqa: F401
+from .load import _copy_and_insert
 from .materialize import export_citation_instances_denorm
 
 MI = "matching_intermediate/"
@@ -85,51 +87,106 @@ _GS_COLS = ("global_source_id", "match_type", "confidence", "canonical_part_sha1
             "extracted_wikidata_qid", "extracted_url")
 
 
+_GS_DDL = ("global_source_id varchar(16), match_type varchar, confidence double precision, canonical_part_sha1 char(40), "
+           "source_type varchar, author_key varchar, year varchar, title text, extracted_doi varchar, "
+           "extracted_isbn varchar, extracted_pmid varchar, extracted_pmc varchar, extracted_arxiv varchar, "
+           "extracted_wikidata_qid varchar, extracted_url text")
+# rows per COPY into a temp table and set-based upsert (one transaction each)
+CHUNK_ROWS = int(os.getenv("MATERIALIZE_CHUNK_ROWS", "500000"))
+
+
+def _batches(con, sql: str):
+    """``sql``'s result from DuckDB as Arrow record batches of CHUNK_ROWS."""
+    result = con.execute(sql)
+    reader = (getattr(result, "to_arrow_reader", None) or result.fetch_record_batch)(CHUNK_ROWS)
+    yield from reader
+
+
 def step_a(pg, con, domain: str, parquet_base: str) -> int:
+    """Upsert the domain's global sources (~131M on enwiki: streamed from DuckDB in
+    chunks, COPY + one INSERT … ON CONFLICT per chunk, in id order so the primary
+    key grows at its end)."""
     pattern = layout.partition_glob(parquet_base, MI + "global_sources_stage", domain)
-    rows = con.execute(f"SELECT {', '.join(_GS_COLS)} FROM read_parquet('{pattern}') ORDER BY global_source_id").fetchall()
+    cols = ", ".join(_GS_COLS)
+    upsert = (f"INSERT INTO global_sources ({cols}) SELECT {cols} FROM gs_in "
+              "ON CONFLICT (global_source_id) DO UPDATE SET "
+              + ", ".join(f"{c} = EXCLUDED.{c}" for c in _GS_COLS[1:])
+              + ", n_pages = NULL, n_total_citations = NULL, reliability_score = NULL, verdict = NULL")
+    n = 0
     with pg.cursor() as cur:
-        psycopg2.extras.execute_values(
-            cur,
-            f"INSERT INTO global_sources ({', '.join(_GS_COLS)}) VALUES %s "
-            "ON CONFLICT (global_source_id) DO UPDATE SET "
-            + ", ".join(f"{c} = EXCLUDED.{c}" for c in _GS_COLS[1:])
-            + ", n_pages = NULL, n_total_citations = NULL, reliability_score = NULL, verdict = NULL",
-            rows, page_size=5000)
-    pg.commit()
-    return len(rows)
+        for batch in _batches(con, f"SELECT {cols} FROM read_parquet('{pattern}') ORDER BY global_source_id"):
+            _copy_and_insert(cur, batch, "gs_in", _GS_DDL, list(_GS_COLS), upsert)
+            pg.commit()
+            n += batch.num_rows
+    return n
 
 
 # ---------------------------------------------------------------------------
 # 7b citation_source_resolution
 # ---------------------------------------------------------------------------
 
+_CSR_COLS = ["normalized_id", "part_index", "page_id", "global_source_id", "source_type", "match_type", "confidence",
+             "is_canonical"]
+_CSR_DDL = ("normalized_id integer, part_index integer, page_id integer, global_source_id varchar(16), "
+            "source_type varchar, match_type varchar, confidence double precision, is_canonical boolean")
+# A part_sha1 can belong to several normalized citations; the ones with an instance
+# on that page are the denorm rows of (page_id, part_sha1) (citation_instances ⋈
+# normalized_citations ⋈ parts for the domain), so the join runs per bucket in DuckDB
+# instead of through the 295M-row parts table in Postgres.
+_CSR_SQL = """
+SELECT DISTINCT dn.normalized_id, dn.part_index, m.page_id, g.global_source_id,
+       m.source_type, m.match_type, m.confidence, m.is_canonical
+FROM read_parquet('{mmap}', hive_partitioning = false) m
+JOIN read_parquet('{gmap}', hive_partitioning = false) g USING (merged_source_id)
+JOIN citation_instances_denorm dn ON dn.page_id = m.page_id AND dn.part_sha1 = m.part_sha1
+"""
+
+
 def step_b(pg, con, domain: str, domain_id: int, parquet_base: str) -> int:
-    mmap = layout.partition_glob(parquet_base, MI + "merged_citation_source_map", domain)
-    gmap = layout.partition_glob(parquet_base, MI + "global_source_map", domain)
-    rows = con.execute(f"""
-        SELECT m.part_sha1, m.page_id, g.global_source_id, m.source_type, m.match_type, m.confidence, m.is_canonical
-        FROM read_parquet('{mmap}', hive_partitioning=true) m
-        JOIN read_parquet('{gmap}') g USING (merged_source_id)
-        ORDER BY m.page_id, m.part_sha1""").fetchall()
+    """citation_source_resolution for the domain, per page bucket: the matches
+    (merged_citation_source_map ⋈ global_source_map) joined to the denorm in
+    DuckDB, COPY + INSERT … ON CONFLICT DO NOTHING per bucket, the table's
+    foreign keys deferred while it is empty."""
+    from . import fkeys
+    from .gates import make_session
+
+    gmap_all = layout.partition_glob(parquet_base, MI + "global_source_map", domain)
+    split = Path(parquet_base) / MI / f"_scratch_7b_{domain}"
+    shutil.rmtree(split, ignore_errors=True)
+    # global_source_map is one file for the domain; split it by page bucket once
+    con.execute(f"""COPY (SELECT merged_source_id, global_source_id, page_id % {layout.PAGE_BUCKETS} AS page_bucket
+                          FROM read_parquet('{gmap_all}', hive_partitioning = false))
+                    TO '{split}' (FORMAT PARQUET, PARTITION_BY (page_bucket))""")
     with pg.cursor() as cur:
         cur.execute("DELETE FROM citation_source_resolution WHERE domain_id = %s", (domain_id,))
-        cur.execute("""CREATE TEMP TABLE csr_in (part_sha1 CHAR(40), page_id INTEGER, global_source_id VARCHAR(16),
-                       source_type VARCHAR, match_type VARCHAR, confidence DOUBLE PRECISION, is_canonical BOOLEAN)
-                       ON COMMIT DROP""")
-        psycopg2.extras.execute_values(cur, "INSERT INTO csr_in VALUES %s", rows, page_size=10000)
-        # a part_sha1 can belong to several normalized citations; keep the ones that have an
-        # instance on that page
-        cur.execute("""
-            INSERT INTO citation_source_resolution
-                (normalized_id, part_index, domain_id, page_id, global_source_id, source_type, match_type, confidence, is_canonical)
-            SELECT DISTINCT p.normalized_id, p.part_index, %(d)s, t.page_id, t.global_source_id,
-                   t.source_type, t.match_type, t.confidence, t.is_canonical
-            FROM csr_in t
-            JOIN normalized_citation_parts p ON p.part_sha1 = t.part_sha1
-            JOIN citation_instances ci ON ci.domain_id = %(d)s AND ci.page_id = t.page_id AND ci.normalized_id = p.normalized_id
-            ON CONFLICT (normalized_id, part_index, domain_id, page_id) DO NOTHING""", {"d": domain_id})
-        n = cur.rowcount
+    pg.commit()
+    session = make_session()
+    n = 0
+    try:
+        fkeys.drop_if_empty(session, "citation_source_resolution", log)
+        insert = (f"INSERT INTO citation_source_resolution (domain_id, {', '.join(_CSR_COLS)}) "
+                  f"SELECT {int(domain_id)}, {', '.join(_CSR_COLS)} FROM csr_in "
+                  "ON CONFLICT (normalized_id, part_index, domain_id, page_id) DO NOTHING")
+        buckets = layout.list_buckets(parquet_base, MI + "merged_citation_source_map", domain)
+        for i, b in enumerate(buckets, 1):
+            gmap = split / f"page_bucket={b}" / "*.parquet"
+            if not list((split / f"page_bucket={b}").glob("*.parquet")):
+                continue
+            bind_bucket_views(con, parquet_base, domain, b, ("citation_instances_denorm",))
+            mmap = layout.partition_glob(parquet_base, MI + "merged_citation_source_map", domain, b)
+            result = con.execute(_CSR_SQL.format(mmap=mmap, gmap=gmap))
+            rows = (getattr(result, "to_arrow_table", None) or result.fetch_arrow_table)()
+            if rows.num_rows:
+                with pg.cursor() as cur:
+                    n += _copy_and_insert(cur, rows, "csr_in", _CSR_DDL, _CSR_COLS, insert)
+                pg.commit()
+            if i % 32 == 0:
+                log(f"7b: {i}/{len(buckets)} buckets, {n:,} rows")
+        fkeys.restore(session, "citation_source_resolution", log)
+    finally:
+        session.close()
+        shutil.rmtree(split, ignore_errors=True)
+    with pg.cursor() as cur:
         # global sources no longer referenced by any resolution row
         cur.execute("""DELETE FROM global_sources gs WHERE NOT EXISTS
                        (SELECT 1 FROM citation_source_resolution r WHERE r.global_source_id = gs.global_source_id)""")
