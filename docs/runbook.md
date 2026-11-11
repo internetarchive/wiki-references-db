@@ -17,6 +17,10 @@ repository root with `.env` filled in (`example.env`).
 | `DEDUP_ROWS_PER_PARTITION` | Stage 3 | staged rows per key partition in `dedup` (memory follows it) |
 | `LOAD_JOBS`, `LOAD_DEFER_FKS`, `LOAD_KEEP_SORTED` | Stage 3 | connections for the citation tables in `load` (`--jobs`; one Parquet row group per unit); deferred foreign keys for `citation_instances` / `ncwr` (`--defer-fks`, default on); keep the key-sorted copies after a successful load |
 | `LOAD_MEMORY_LIMIT`, `LOAD_ROWS_PER_PARTITION`, `TEMPLATE_COUNT_MIN` | Stage 3 | DuckDB memory limit and join partition size for the template Parquet written by `load`; the citation count from which a template value's report total is precomputed |
+| `PARTS_JOBS`, `PARTS_UNIT_IDS` | Stage 4 | worker processes for `parts` (`--jobs`) and normalized-citation ids per unit |
+| `DUCKDB_MEMORY_LIMIT`, `DUCKDB_THREADS`, `DUCKDB_TEMP_DIRECTORY` | Stages 4.6–8, gates | per DuckDB connection, so per worker in `match` / `revision-stats`; unset, DuckDB takes 80 % of RAM and every core per connection |
+| `DENORM_WORK_MEM`, `DENORM_MAX_LINE_SIZE`, `DENORM_GROUPS` | Stage 4.6 / 7c | Postgres `work_mem` for the parallel export (256MB: 1GB took enwiki past RAM); longest CSV row DuckDB accepts (64 MB); bucket groups of the repartition (16) |
+| `MATCH_PAGE_SLICES` | Stage 6 | page slices a bucket is matched in (8; memory follows the slice) |
 | `REVISION_BUNDLES_DIR` | Stage 1 | the `.mwrev.zst` bundles, one directory per domain |
 | `API_*`, `WIKIPEDIA_API_*` | the API | CORS, default domain, pool size, User-Agent for title lookups |
 
@@ -72,15 +76,19 @@ uv run wcd extract-all -d $BUNDLES/en.wikipedia.org -o $STAGING --domain en.wiki
 uv run wcd dedup -d $STAGING
 uv run wcd load -d $STAGING --parquet-dir $PARQUET_DIR --jobs 16
 uv run wcd gate 3 --domain en.wikipedia.org
-uv run wcd init-db --add-indexes
+# secondary indexes of the loaded tables only; each later table's after its own stage
+uv run wcd init-db --add-indexes --table web_resources citation_instances revisions
 
 # 4  parts (gate 4), 4.6 denorm export; 5 ref_name_links (gate 5)
-uv run wcd parts --domain en.wikipedia.org
+export DUCKDB_MEMORY_LIMIT=16GB DUCKDB_TEMP_DIRECTORY=$STAGING/.duck-spill   # Stages 4.6–8 (see below)
+uv run wcd parts --domain en.wikipedia.org --jobs 24
+uv run wcd init-db --add-indexes --table normalized_citation_parts
 uv run wcd denorm-export --domain en.wikipedia.org
 uv run wcd ref-name-links --domain en.wikipedia.org
+uv run wcd init-db --add-indexes --table ref_name_links
 
-# 6  matching per bucket + cross-page (gate 6)
-uv run wcd match --domain en.wikipedia.org --jobs 8
+# 6  matching per bucket + cross-page (gate 6); per worker: DuckDB 3 GB, 2 threads
+DUCKDB_MEMORY_LIMIT=3GB DUCKDB_THREADS=2 uv run wcd match --domain en.wikipedia.org --jobs 9
 
 # 7  materialization 7a–7h (gate 7);  8  revision stats (gate 8)
 uv run wcd materialize --domain en.wikipedia.org

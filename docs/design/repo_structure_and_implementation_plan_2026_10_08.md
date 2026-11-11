@@ -672,3 +672,36 @@ Against the §21 baseline (row-by-row upserts at ~7.8k rows/s, with ncwr never f
 **Decisions taken without asking:** dropping id ranges after measuring no gain; keeping `normalized_citations`' FK; making deferral the default for the two tables; no `INCLUDE` on `url_hash`; reusing a kept sorted copy, matched by source size and mtime.
 
 **Open:** the sort is now the largest single cost (43–48 min of DuckDB writing the ordered run on about one core for `normalized_citations`). Having `dedup` write the citation tables in key order, or sorting only the key and a row index, would remove most of it. `init-db --add-indexes` (Stage 3's secondary indexes) has not been run yet. WAL and checkpoint I/O is the remaining Postgres limit (§21 item 5).
+
+## 23. Stages 4–6 at enwiki scale: what broke and what changed (2026-11-10/11)
+
+Run on enwiki-20261001 after Stage 3 (§22), on the 28-core, 62 GB VM, each step in a memory-capped systemd scope. All changes keep the output identical unless a bullet says otherwise; the fixture goldens and the upstream `wcd_semantic` goldens pass throughout (full suite: 374 → ~390 tests, all passing).
+
+**Indexes after Stage 3.** `init-db --add-indexes` built every secondary index in the schema, including the Stage 4–7 tables', which would then have been loaded through 8 indexes on `normalized_citation_parts` alone. `--table` (several tables) now scopes it: the 7 indexes of `web_resources`, `citation_instances` and `revisions` took 28 min (`revisions` 2 × ~11 min); each later table's indexes are built after its stage (`normalized_citation_parts` 8 indexes in 28 + 14 min, `ref_name_links` 47 s).
+
+**Stage 4 `parts`** (`8449043`, `4cb61c7`, `1cd5389`, `81f2850`): 295,029,274 parts (211 GB) from 284.5M citations, gate 4 passes.
+- One process would have taken a day: the normalizers cost ~4,170 citations per CPU-second (sample of 58,754). `--jobs` (24) spawned processes now take 1M-id ranges; ~2 h, Python-bound (~46k citations/s).
+- The parts table's foreign key is deferred like Stage 3's (`fkeys` module, shared by load, parts, ref-name-links and gates 3–5); validation 12 min.
+- One citation (a 227,137-character vandalised `<ref>`) held a worker for ~85 CPU-min: the vendored `_RELIABLE_YEAR_RE` retried two name alternatives at every letter of a word. They now start only at a word start (NOTICE deviation 2; identical matches on the corpus and 20,000 random strings; 227k letters 0.56 s). A first fix that cut long letter runs before the normalizer was replaced at the user's request: it would also have cut real base64 URL parameters.
+- Gate 4 found URL citations without `extracted_url`: 2,385 `ftp://` (the normalizer extracts only http/https), 127 whose only part was an embedded `{{Citation needed}}` (the splitter dropped the URL text), ~30 malformed. Stage 4 now falls back to the citation's first URL (templates and wiki quote markup removed, a host required) and, decided with the user, adds a URL part when no part carries one. Gate 4 checks per citation, and only citations whose text has a URL with a host (90 have none, e.g. `[http://'"around%2080%20…`).
+
+**Stage 4.6 `denorm-export`** (`93e3640` … `ec5c5b1`): 348,766,774 rows (50 GB), gate passes; ~2 h.
+- A server-side cursor never runs a parallel plan: the 3-way join spilled 95 GB of hash batches on one backend without a row in 30 min. The export is now `COPY (SELECT …) TO STDOUT` (8 parallel workers) into a CSV (203 GB, 45 min), read by DuckDB with explicit types into Parquet (26 min; one core, quoted newlines), then repartitioned.
+- `work_mem` 1GB × 9 parallel processes took Postgres past RAM: the kernel OOM-killed a worker and the server restarted (crash recovery, no loss). `DENORM_WORK_MEM` 256MB.
+- A 2.8 MB row (one URL repeated) exceeded DuckDB's 2 MB CSV line limit (`DENORM_MAX_LINE_SIZE`, 64 MB); the cleanup then deleted the export. The CSV and the converted Parquet are now kept on failure and `--reuse-export` reuses them.
+- The one-statement repartition (sort + 512-way partitioned write) ran DuckDB out of memory at 16 GB: it now splits by bucket group (16) first and sorts each group alone (41 min).
+
+**Stage 5 `ref-name-links`** (`aad31fc`, `333c258`, `dbbaaca`): 92,759,078 links from 72.8M named instances, gate 5 passes; 1 h 34 min.
+- Named instances move into DuckDB as Arrow batches, bucket results go to Postgres by COPY, foreign keys deferred (was `executemany` and `execute_values`; the fixture step went 5.1 → 1.5 s).
+- A B-tree entry is limited to ~2.7 KB: 14 ref names exceed it (longest 83 KB, all vandalism). Decided with the user: `ref_name_links` is keyed on `ref_name_md5`, a stored generated column. `idx_ncp_doi` / `idx_gs_doi` are hash indexes (a 3,984-byte extracted DOI).
+- Gate 5 compared range bounds as revision ids and reported 703 overlapping pairs on 126 pages; none overlap in time (imported histories whose ids run backwards). It now orders ranges by (timestamp, id), per bucket in DuckDB.
+
+**Stage 6 `match`** (`0c5bc92`, `f5f3e10`, `7583cec`, `dd6bacf`): running at the time of writing; one bucket (~14k pages, ~610k parts) takes ~21 min on one core.
+- Each page's rows were found by a boolean mask over the whole bucket (O(pages × rows)); now one `groupby`.
+- py-spy put 56 % of the time in `DataFrame.iterrows` inside the vendored `build_merged_sources` Pass 3, which rebuilt the template side per unmerged ref-tag source; it is now built once per page (NOTICE deviation 3). The rest is spread over per-page pandas overhead (~85 ms per page) in the vendored matchers.
+- Every DuckDB connection now takes `DUCKDB_MEMORY_LIMIT` / `DUCKDB_THREADS` / `DUCKDB_TEMP_DIRECTORY` (unset, each of 14 workers would take 80 % of RAM). Materialising a bucket with 28 threads under 8 GB made DuckDB 1.5.6 segfault in `.df()`; buckets are now matched in 8 page slices, each written as it finishes (peak 9.4 → 4.3 GB per worker). Bucket 0's outputs are identical, as row multisets, to the one-piece run's.
+- Full run: 9 workers (DuckDB 3 GB, 2 threads each) in a 44 GB scope beside Postgres' 16 GB of shared buffers; ~20 h for 6a–6c. 6d (cross-page, single process) and gate 6 follow.
+
+**Decisions taken without asking:** per-table index builds; `parts` worker count; hash DOI indexes; gate 4 skipping URL citations without a host; the denorm export via CSV; Stage 6 slicing and worker sizing.
+
+**Open:** Stage 6's per-page pandas cost (vectorising the vendored matchers is the only large lever left); 6d's memory; Stage 7 (7b moves the whole match result through Python into a table with foreign keys to the 295M-row parts table, the pattern that stalled Stage 3); Stage 8.
