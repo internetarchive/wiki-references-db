@@ -65,7 +65,14 @@ def duckdb_connect(*args, **kwargs):
         con.execute(f"SET memory_limit = '{mem}'")
     tmp = os.getenv("DUCKDB_TEMP_DIRECTORY")
     if tmp:
-        con.execute(f"SET temp_directory = '{tmp}'")
+        # one directory per connection: DuckDB names its spill files the same in every
+        # process (duckdb_temp_storage_DEFAULT-0.tmp), and Stage 6's workers sharing
+        # one directory overwrote each other's (an IO error on enwiki, or worse, a
+        # silently wrong read). DuckDB removes its files on close; the directory stays.
+        import tempfile
+
+        os.makedirs(tmp, exist_ok=True)
+        con.execute(f"SET temp_directory = '{tempfile.mkdtemp(prefix=f'p{os.getpid()}-', dir=tmp)}'")
     # DUCKDB_THREADS: per connection, so per worker in a --jobs pool. On enwiki, Stage 6
     # materialising a bucket with all 28 threads under an 8 GB limit ran out of memory,
     # and DuckDB 1.5.6 segfaulted in .df() instead of raising; 1–4 threads did not.

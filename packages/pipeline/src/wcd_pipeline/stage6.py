@@ -382,15 +382,29 @@ def main(argv=None) -> int:
     todo = [b for b in buckets if args.force or not bucket_done(args.parquet_dir, args.domain, b)]
     log(f"{len(buckets)} bucket(s), {len(todo)} to run, {args.jobs} job(s)")
     t0 = time.time()
+    # a bucket that fails is logged and left without its _SUCCESS marker (a re-run
+    # redoes it); the others go on, and the run exits non-zero naming the failures
+    failed = []
     if args.jobs > 1 and len(todo) > 1:
         with ProcessPoolExecutor(max_workers=args.jobs) as pool:
             futures = {pool.submit(run_bucket, args.parquet_dir, args.domain, b): b for b in todo}
             for f in as_completed(futures):
-                log(f"bucket {f.result()}")
+                try:
+                    log(f"bucket {f.result()}")
+                except Exception as e:  # noqa: BLE001 — reported, and the run fails at the end
+                    failed.append(futures[f])
+                    log(f"bucket {futures[f]} FAILED: {type(e).__name__}: {e}")
     else:
         for b in todo:
-            log(f"bucket {run_bucket(args.parquet_dir, args.domain, b)}")
+            try:
+                log(f"bucket {run_bucket(args.parquet_dir, args.domain, b)}")
+            except Exception as e:  # noqa: BLE001
+                failed.append(b)
+                log(f"bucket {b} FAILED: {type(e).__name__}: {e}")
     log(f"6a-6c done in {time.time() - t0:.1f}s")
+    if failed:
+        log(f"{len(failed)} bucket(s) failed: {sorted(failed)}; re-run to redo them")
+        return 1
     if args.skip_global:
         return 0
     if args.global_engine == "scaled":
