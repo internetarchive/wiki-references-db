@@ -367,6 +367,9 @@ def main(argv=None) -> int:
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2), help="buckets processed concurrently")
     ap.add_argument("--force", action="store_true", help="re-run buckets that already have a _SUCCESS marker")
     ap.add_argument("--skip-global", action="store_true", help="stop after 6c")
+    ap.add_argument("--global-engine", choices=("scaled", "vendored"), default="scaled",
+                    help="6d: scaled (integer union-find + DuckDB, global_match) or the vendored pandas match_global "
+                         "(same output; only for small domains)")
     ap.add_argument("--no-gate", action="store_true")
     args = ap.parse_args(argv)
     if not args.parquet_dir:
@@ -390,7 +393,11 @@ def main(argv=None) -> int:
     log(f"6a-6c done in {time.time() - t0:.1f}s")
     if args.skip_global:
         return 0
-    log(f"6d {run_global(args.parquet_dir, args.domain)}")
+    if args.global_engine == "scaled":
+        from .global_match import run_global_scaled
+        log(f"6d {run_global_scaled(args.parquet_dir, args.domain)}")
+    else:
+        log(f"6d {run_global(args.parquet_dir, args.domain)}")
     if not args.no_gate:
         failures = gate(args.parquet_dir, args.domain)
         if failures:
