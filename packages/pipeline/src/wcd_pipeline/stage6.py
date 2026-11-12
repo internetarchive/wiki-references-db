@@ -370,6 +370,10 @@ def main(argv=None) -> int:
     ap.add_argument("--global-engine", choices=("scaled", "vendored"), default="scaled",
                     help="6d: scaled (integer union-find + DuckDB, global_match) or the vendored pandas match_global "
                          "(same output; only for small domains)")
+    ap.add_argument("--reuse-unions", action="store_true",
+                    help="6d scaled: reuse the unions a previous 6d run saved (matching_intermediate/_global_unions) "
+                         "if they are for the same number of merged sources; for re-running 6d after a failure "
+                         "past the union-find, never after 6a-6c changed")
     ap.add_argument("--no-gate", action="store_true")
     args = ap.parse_args(argv)
     if not args.parquet_dir:
@@ -409,7 +413,7 @@ def main(argv=None) -> int:
         return 0
     if args.global_engine == "scaled":
         from .global_match import run_global_scaled
-        log(f"6d {run_global_scaled(args.parquet_dir, args.domain)}")
+        log(f"6d {run_global_scaled(args.parquet_dir, args.domain, reuse_unions=args.reuse_unions)}")
     else:
         log(f"6d {run_global(args.parquet_dir, args.domain)}")
     if not args.no_gate:

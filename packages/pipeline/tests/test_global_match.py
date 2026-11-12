@@ -95,6 +95,22 @@ def test_scaled_engine_matches_vendored(tmp_path, monkeypatch, seed, n):
     assert "singleton" in types and "author_year_fuzzy" in types and len(types) >= 3
 
 
+def test_scaled_engine_reuses_saved_unions(tmp_path, capsys):
+    rows = _rows(2, 1500)
+    _write_input(tmp_path, rows)
+    first = global_match.run_global_scaled(str(tmp_path), DOMAIN)
+    want = {ds: _read(tmp_path, ds) for ds in ("global_sources_stage", "global_source_map")}
+    capsys.readouterr()
+    again = global_match.run_global_scaled(str(tmp_path), DOMAIN, reuse_unions=True)
+    assert "unions reused" in capsys.readouterr().out
+    assert again["merges"] == first["merges"] and again["global_sources"] == first["global_sources"]
+    for ds, rows_ in want.items():
+        assert _read(tmp_path, ds) == rows_, ds
+    # unions saved for another threshold are not reused
+    global_match.run_global_scaled(str(tmp_path), DOMAIN, threshold=90, reuse_unions=True)
+    assert "recomputing" in capsys.readouterr().out
+
+
 def test_int_union_find_matches_vendored():
     from wcd_semantic.unionfind import UnionFind
 
