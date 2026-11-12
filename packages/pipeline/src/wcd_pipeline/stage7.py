@@ -20,6 +20,7 @@ DuckDB computes per bucket from the Parquet tier; psycopg2 writes to Postgres
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import shutil
@@ -30,6 +31,7 @@ import duckdb
 import psycopg2
 import psycopg2.extras
 import pyarrow as pa
+import pyarrow.csv as pa_csv
 
 from wcd_schema import parquet as layout
 from wcd_schema.duckdb import bind_bucket_views
@@ -37,7 +39,7 @@ from wcd_semantic.profile import build_source_profile
 from wcd_semantic.scoring import compute_score
 
 from .config import duckdb_connect, load_dotenv, psycopg_dsn  # noqa: F401
-from .load import _copy_and_insert
+from .load import _CSV_OPTIONS, _copy_and_insert
 from .materialize import export_citation_instances_denorm
 
 MI = "matching_intermediate/"
@@ -245,20 +247,9 @@ LEFT JOIN reuse ru USING (page_id, global_source_id)
 ORDER BY t.page_id, t.global_source_id
 """
 
-_PSS_INSERT = """
-INSERT INTO page_source_summary
-    (domain_id, page_id, global_source_id, author_key, year, title,
-     extracted_doi, extracted_isbn, extracted_pmid, extracted_pmc, extracted_arxiv, extracted_wikidata_qid,
-     extracted_librarybase_id, extracted_url,
-     source_type, match_type, confidence, first_rev_id, first_seen, last_rev_id, last_seen,
-     n_citations, n_revisions_cited, n_self_closing_uses, is_current)
-SELECT %(d)s, t.page_id, t.global_source_id, gs.author_key, gs.year, gs.title,
-       gs.extracted_doi, gs.extracted_isbn, gs.extracted_pmid, gs.extracted_pmc, gs.extracted_arxiv, gs.extracted_wikidata_qid,
-       gs.extracted_librarybase_id, gs.extracted_url,
-       t.source_type, t.match_type, t.confidence, t.first_rev_id, t.first_seen, t.last_rev_id, t.last_seen,
-       t.n_citations, t.n_revisions_cited, t.n_self_closing_uses, t.is_current
-FROM pss_in t JOIN global_sources gs USING (global_source_id)
-"""
+# global_sources columns page_source_summary carries (from global_sources_stage, as 7a loads them)
+_PSS_GS_COLS = ["author_key", "year", "title", "extracted_doi", "extracted_isbn", "extracted_pmid",
+                "extracted_pmc", "extracted_arxiv", "extracted_wikidata_qid", "extracted_url"]
 
 
 _PSS_COLS = ["page_id", "global_source_id", "source_type", "match_type", "confidence", "first_rev_id", "first_seen",
@@ -269,50 +260,74 @@ _PSS_DDL = ("page_id integer, global_source_id varchar(16), source_type varchar,
             "is_current boolean")
 
 
+def _pss_scratch(parquet_base: str, domain: str) -> Path:
+    return Path(parquet_base) / "_scratch" / "7d" / f"domain={domain}"
+
+
 def step_d(pg, con, domain: str, domain_id: int, parquet_base: str, force: bool) -> int:
-    """page_source_summary per bucket (checkpointed). A bucket's old rows are
-    deleted by its page ids (the primary key leads with domain_id, page_id; a
-    ``page_id % 512`` filter scanned the whole table once per bucket); rows go
-    in by COPY; the table's foreign keys are deferred while it is empty."""
+    """page_source_summary for the domain. Each bucket's rows are computed in
+    DuckDB and written to a scratch Parquet file (the file is the bucket's
+    checkpoint); then one DuckDB join adds the global source's columns from
+    ``global_sources_stage`` (what 7a loaded into ``global_sources``; nothing
+    sets ``extracted_librarybase_id`` there, so it is NULL) and the rows go in
+    by COPY, the domain's old rows deleted first and the table's foreign keys
+    deferred while it is empty. (Joining ``global_sources`` in Postgres per
+    bucket was one random primary-key read per row into a table larger than
+    shared_buffers: ~2 min per bucket on enwiki.)"""
     from . import fkeys
     from .gates import make_session
 
-    ck = Checkpoint(parquet_base, "7d", domain)
-    if force:
-        ck.clear()
+    scratch = _pss_scratch(parquet_base, domain)
+    Checkpoint(parquet_base, "7d", domain).clear()      # the per-bucket checkpoint of earlier versions
+    if force and scratch.exists():
+        shutil.rmtree(scratch)
+    scratch.mkdir(parents=True, exist_ok=True)
     buckets = layout.list_buckets(parquet_base, "citation_instances_denorm", domain)
+    todo = [b for b in buckets if not (scratch / f"bucket={b}.parquet").exists()]
+    t0 = time.time()
+    for i, b in enumerate(todo, 1):
+        bind_bucket_views(con, parquet_base, domain, b,
+                          ("citation_instances_denorm", "citation_history", "revisions", "named_ref_uses",
+                           "ref_name_links"))
+        tmp = scratch / f"bucket={b}.parquet.tmp"
+        con.execute(f"COPY ({_PSS_SQL}) TO '{tmp}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+        tmp.rename(scratch / f"bucket={b}.parquet")
+        if i % 32 == 0:
+            log(f"7d: {i}/{len(todo)} buckets computed ({time.time() - t0:.0f}s)")
+
+    gs_pattern = layout.partition_glob(parquet_base, MI + "global_sources_stage", domain)
+    cols = ["domain_id", "page_id", "global_source_id"] + _PSS_GS_COLS + ["extracted_librarybase_id"] + _PSS_COLS[2:]
+    select = ", ".join([f"CAST({int(domain_id)} AS INTEGER) AS domain_id", "t.page_id", "t.global_source_id"]
+                       + [f"gs.{c}" for c in _PSS_GS_COLS] + ["CAST(NULL AS VARCHAR) AS extracted_librarybase_id"]
+                       + [f"t.{c}" for c in _PSS_COLS[2:]])
+    sql = (f"SELECT {select} FROM read_parquet('{scratch}/bucket=*.parquet') t "
+           f"JOIN read_parquet('{gs_pattern}') gs USING (global_source_id) ORDER BY t.page_id, t.global_source_id")
     with pg.cursor() as cur:
-        if not ck.done:
-            cur.execute("DELETE FROM page_source_summary WHERE domain_id = %s", (domain_id,))
-            pg.commit()
+        cur.execute("DELETE FROM page_source_summary WHERE domain_id = %s", (domain_id,))
+    pg.commit()
     session = make_session()
-    total = 0
+    total = n_batches = 0
     try:
         fkeys.drop_if_empty(session, "page_source_summary", log)
-        insert = _PSS_INSERT.replace("%(d)s", str(int(domain_id)))
-        for i, b in enumerate(buckets, 1):
-            if b in ck.done:
-                continue
-            bind_bucket_views(con, parquet_base, domain, b,
-                              ("citation_instances_denorm", "citation_history", "revisions", "named_ref_uses",
-                               "ref_name_links"))
-            result = con.execute(_PSS_SQL)
-            rows = (getattr(result, "to_arrow_table", None) or result.fetch_arrow_table)()
-            pages = [p for (p,) in con.execute("SELECT DISTINCT page_id FROM revisions").fetchall()]
-            with pg.cursor() as cur:
-                # rows a run interrupted after its commit (and before its checkpoint) left
-                cur.execute("DELETE FROM page_source_summary WHERE domain_id = %s AND page_id = ANY(%s)",
-                            (domain_id, pages))
-                if rows.num_rows:
-                    total += _copy_and_insert(cur, rows, "pss_in", _PSS_DDL, _PSS_COLS, insert)
-            pg.commit()
-            ck.mark(b)
-            if i % 32 == 0:
-                log(f"7d: {i}/{len(buckets)} buckets, {total:,} rows")
+        with pg.cursor() as cur:
+            for batch in _batches(con, sql):
+                buf = io.BytesIO()
+                pa_csv.write_csv(batch, buf, write_options=_CSV_OPTIONS)
+                buf.seek(0)
+                cur.copy_expert(f"COPY page_source_summary ({', '.join(cols)}) FROM STDIN WITH (FORMAT csv)", buf)
+                pg.commit()
+                total += batch.num_rows
+                n_batches += 1
+                if n_batches % 64 == 0:
+                    log(f"7d: {total:,} rows loaded ({time.time() - t0:.0f}s)")
+        n_scratch = con.execute(f"SELECT count(*) FROM read_parquet('{scratch}/bucket=*.parquet')").fetchone()[0]
+        if n_scratch != total:
+            raise RuntimeError(f"7d: {n_scratch} summary rows computed but {total} loaded "
+                               "(a global source missing from global_sources_stage?)")
         fkeys.restore(session, "page_source_summary", log)
     finally:
         session.close()
-    ck.clear()
+    shutil.rmtree(scratch)
     return total
 
 
