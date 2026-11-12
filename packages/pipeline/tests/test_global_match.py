@@ -84,7 +84,9 @@ def test_scaled_engine_matches_vendored(tmp_path, monkeypatch, seed, n):
     _write_input(b, rows)
     stage6.run_global(str(a), DOMAIN)
     monkeypatch.setattr(global_match, "BLOCK_ROWS", 7)    # several row blocks per fuzzy group
+    monkeypatch.setattr(global_match, "CHUNK_ROWS", 97)   # several output files
     global_match.run_global_scaled(str(b), DOMAIN)
+    assert len(list(layout.partition_dir(b, "matching_intermediate/global_source_map", DOMAIN).glob("*.parquet"))) > 1
     for ds in ("global_sources_stage", "global_source_map"):
         want, got = _read(a, ds), _read(b, ds)
         assert len(got) == len(want), ds

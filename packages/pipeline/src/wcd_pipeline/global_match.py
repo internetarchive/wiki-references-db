@@ -52,6 +52,8 @@ HARD_SIGNALS = (("doi", "extracted_doi", 1.00), ("isbn", "extracted_isbn", 0.95)
                 ("wikidata_qid", "extracted_wikidata_qid", 0.95))
 # rows of a fuzzy group scored per cdist call (memory: rows × group size float64)
 BLOCK_ROWS = int(os.getenv("MATCH_GLOBAL_BLOCK_ROWS", "2048"))
+# merged sources (by idx) per output file of the component build
+CHUNK_ROWS = int(os.getenv("MATCH_GLOBAL_CHUNK_ROWS", "8000000"))
 
 
 def log(msg: str) -> None:
@@ -217,12 +219,13 @@ def run_global_scaled(parquet_base: str, domain: str, threshold: int = vendored.
                                 "edge_confidence": pa.array([e[2] for e in edge], pa.float64())})
             del uf, edge, touched, roots
             _save_unions(udir, n, threshold, counts, comp_in, edge_in)
-            log(f"{comp_in.num_rows:,} sources in {edge_in.num_rows:,} multi-member components; unions saved "
+            # (edge_in also keeps the edge info of roots that later joined another component)
+            n_comp = len(np.unique(comp_in.column("root").to_numpy()))
+            log(f"{comp_in.num_rows:,} sources in {n_comp:,} multi-member components; unions saved "
                 f"({time.time() - t0:.0f}s)")
         con.register("comp_in", comp_in)
         con.register("edge_in", edge_in)
-        _build(con, parquet_base, domain)
-        n_gs = con.execute("SELECT count(*) FROM gs").fetchone()[0]
+        n_gs = _build(con, parquet_base, domain)
     finally:
         con.close()
     log(f"{n_gs:,} global sources ({time.time() - t0:.0f}s)")
@@ -261,7 +264,7 @@ def _multi_ids(con) -> pa.Table:
                      "n_pages": pa.array(n_pages, pa.int32()), "page_ids": pa.array(page_ids, pa.string())})
 
 
-def _build(con, parquet_base: str, domain: str) -> None:
+def _build(con, parquet_base: str, domain: str) -> int:
     # a source in no multi-member component is its own global source (root = its idx)
     con.execute("""CREATE TEMP TABLE m AS
         SELECT ms.idx, COALESCE(c.root, ms.idx) AS root, ms.merged_source_id, ms.page_id
@@ -284,37 +287,51 @@ def _build(con, parquet_base: str, domain: str) -> None:
     # order, over the whole domain) with the same canonical_sha1
     con.execute("""CREATE TEMP TABLE canon_type AS
         SELECT canonical_sha1, arg_min_null(source_type, idx) AS source_type FROM ms GROUP BY canonical_sha1""")
-    con.execute("""CREATE TEMP TABLE gs AS
-        SELECT i.global_source_id,
-               CASE WHEN c.n_members = 1 THEN 'singleton' ELSE COALESCE(e.edge_match_type, 'singleton') END AS match_type,
-               CASE WHEN c.n_members = 1 THEN NULL ELSE e.edge_confidence END AS confidence,
-               i.n_pages, i.page_ids,
-               k.canonical_sha1 AS canonical_part_sha1, t.source_type,
-               k.author_key, k.year, k.title, k.extracted_doi, k.extracted_isbn, k.extracted_pmid, k.extracted_pmc,
-               k.extracted_arxiv, k.extracted_wikidata_qid, k.extracted_url,
-               CAST(c.n_total AS INTEGER) AS n_total_citations,
-               c.root, c.first_idx
-        FROM comp c JOIN canon k USING (root) JOIN multi_ids i USING (root)
-        LEFT JOIN edge_in e USING (root)
-        LEFT JOIN canon_type t ON t.canonical_sha1 IS NOT DISTINCT FROM k.canonical_sha1
-        UNION ALL
-        SELECT left(sha1('global:' || ms.merged_source_id), 16), 'singleton', CAST(NULL AS DOUBLE),
-               CAST(1 AS INTEGER), '[' || CAST(ms.page_id AS VARCHAR) || ']',
-               ms.canonical_sha1, t.source_type,
-               ms.author_key, ms.year, ms.title, ms.extracted_doi, ms.extracted_isbn, ms.extracted_pmid,
-               ms.extracted_pmc, ms.extracted_arxiv, ms.extracted_wikidata_qid, ms.extracted_url,
-               CAST(ms.n_total_citations AS INTEGER), ms.idx, ms.idx
-        FROM ms ANTI JOIN comp_in c USING (idx)
-        LEFT JOIN canon_type t ON t.canonical_sha1 IS NOT DISTINCT FROM ms.canonical_sha1""")
-    for ds, sql in (
-        ("global_sources_stage",
-         "SELECT * EXCLUDE (root, first_idx) FROM gs ORDER BY first_idx"),
-        ("global_source_map",
-         "SELECT m.merged_source_id, g.global_source_id, CAST(m.page_id AS INTEGER) AS page_id, g.match_type, g.confidence "
-         "FROM m JOIN gs g USING (root) ORDER BY g.first_idx, m.idx"),
-    ):
+    # the global sources and their map, written in first_idx ranges: each range's rows are the
+    # build side of every join, so memory follows CHUNK_ROWS rather than the domain's ~120M rows
+    n_src = con.execute("SELECT count(*) FROM ms").fetchone()[0]
+    dirs = {}
+    for ds in ("global_sources_stage", "global_source_map"):
         d = layout.partition_dir(parquet_base, "matching_intermediate/" + ds, domain)
         if d.exists():
             shutil.rmtree(d)
         d.mkdir(parents=True)
-        con.execute(f"COPY ({sql}) TO '{d / 'data.parquet'}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+        dirs[ds] = d
+    n_gs = 0
+    for k, lo in enumerate(range(0, max(n_src, 1), CHUNK_ROWS)):
+        hi = lo + CHUNK_ROWS
+        con.execute("DROP TABLE IF EXISTS gs")
+        con.execute(f"""CREATE TEMP TABLE gs AS
+            SELECT i.global_source_id,
+                   CASE WHEN c.n_members = 1 THEN 'singleton' ELSE COALESCE(e.edge_match_type, 'singleton') END AS match_type,
+                   CASE WHEN c.n_members = 1 THEN NULL ELSE e.edge_confidence END AS confidence,
+                   i.n_pages, i.page_ids,
+                   k.canonical_sha1 AS canonical_part_sha1, t.source_type,
+                   k.author_key, k.year, k.title, k.extracted_doi, k.extracted_isbn, k.extracted_pmid, k.extracted_pmc,
+                   k.extracted_arxiv, k.extracted_wikidata_qid, k.extracted_url,
+                   CAST(c.n_total AS INTEGER) AS n_total_citations,
+                   c.root, c.first_idx
+            FROM (SELECT * FROM comp WHERE first_idx >= {lo} AND first_idx < {hi}) c
+            JOIN canon k USING (root) JOIN multi_ids i USING (root)
+            LEFT JOIN edge_in e USING (root)
+            LEFT JOIN canon_type t ON t.canonical_sha1 IS NOT DISTINCT FROM k.canonical_sha1
+            UNION ALL
+            SELECT left(sha1('global:' || s.merged_source_id), 16), 'singleton', CAST(NULL AS DOUBLE),
+                   CAST(1 AS INTEGER), '[' || CAST(s.page_id AS VARCHAR) || ']',
+                   s.canonical_sha1, t.source_type,
+                   s.author_key, s.year, s.title, s.extracted_doi, s.extracted_isbn, s.extracted_pmid,
+                   s.extracted_pmc, s.extracted_arxiv, s.extracted_wikidata_qid, s.extracted_url,
+                   CAST(s.n_total_citations AS INTEGER), s.idx, s.idx
+            FROM (SELECT * FROM ms WHERE idx >= {lo} AND idx < {hi}) s
+            ANTI JOIN comp_in c USING (idx)
+            LEFT JOIN canon_type t ON t.canonical_sha1 IS NOT DISTINCT FROM s.canonical_sha1""")
+        name = f"data-{k:04d}.parquet"
+        con.execute(f"COPY (SELECT * EXCLUDE (root, first_idx) FROM gs ORDER BY first_idx) "
+                    f"TO '{dirs['global_sources_stage'] / name}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+        con.execute("COPY (SELECT m.merged_source_id, g.global_source_id, CAST(m.page_id AS INTEGER) AS page_id, "
+                    "g.match_type, g.confidence FROM m JOIN gs g USING (root) ORDER BY g.first_idx, m.idx) "
+                    f"TO '{dirs['global_source_map'] / name}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+        n_gs += con.execute("SELECT count(*) FROM gs").fetchone()[0]
+        log(f"global sources {lo:,}..{min(hi, n_src):,}: {n_gs:,} so far")
+    con.execute("DROP TABLE IF EXISTS gs")
+    return n_gs
