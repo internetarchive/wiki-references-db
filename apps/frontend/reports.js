@@ -1,9 +1,11 @@
 // Report pages ported from the v1 Citation Explorer:
 //   /citations/{sha1}[?domain=&page_id=]        revisions that contain a citation (on one page, or every page)
 //   /citations/{sha1}/pages[?domain=&page_id=]  pages whose citations normalize to the same text
-//   /templates/{id}/report?parameter_key=&parameter_value=   citations with that template parameter value
+//   /templates/report?domain=&template=&parameter_key=&parameter_value=   citations with that template parameter value
 //   /templates/report?legacy_id=…               an old explorer template link whose id could not be mapped
+// Nothing here uses database row ids: pages are (domain, page id), citations hashes, templates names.
 const API_BASE = "/api/v2";
+const DEFAULT_DOMAIN = "en.wikipedia.org";
 const HISTORY_PAGE_SIZE = 500;
 const LIST_PAGE_SIZE = 100;
 // the API serves a citation's history across all pages only up to this many pages (HISTORY_MAX_PAGES)
@@ -294,10 +296,13 @@ async function pagesReport(sha1) {
 }
 
 // ---------------------------------------------------------------------------
-// /templates/{id}/report: citations with a template parameter value
+// /templates/report?domain=&template=&parameter_key=&parameter_value=:
+// citations with a template parameter value (templates are named, not numbered)
 // ---------------------------------------------------------------------------
 
-async function templateReport(templateId) {
+async function templateReport() {
+  const domain = (params.get("domain") || DEFAULT_DOMAIN).trim();
+  const template = (params.get("template") || "").trim();
   const key = (params.get("parameter_key") || "").trim();
   const value = (params.get("parameter_value") || "").trim();
   setHeader("Template Parameter Report", "Citations whose template has this parameter value.");
@@ -312,9 +317,9 @@ async function templateReport(templateId) {
     emptyText: "No citations use this template parameter value.",
     summarize: (shown, total) => `Showing ${formatInteger(shown)} of ${plural(total, "citation")} using this value.`,
     fetchPage: async (offset) => {
-      const query = new URLSearchParams({ parameter_key: key, parameter_value: value, limit: String(LIST_PAGE_SIZE),
-                                          offset: String(offset) });
-      const result = await fetchJson(`${API_BASE}/templates/${templateId}/report?${query}`);
+      const query = new URLSearchParams({ domain, template, parameter_key: key, parameter_value: value,
+                                          limit: String(LIST_PAGE_SIZE), offset: String(offset) });
+      const result = await fetchJson(`${API_BASE}/templates/report?${query}`);
       if (!header) {
         header = result;
         setHeader("Template Parameter Report", `${result.template_name}: ${key} = ${value}`);
@@ -339,7 +344,8 @@ async function templateReport(templateId) {
   });
 
   const query = el("dl", { className: "report-facts" }, [
-    el("dt", { text: "Template" }), el("dd", { text: `#${templateId}` }),
+    el("dt", { text: "Wiki" }), el("dd", { text: domain }),
+    el("dt", { text: "Template" }), el("dd", { text: template }),
     el("dt", { text: "Parameter" }), el("dd", {}, [el("code", { text: key })]),
     el("dt", { text: "Value" }), el("dd", {}, [el("code", { text: value || "(empty)" })]),
   ]);
@@ -352,16 +358,12 @@ async function templateReport(templateId) {
 
 function legacyTemplateNotice() {
   const legacyId = params.get("legacy_id");
-  const name = params.get("template_name");
   const key = params.get("parameter_key") || "";
   const value = params.get("parameter_value") || "";
   setHeader("Template Parameter Report", "This link comes from the retired Citation Explorer.");
-  const what = name ? `the template “${name}”` : `template #${legacyId}`;
-  const reason = name
-    ? `${what} is not in the current database.`
-    : "template ids were renumbered in the current database, and this server has no table to translate the old id.";
   reportRoot.replaceChildren(card(
-    el("p", { text: `This link asked for citations with ${key} = “${value}” in ${what} from the old explorer, but ${reason}` }),
+    el("p", { text: `This link asked for citations with ${key} = “${value}” in template #${legacyId} of the old explorer. ` +
+                    "Templates are now identified by name, and this server cannot tell which template that old number meant." }),
     el("p", { className: "muted", text: "Open a page in the dashboard and use “Find matches” on a template parameter to run the same report." }),
     el("div", { className: "button-row" }, [el("a", { className: "timeline-action-link", href: "/", text: "Go to the dashboard" })])
   ));
@@ -377,10 +379,12 @@ async function route() {
       await pagesReport(match[1]);
     } else if ((match = path.match(/^\/citations\/([0-9a-f]{40})$/))) {
       await historyReport(match[1]);
-    } else if ((match = path.match(/^\/templates\/(\d+)\/report$/))) {
-      await templateReport(match[1]);
     } else if (path === "/templates/report") {
-      legacyTemplateNotice();
+      if (params.get("template")) {
+        await templateReport();
+      } else {
+        legacyTemplateNotice();
+      }
     } else {
       setHeader("Report Not Found");
       showError("There is no report at this address.");

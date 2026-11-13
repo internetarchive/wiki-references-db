@@ -356,6 +356,10 @@ function formatSourceFacts(source) {
   if (source.page_citation_count) {
     facts.push(`${formatInteger(source.page_citation_count)} citation uses on this page`);
   }
+  if (source.source_key) {
+    // the durable name of the source (its standardized identifier, else a content hash)
+    facts.push(`Key ${source.source_key}`);
+  }
 
   return facts;
 }
@@ -616,12 +620,15 @@ function citationPagesUrl(sha1, domain, pageId) {
   return `/citations/${encodeURIComponent(sha1)}/pages${reportQuery(domain, pageId)}`;
 }
 
-function templateReportUrl(templateId, key, value) {
+// templates are named (domain + template name); their database row ids are not part of the API
+function templateReportUrl(domain, templateName, key, value) {
   const params = new URLSearchParams({
+    domain,
+    template: templateName,
     parameter_key: String(key),
     parameter_value: String(value ?? "").trim(),
   });
-  return `/templates/${encodeURIComponent(templateId)}/report?${params}`;
+  return `/templates/report?${params}`;
 }
 
 function makeElement(tag, className, text) {
@@ -645,7 +652,7 @@ function makeLink(text, href, { external = false, className = "" } = {}) {
   return link;
 }
 
-function renderTemplateParameters(template) {
+function renderTemplateParameters(template, domain) {
   const block = makeElement("div", "citation-template");
   block.appendChild(makeElement("p", "citation-template-name", template.template_name));
 
@@ -670,7 +677,7 @@ function renderTemplateParameters(template) {
     row.appendChild(makeElement("td", "citation-param-value", String(value ?? "")));
     const action = makeElement("td", "citation-param-action");
     if (String(value ?? "").trim()) {
-      const link = makeLink("Find matches", templateReportUrl(template.wiki_template_id, key, value), {
+      const link = makeLink("Find matches", templateReportUrl(domain, template.template_name, key, value), {
         className: "inline-action",
       });
       link.title = `Other citations whose ${template.template_name} has ${key} = this value`;
@@ -753,7 +760,7 @@ function renderCitationItem(citation, domain, pageId) {
       parts.push(`${links.length} link${links.length === 1 ? "" : "s"}`);
     }
     details.appendChild(makeElement("summary", "", `Details: ${parts.join(", ")}`));
-    templates.forEach((template) => details.appendChild(renderTemplateParameters(template)));
+    templates.forEach((template) => details.appendChild(renderTemplateParameters(template, domain)));
     if (links.length) {
       const list = makeElement("ul", "citation-link-list");
       links.forEach((link) => {

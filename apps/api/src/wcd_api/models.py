@@ -1,6 +1,17 @@
 """Response models. The Group-2 shapes are UVA's (``analytics_service/main.py``)
 plus ``domain`` / ``url`` and the new identifier and resolution fields; the
 Group-3/4 shapes are v1's plus ``citation_type`` / ``parts`` (proposed_api.md).
+
+**No build-dependent ids in /api/v2.** Things are named by upstream ids (domain,
+page id, revision id), content hashes (``normalized_sha1``, ``raw_sha1``,
+``part_sha1``), names (templates) and URLs (web resources). Database row ids
+(``wiki_templates.id``, ``web_resources.id``) are never returned, and a citation
+instance is ``(domain, page_id, raw_sha1)``. The one interim id is
+``global_source_id``, a per-build handle (see ``source_key`` for the durable one).
+
+The ``V1…`` subclasses at the end add back the fields the v1 contract carried
+(``citation_instance_id``, the v1 database's ``wiki_template_id``). Queries build
+those supersets; a v2 route's ``response_model`` drops the v1-only fields.
 """
 from __future__ import annotations
 
@@ -104,8 +115,19 @@ class Identifiers(BaseModel):
     extracted_url: str | None = None
 
 
+SOURCE_KEY_DESCRIPTION = (
+    "Durable key of the source: its standardized identifier as `scheme:value`, in the order "
+    "doi, isbn, pmid, pmc, arxiv, wikidata, librarybase, url (intrinsic identifiers first, so the key does not "
+    "change when a Wikidata or LibraryBase item is created later), else `part:<canonical_part_sha1>` (a content "
+    "hash, the fallback). Look a source up by it with /api/v2/sources?key=.")
+GLOBAL_SOURCE_ID_DESCRIPTION = (
+    "Interim, per-build handle of the global source: `<run id>.<hash>`, or a bare hash for the build that predates "
+    "run ids. It changes when the source's membership changes between builds; store `source_key` instead.")
+
+
 class TopSource(Identifiers):
-    global_source_id: str
+    global_source_id: str = Field(..., description=GLOBAL_SOURCE_ID_DESCRIPTION)
+    source_key: str | None = Field(None, description=SOURCE_KEY_DESCRIPTION)
     source_label: str
     author_key: str | None = None
     year: str | None = None
@@ -157,7 +179,9 @@ class CanonicalPart(BaseModel):
 
 
 class GlobalSourceResponse(Identifiers):
-    global_source_id: str
+    global_source_id: str = Field(..., description=GLOBAL_SOURCE_ID_DESCRIPTION)
+    run_id: str | None = Field(None, description="the build run the global_source_id belongs to (API_BASE_RUN_ID for bare ids)")
+    source_key: str = Field(..., description=SOURCE_KEY_DESCRIPTION)
     source_label: str
     source_type: str | None = None
     match_type: str | None = None
@@ -171,6 +195,13 @@ class GlobalSourceResponse(Identifiers):
     verdict: str | None = None
     canonical_part_sha1: str | None = None
     canonical: CanonicalPart | None = None
+
+
+class SourceLookupResponse(BaseModel):
+    identifier: str = Field(..., description="doi, isbn, pmid, pmc, arxiv, wikidata, librarybase, url or part")
+    value: str = Field(..., description="the value as looked up (normalized: lowercase DOI, bare PMC number, …)")
+    total: int
+    sources: list[GlobalSourceResponse]
 
 
 # ---------------------------------------------------------------------------
@@ -228,13 +259,12 @@ class GlobalPart(Part):
 
 
 class ExtractedLink(BaseModel):
-    web_resource_id: int
     url: str
 
 
 class TemplateUse(BaseModel):
-    wiki_template_id: int
-    template_name: str
+    template_name: str = Field(..., description="as normalized at extraction (underscores → spaces, first letter capitalized); "
+                                                 "with the page's domain it names the template")
     parameters: dict[str, Any]
 
 
@@ -251,10 +281,9 @@ InstanceId = Annotated[str, Field(description="citation_instances.id as a decima
 
 
 class CitationAtRevision(BaseModel):
-    citation_instance_id: InstanceId
+    raw_sha1: str = Field(..., description="sha1 of the raw citation text; with domain and page_id it identifies the citation instance")
     normalized_sha1: str | None = None
     reference_normalized: str | None = None
-    raw_sha1: str | None = None
     reference_type: str
     reference_name: str | None = None
     citation_type: str | None = None
@@ -281,7 +310,7 @@ class PageCitationsResponse(BaseModel):
 class InstanceRef(BaseModel):
     domain: str
     page_id: int
-    citation_instance_id: InstanceId
+    raw_sha1: str
     reference_name: str | None = None
     reference_type: str
 
@@ -341,7 +370,6 @@ class TemplateReportCitation(BaseModel):
 
 
 class TemplateReportResponse(BaseModel):
-    wiki_template_id: int
     template_name: str
     domain: str | None = None
     parameter_key: str
@@ -361,7 +389,6 @@ class WebResourceReference(BaseModel):
 
 
 class WebResourceResponse(BaseModel):
-    web_resource_id: int
     url: str
     domain: str | None = None
     numeric_page_id: int | None = None
@@ -371,3 +398,35 @@ class WebResourceResponse(BaseModel):
 class ErrorResponse(BaseModel):
     error: str
     code: int
+
+
+# ---------------------------------------------------------------------------
+# /api/v1 supersets: the fields the v1 contract had that v2 dropped. Remove
+# with the v1 aliases.
+# ---------------------------------------------------------------------------
+
+class V1TemplateUse(TemplateUse):
+    wiki_template_id: int | None = Field(None, description="the template's id in the v1 database (API_LEGACY_TEMPLATE_IDS); "
+                                                           "null when unknown")
+
+
+class V1CitationAtRevision(CitationAtRevision):
+    citation_instance_id: InstanceId
+    templates: list[V1TemplateUse] = []
+
+
+class V1PageCitationsResponse(PageCitationsResponse):
+    citations: list[V1CitationAtRevision]
+
+
+class V1InstanceRef(InstanceRef):
+    citation_instance_id: InstanceId
+
+
+class V1CitationDetailResponse(CitationDetailResponse):
+    instances: list[V1InstanceRef]
+    templates: list[V1TemplateUse]
+
+
+class V1TemplateReportResponse(TemplateReportResponse):
+    wiki_template_id: int = Field(..., description="the v1 template id that was asked for")

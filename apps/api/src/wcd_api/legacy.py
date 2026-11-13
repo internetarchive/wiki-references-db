@@ -2,11 +2,12 @@
 ``/api/v1/docs``) to the dashboard's report pages and FastAPI's docs.
 
 Page ids and ``normalized_sha1`` values are the same in both databases, so those
-links map directly. Template ids are not: the v1 database numbered its
-``wiki_templates`` differently. An old template link is translated through the
-v1 id → name table when one is configured (``API_LEGACY_TEMPLATE_IDS``, a TSV
-``id<TAB>name`` exported from the v1 database); otherwise it lands on a report
-page that says the link cannot be followed.
+links map directly. Template ids are not (they are load-order row ids, and the
+current API names templates instead): an old template link is translated to the
+template's name through the v1 id → name table when one is configured
+(``API_LEGACY_TEMPLATE_IDS``, a TSV ``id<TAB>name`` exported from the v1
+database); otherwise it lands on a report page that says the link cannot be
+followed.
 
 The redirects are 302s on purpose: while the cutover settles, a wrong mapping
 can be fixed without browsers having cached it.
@@ -19,7 +20,6 @@ from urllib.parse import urlencode
 
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse
-from sqlalchemy import text
 
 log = logging.getLogger("wcd_api")
 
@@ -39,6 +39,14 @@ def load_template_names(path: str | None) -> dict[int, str]:
                 names[int(old_id)] = name.replace("\\t", "\t").replace("\\\\", "\\")
     log.info("wcd_api: %d legacy template ids from %s", len(names), path)
     return names
+
+
+def ids_by_name(names: dict[int, str]) -> dict[str, int]:
+    """name → v1 id (the smallest, if the v1 database had duplicates)."""
+    out: dict[str, int] = {}
+    for old_id, name in sorted(names.items()):
+        out.setdefault(name, old_id)
+    return out
 
 
 def _to(path: str, **params) -> RedirectResponse:
@@ -73,15 +81,11 @@ def explorer_citation_pages(request: Request, normalized_sha1: str, page_id: int
 def explorer_template_report(request: Request, old_template_id: int, parameter_key: str = "", parameter_value: str = ""):
     key, value = parameter_key.strip(), parameter_value.strip()
     name = request.app.state.legacy_template_names.get(old_template_id)
-    new_id = None
     if name is not None:
-        with request.app.state.db.connect() as con:
-            new_id = con.execute(text(
-                "SELECT w.id FROM wiki_templates w JOIN domains d ON d.id = w.domain WHERE d.value = :d AND w.name = :n "
-                "ORDER BY w.id LIMIT 1"), {"d": request.app.state.settings.default_domain, "n": name}).scalar()
-    if new_id is not None:
-        return _to(f"/templates/{new_id}/report", parameter_key=key, parameter_value=value)
-    return _to("/templates/report", legacy_id=old_template_id, template_name=name, parameter_key=key, parameter_value=value)
+        return _to("/templates/report", domain=request.app.state.settings.default_domain, template=name,
+                   parameter_key=key, parameter_value=value)
+    # no id table (or an id it lacks): the report page explains
+    return _to("/templates/report", legacy_id=old_template_id, parameter_key=key, parameter_value=value)
 
 
 @router.get("/api/v1/docs")

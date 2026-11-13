@@ -43,6 +43,7 @@ def create_app(settings: Settings | None = None, *, title_resolver=resolve_title
     app.state.settings = settings
     app.state.title_resolver = title_resolver
     app.state.legacy_template_names = legacy.load_template_names(settings.legacy_template_ids)
+    app.state.legacy_template_ids_by_name = legacy.ids_by_name(app.state.legacy_template_names)
     if settings.cors_origins:
         app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_methods=["GET"], allow_headers=["*"])
 
@@ -74,13 +75,12 @@ def create_app(settings: Settings | None = None, *, title_resolver=resolve_title
             return FileResponse(frontend_dir / "index.html")
 
         # report pages (reports.js reads the path): citation history, pages citing a
-        # citation, and template-parameter matches; /templates/report is the landing
-        # page for an old explorer template link whose id could not be mapped
+        # citation, and template-parameter matches (?domain=&template=&parameter_key=&
+        # parameter_value=; with ?legacy_id= it explains an old link it cannot follow)
         def report_page():
             return FileResponse(frontend_dir / "reports.html")
 
-        for path in ("/citations/{normalized_sha1}", "/citations/{normalized_sha1}/pages",
-                     "/templates/{wiki_template_id}/report", "/templates/report"):
+        for path in ("/citations/{normalized_sha1}", "/citations/{normalized_sha1}/pages", "/templates/report"):
             app.add_api_route(path, report_page, methods=["GET"], include_in_schema=False)
 
     return app

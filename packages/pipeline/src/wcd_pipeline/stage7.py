@@ -87,7 +87,7 @@ _GS_COLS = ("global_source_id", "match_type", "confidence", "canonical_part_sha1
             "extracted_wikidata_qid", "extracted_url")
 
 
-_GS_DDL = ("global_source_id varchar(16), match_type varchar, confidence double precision, canonical_part_sha1 char(40), "
+_GS_DDL = ("global_source_id varchar(64), match_type varchar, confidence double precision, canonical_part_sha1 char(40), "
            "source_type varchar, author_key varchar, year varchar, title text, extracted_doi varchar, "
            "extracted_isbn varchar, extracted_pmid varchar, extracted_pmc varchar, extracted_arxiv varchar, "
            "extracted_wikidata_qid varchar, extracted_url text")
@@ -129,7 +129,7 @@ def step_a(pg, con, domain: str, parquet_base: str) -> int:
 
 _CSR_COLS = ["normalized_id", "part_index", "page_id", "global_source_id", "source_type", "match_type", "confidence",
              "is_canonical"]
-_CSR_DDL = ("normalized_id integer, part_index integer, page_id integer, global_source_id varchar(16), "
+_CSR_DDL = ("normalized_id integer, part_index integer, page_id integer, global_source_id varchar(64), "
             "source_type varchar, match_type varchar, confidence double precision, is_canonical boolean")
 # A part_sha1 can belong to several normalized citations; the ones with an instance
 # on that page are the denorm rows of (page_id, part_sha1) (citation_instances ⋈
@@ -256,7 +256,7 @@ _PSS_GS_COLS = ["author_key", "year", "title", "extracted_doi", "extracted_isbn"
 
 _PSS_COLS = ["page_id", "global_source_id", "source_type", "match_type", "confidence", "first_rev_id", "first_seen",
              "last_rev_id", "last_seen", "n_citations", "n_revisions_cited", "n_self_closing_uses", "is_current"]
-_PSS_DDL = ("page_id integer, global_source_id varchar(16), source_type varchar, match_type varchar, "
+_PSS_DDL = ("page_id integer, global_source_id varchar(64), source_type varchar, match_type varchar, "
             "confidence double precision, first_rev_id bigint, first_seen timestamp, last_rev_id bigint, "
             "last_seen timestamp, n_citations integer, n_revisions_cited integer, n_self_closing_uses integer, "
             "is_current boolean")

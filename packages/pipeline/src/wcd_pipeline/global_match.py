@@ -43,9 +43,11 @@ import pyarrow.parquet as pq
 from rapidfuzz import fuzz, process
 
 from wcd_schema import parquet as layout
+from wcd_schema.ids import qualify_global_source_id, qualify_global_source_id_sql
 from wcd_semantic import match_global as vendored
 
 from .config import duckdb_connect
+from .config import run_id as run_id_from_env
 
 HARD_SIGNALS = (("doi", "extracted_doi", 1.00), ("isbn", "extracted_isbn", 0.95), ("pmid", "extracted_pmid", 0.95),
                 ("pmc", "extracted_pmc", 0.95), ("arxiv", "extracted_arxiv", 0.95),
@@ -233,7 +235,7 @@ def run_global_scaled(parquet_base: str, domain: str, threshold: int = vendored.
             "seconds": round(time.time() - t0, 1)}
 
 
-def _multi_ids(con) -> pa.Table:
+def _multi_ids(con, run_id: str | None = None) -> pa.Table:
     """global_source_id (sha1 of the sorted member ids) and the sorted page ids
     of every multi-member component, streamed in (root, merged_source_id) order.
     DuckDB's ordered and list aggregates hold every group in memory, which the
@@ -243,7 +245,7 @@ def _multi_ids(con) -> pa.Table:
 
     def flush():
         roots.append(cur_root)
-        gids.append(hashlib.sha1(("global:" + "|".join(members)).encode()).hexdigest()[:16])
+        gids.append(qualify_global_source_id(hashlib.sha1(("global:" + "|".join(members)).encode()).hexdigest()[:16], run_id))
         ps = sorted(pages)
         n_pages.append(len(ps))
         page_ids.append("[" + ", ".join(map(str, ps)) + "]")
@@ -265,11 +267,14 @@ def _multi_ids(con) -> pa.Table:
 
 
 def _build(con, parquet_base: str, domain: str) -> int:
+    run_id = run_id_from_env()
+    # a singleton's id: the UVA hash of its one member, qualified by the run id (if any)
+    singleton_id = qualify_global_source_id_sql("left(sha1('global:' || s.merged_source_id), 16)", run_id)
     # a source in no multi-member component is its own global source (root = its idx)
     con.execute("""CREATE TEMP TABLE m AS
         SELECT ms.idx, COALESCE(c.root, ms.idx) AS root, ms.merged_source_id, ms.page_id
         FROM ms LEFT JOIN comp_in c USING (idx)""")
-    con.register("multi_ids", _multi_ids(con))
+    con.register("multi_ids", _multi_ids(con, run_id))
     con.execute("""CREATE TEMP TABLE comp AS
         SELECT c.root, count(*) AS n_members, sum(ms.n_total_citations) AS n_total, min(c.idx) AS first_idx
         FROM comp_in c JOIN ms USING (idx) GROUP BY c.root""")
@@ -316,7 +321,7 @@ def _build(con, parquet_base: str, domain: str) -> int:
             LEFT JOIN edge_in e USING (root)
             LEFT JOIN canon_type t ON t.canonical_sha1 IS NOT DISTINCT FROM k.canonical_sha1
             UNION ALL
-            SELECT left(sha1('global:' || s.merged_source_id), 16), 'singleton', CAST(NULL AS DOUBLE),
+            SELECT {singleton_id}, 'singleton', CAST(NULL AS DOUBLE),
                    CAST(1 AS INTEGER), '[' || CAST(s.page_id AS VARCHAR) || ']',
                    s.canonical_sha1, t.source_type,
                    s.author_key, s.year, s.title, s.extracted_doi, s.extracted_isbn, s.extracted_pmid,

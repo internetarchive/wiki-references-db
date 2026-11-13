@@ -7,6 +7,7 @@ inputs, so no stage ever needs another stage's sequence values.
 from __future__ import annotations
 
 import hashlib
+import re
 import struct
 from typing import Iterable
 
@@ -64,10 +65,57 @@ def template_search_bucket_sql(name_expr: str, key_expr: str, value_expr: str) -
     return f"CAST(('0x' || left(md5({joined}), 8))::UBIGINT % {TEMPLATE_SEARCH_BUCKETS} AS INTEGER)"
 
 
-def global_source_id(member_ids: Iterable[str]) -> str:
-    """``global_sources.global_source_id`` (UVA): ``sha1("global:" + "|".join(sorted(members)))[:16]``."""
+#: a build run's identifier, as it prefixes global source ids: lowercase letters, digits,
+#: ``-`` and ``_`` (no ``.``, which separates it from the hash), at most 40 characters
+RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+#: between the run id and the hash in a run-qualified global source id
+GLOBAL_SOURCE_RUN_SEP = "."
+#: room for ``<run id>.<16 hex>`` (the Postgres columns are varchar of this length)
+GLOBAL_SOURCE_ID_MAX_LEN = 64
+
+
+def check_run_id(run_id: str | None) -> str | None:
+    """``run_id`` if valid (None and "" mean an unqualified run), else ValueError."""
+    if not run_id:
+        return None
+    if not RUN_ID_PATTERN.match(run_id):
+        raise ValueError(f"run id {run_id!r} must match {RUN_ID_PATTERN.pattern}")
+    return run_id
+
+
+def qualify_global_source_id(hash16: str, run_id: str | None) -> str:
+    """``<run_id>.<hash16>``, or the bare hash when the run has no id.
+
+    Global source ids are interim, per-build handles (a source's membership, and
+    so its hash, can change between builds). Builds made with ``WCD_RUN_ID`` set
+    qualify them with the run id; bare ids are the build that predates run ids
+    (the 2026-11 enwiki build). Two runs that form the same component get the
+    same hash, so the suffix still compares across runs."""
+    run_id = check_run_id(run_id)
+    return f"{run_id}{GLOBAL_SOURCE_RUN_SEP}{hash16}" if run_id else hash16
+
+
+def qualify_global_source_id_sql(hash_expr: str, run_id: str | None) -> str:
+    """``qualify_global_source_id`` in SQL (DuckDB or Postgres); ``hash_expr`` is an expression."""
+    run_id = check_run_id(run_id)
+    return f"('{run_id}{GLOBAL_SOURCE_RUN_SEP}' || {hash_expr})" if run_id else hash_expr
+
+
+def split_global_source_id(gid: str) -> tuple[str | None, str]:
+    """(run id or None, hash) of a global source id."""
+    run_id, sep, hash16 = gid.rpartition(GLOBAL_SOURCE_RUN_SEP)
+    return (run_id, hash16) if sep else (None, gid)
+
+
+def global_source_hash(member_ids: Iterable[str]) -> str:
+    """UVA's global source hash: ``sha1("global:" + "|".join(sorted(members)))[:16]``."""
     joined = "|".join(sorted(member_ids))
     return hashlib.sha1(f"global:{joined}".encode("utf-8")).hexdigest()[:16]
+
+
+def global_source_id(member_ids: Iterable[str], run_id: str | None = None) -> str:
+    """``global_sources.global_source_id``: the UVA hash, qualified by the run id when there is one."""
+    return qualify_global_source_id(global_source_hash(member_ids), run_id)
 
 
 def ref_source_id(page_id: int, root_part_sha1: str) -> str:

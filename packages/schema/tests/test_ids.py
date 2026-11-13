@@ -58,3 +58,21 @@ def test_template_search_bucket_duckdb_matches_python(name, key, value):
 def test_template_search_buckets_spread():
     buckets = {ids.template_search_bucket("Cite web", "url", f"https://example.org/{i}") for i in range(5000)}
     assert len(buckets) > 500   # nearly all 512 used by 5,000 values of one template/key
+
+
+def test_run_qualified_global_source_ids():
+    import hashlib
+    bare = hashlib.sha1(b"global:a|b").hexdigest()[:16]
+    assert ids.global_source_id(["b", "a"], None) == ids.global_source_id(["b", "a"], "") == bare
+    q = ids.global_source_id(["b", "a"], "enwiki-20261101")
+    assert q == "enwiki-20261101." + bare and len(q) <= ids.GLOBAL_SOURCE_ID_MAX_LEN
+    assert ids.split_global_source_id(q) == ("enwiki-20261101", bare)
+    assert ids.split_global_source_id(bare) == (None, bare)
+    for bad in ("EN", "a.b", "-x", "x" * 41, "a b"):
+        with pytest.raises(ValueError):
+            ids.check_run_id(bad)
+    # the SQL form agrees with Python
+    con = duckdb.connect()
+    expr = ids.qualify_global_source_id_sql("left(sha1('global:a|b'), 16)", "run_1")
+    assert con.execute(f"SELECT {expr}").fetchone()[0] == "run_1." + bare
+    assert ids.qualify_global_source_id_sql("h", None) == "h"

@@ -13,11 +13,11 @@ from sqlalchemy import text
 from wcd_schema.ids import page_bucket
 
 from ..db import Database
+# the V1 models are the v2 shapes plus citation_instance_id / wiki_template_id; v2 routes drop those fields
 from ..models import (
-    CitationAtRevision, CitationDetailResponse, CitationHistoryResponse, CitationPage, CitationPagesResponse, ExtractedLink,
-    GlobalPart, HistoryEntry,
-    InstanceRef, PageCitationsResponse, PageRef, PageRevisionsResponse, Part, PartResolution, RevisionItem,
-    RevisionRef, TemplateUse,
+    CitationHistoryResponse, CitationPage, CitationPagesResponse, ExtractedLink, GlobalPart, HistoryEntry, PageRef,
+    PageRevisionsResponse, Part, PartResolution, RevisionItem, RevisionRef, V1CitationAtRevision, V1CitationDetailResponse,
+    V1InstanceRef, V1PageCitationsResponse, V1TemplateUse,
 )
 from . import BadRequest, NotFound
 from .common import TYPE_LABELS, page_titles, page_url, require_domain_id
@@ -71,18 +71,19 @@ def get_revisions(db: Database, domain: str, page_id: int, limit: int = 100, off
 def _links(con, nc_ids: list[int]) -> dict[int, list[ExtractedLink]]:
     out = defaultdict(list)
     if nc_ids:
-        for nid, wid, url in con.execute(text(
-                "SELECT l.normalized_id, w.id, w.url FROM normalized_citation_web_resources l "
+        for nid, url in con.execute(text(
+                "SELECT l.normalized_id, w.url FROM normalized_citation_web_resources l "
                 "JOIN web_resources w ON w.id = l.web_resource_id WHERE l.normalized_id = ANY(:ids) ORDER BY w.url"),
                 {"ids": nc_ids}).all():
-            out[nid].append(ExtractedLink(web_resource_id=wid, url=url))
+            out[nid].append(ExtractedLink(url=url))
     return out
 
 
-def _templates(db: Database, con, domain: str, page_id: int, sha_by_id: dict[int, str]) -> dict[int, list[TemplateUse]]:
+def _templates(db: Database, domain: str, page_id: int, sha_by_id: dict[int, str]) -> dict[int, list[V1TemplateUse]]:
     """Template uses of the normalized citations ``sha_by_id`` (id → sha1) as
     cited on ``(domain, page_id)``, from the page's ``template_params``
-    partition; template ids from ``wiki_templates``."""
+    partition. Templates are named, not numbered (``wiki_templates.id`` is a
+    load-order row id)."""
     out = defaultdict(list)
     if not sha_by_id:
         return out
@@ -96,16 +97,11 @@ def _templates(db: Database, con, domain: str, page_id: int, sha_by_id: dict[int
             "ORDER BY normalized_sha1, offset_start, parameter_key", [page_id, list(id_by_sha)]).fetchall()
     finally:
         duck.close()
-    names = sorted({r[1] for r in rows})
-    tpl_ids = dict(con.execute(text(
-        "SELECT w.name, w.id FROM wiki_templates w JOIN domains d ON d.id = w.domain WHERE d.value = :d AND w.name = ANY(:n)"),
-        {"d": domain, "n": names}).all()) if names else {}
     grouped: dict[tuple, dict] = {}
     for sha, name, offset, key, value in rows:
-        if name in tpl_ids:
-            grouped.setdefault((id_by_sha[sha], tpl_ids[name], name, offset), {})[key] = value
-    for (nid, wt_id, name, _off), params in sorted(grouped.items(), key=lambda kv: (kv[0][0], kv[0][3])):
-        out[nid].append(TemplateUse(wiki_template_id=wt_id, template_name=name, parameters=params))
+        grouped.setdefault((id_by_sha[sha], name, offset), {})[key] = value
+    for (nid, name, _off), params in sorted(grouped.items(), key=lambda kv: (kv[0][0], kv[0][2])):
+        out[nid].append(V1TemplateUse(template_name=name, parameters=params))
     return out
 
 
@@ -209,7 +205,7 @@ def get_citations(db: Database, domain: str, page_id: int, revision_id: int | No
         if not raw:
             sha_by_id = {v["nc_id"]: v["normalized_sha1"] for v in inst.values()}
             links, parts, others = _links(con, nc_ids), _parts(con, nc_ids, domain_id, page_id), _other_articles(con, nc_ids)
-            templates = _templates(db, con, domain, page_id, sha_by_id)
+            templates = _templates(db, domain, page_id, sha_by_id)
 
     citations = []
     for cid, first_id, last_id, n, in_next in page_rows:
@@ -219,7 +215,7 @@ def get_citations(db: Database, domain: str, page_id: int, revision_id: int | No
         removed = None
         if next_rev is not None and not in_next:
             removed = RevisionRef(revision_id=next_rev, revision_timestamp=ts.get(next_rev))
-        item = CitationAtRevision(
+        item = V1CitationAtRevision(
             citation_instance_id=str(cid), raw_sha1=i["raw_sha1"],
             reference_type=TYPE_LABELS.get(i["reference_type"], str(i["reference_type"])), reference_name=i["reference_name"],
             first_seen=RevisionRef(revision_id=first_id, revision_timestamp=ts.get(first_id)),
@@ -235,7 +231,7 @@ def get_citations(db: Database, domain: str, page_id: int, revision_id: int | No
             item.templates = templates.get(i["nc_id"], [])
             item.parts = [Part(**{k: v for k, v in p.items() if k != "normalized_id"}) for p in parts.get(i["nc_id"], [])]
         citations.append(item)
-    return PageCitationsResponse(domain=domain, page_id=page_id, revision_id=revision_id, revision_timestamp=ts[revision_id],
+    return V1PageCitationsResponse(domain=domain, page_id=page_id, revision_id=revision_id, revision_timestamp=ts[revision_id],
                                  citation_count=total, citations=citations)
 
 
@@ -274,7 +270,7 @@ def _history(db: Database, con, instances: list[dict], page_filter: tuple[str, i
 
 def _instances(con, nc_id: int) -> list[dict]:
     return [dict(r) for r in con.execute(text(
-        "SELECT ci.id, d.value AS domain, ci.page_id, ci.reference_name, ci.reference_type FROM citation_instances ci "
+        "SELECT ci.id, d.value AS domain, ci.page_id, ci.raw_sha1, ci.reference_name, ci.reference_type FROM citation_instances ci "
         "JOIN domains d ON d.id = ci.domain_id WHERE ci.normalized_id = :n ORDER BY d.value, ci.page_id, ci.id"),
         {"n": nc_id}).mappings().all()]
 
@@ -288,17 +284,17 @@ def get_citation(db: Database, normalized_sha1: str) -> CitationDetailResponse:
         instances = _instances(con, nc["id"])
         links = _links(con, [nc["id"]])
         # template parameters are a function of the normalized text: any page citing it has them
-        templates = (_templates(db, con, instances[0]["domain"], instances[0]["page_id"], {nc["id"]: nc["normalized_sha1"]})
+        templates = (_templates(db, instances[0]["domain"], instances[0]["page_id"], {nc["id"]: nc["normalized_sha1"]})
                      if instances else {})
         parts, resolutions = _parts(con, [nc["id"]], None, None), _resolutions(con, [nc["id"]])
         history = _history(db, con, instances, None)
     pages = sorted({(i["domain"], i["page_id"]) for i in instances})
     with db.connect() as con:
         titles = page_titles(con, pages)
-    return CitationDetailResponse(
+    return V1CitationDetailResponse(
         normalized_sha1=nc["normalized_sha1"], reference_normalized=nc["reference_normalized"], citation_type=nc["citation_type"],
         appears_on_articles=[PageRef(domain=d, page_id=p, page_title=titles.get((d, p))) for d, p in pages],
-        instances=[InstanceRef(domain=i["domain"], page_id=i["page_id"], citation_instance_id=str(i["id"]), reference_name=i["reference_name"],
+        instances=[V1InstanceRef(domain=i["domain"], page_id=i["page_id"], raw_sha1=i["raw_sha1"], citation_instance_id=str(i["id"]), reference_name=i["reference_name"],
                                reference_type=TYPE_LABELS.get(i["reference_type"], str(i["reference_type"]))) for i in instances],
         extracted_links=links.get(nc["id"], []), templates=templates.get(nc["id"], []),
         parts=[GlobalPart(**{k: v for k, v in p.items() if k != "normalized_id"},

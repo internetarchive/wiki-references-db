@@ -25,6 +25,28 @@ def source_label(row) -> str:
     return f"Source {row['global_source_id']}"
 
 
+#: standardized identifiers in source-key order: intrinsic ids of the work first, then the
+#: knowledge-base items (created later, LibraryBase as the assigner of last resort), then the
+#: URL — so a key only ever moves toward a more standard identifier. (scheme, column)
+SOURCE_KEY_ORDER = (
+    ("doi", "extracted_doi"), ("isbn", "extracted_isbn"), ("pmid", "extracted_pmid"), ("pmc", "extracted_pmc"),
+    ("arxiv", "extracted_arxiv"), ("wikidata", "extracted_wikidata_qid"), ("librarybase", "extracted_librarybase_id"),
+    ("url", "extracted_url"),
+)
+#: the fallback key: a content hash of the source's canonical part
+SOURCE_KEY_FALLBACK = ("part", "canonical_part_sha1")
+
+
+def source_key(row) -> str | None:
+    """``scheme:value`` of the first standardized identifier the source has, else
+    ``part:<canonical_part_sha1>``; None if the row carries neither."""
+    for scheme, col in SOURCE_KEY_ORDER + (SOURCE_KEY_FALLBACK,):
+        v = row.get(col)
+        if v is not None and str(v).strip():
+            return f"{scheme}:{str(v).strip()}"
+    return None
+
+
 def page_titles(con: Connection, pages) -> dict[tuple[str, int], str]:
     """Titles from ``page_metadata`` for ``(domain, page_id)`` pairs, in one query."""
     pairs = sorted({(d, int(p)) for d, p in pages})
