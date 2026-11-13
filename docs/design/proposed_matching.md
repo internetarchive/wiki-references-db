@@ -100,7 +100,7 @@ Signals kept: doi 1.00 / isbn .95 / pmid .95 (+ pmc / arxiv / wikidata_qid .95) 
 
 ## Stage 6d: Cross-Page Matching — UVA `cross_page_matcher.py`
 
-Kept: hard-id groupby (doi 1.00, isbn/pmid .95, + pmc/arxiv/qid .95), author+year fuzzy with title threshold 85 and `author_key[:4]`+year blocking, no URL cross-page, hard-id sources excluded from fuzzy, deterministic `global_source_id = sha1("global:" + "|".join(sorted(members)))[:16]`, canonical member by UVA `_id_priority` (identifier quality, then citation count), `confidence = None` for singletons.
+Kept: hard-id groupby (doi 1.00, isbn/pmid .95, + pmc/arxiv/qid .95), author+year fuzzy with title threshold 85 and `author_key[:4]`+year blocking, no URL cross-page, hard-id sources excluded from fuzzy, deterministic `global_source_id = sha1("global:" + "|".join(sorted(members)))[:16]` (prefixed `<run id>.` when the build sets `WCD_RUN_ID`, 2026-11-13: an interim per-build handle; `ids.qualify_global_source_id`), canonical member by UVA `_id_priority` (identifier quality, then citation count), `confidence = None` for singletons.
 
 Also kept: **`_compute_score`** (reliability score + verdict) — but it is *called* in Stage 7f, not here, so scoring is a materialization step with its own validation gate rather than a side effect of matching. `load_merged_sources` gains the three identifier columns and reads `id_tier`, `year_reliable`, `norm_subtype` of the canonical member from `normalized_citation_parts` (UVA reads them from `ref_tag_normalized`).
 

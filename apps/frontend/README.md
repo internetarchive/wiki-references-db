@@ -40,8 +40,9 @@ Ported from the v1 Citation Explorer (`legacy/explorer.py`):
     one page or (for citations on ≤ 25 pages) every page. Was `/explorer/citation/{sha1}/report`.
   * `/citations/{sha1}/pages?domain=&page_id=` — the pages citing it, by title, the
     current page highlighted. Was `/explorer/citation/{sha1}/other-articles`.
-  * `/templates/{id}/report?parameter_key=&parameter_value=` — citations whose template
-    has that parameter value ("Find matches" on a parameter). Was `/explorer/template/{id}/report`.
+  * `/templates/report?domain=&template=&parameter_key=&parameter_value=` — citations whose
+    template (by name) has that parameter value ("Find matches" on a parameter). Was
+    `/explorer/template/{id}/report`.
   * `/templates/report?legacy_id=…` — landing page for an old template link whose id
     could not be translated.
 * `?url=<article URL>` loads a page by URL (old `/explorer/article?url=` links redirect here).
