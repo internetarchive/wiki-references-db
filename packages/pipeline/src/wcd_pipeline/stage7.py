@@ -358,17 +358,27 @@ def step_e(pg) -> int:
     return n
 
 
-# wcd_semantic.scoring.compute_score as one UPDATE: the same terms, with Python's
+# wcd_semantic.scoring.compute_score set-based: the same terms, with Python's
 # truthiness (NULL and '' are false) and its `x or ''` / `x or 0` defaults; the
 # canonical part is the first by (normalized_id, part_index) with that sha1, as the
 # per-row LATERAL lookup chose it. test_stage7_score holds it to compute_score.
-_SCORE_SQL = """
-WITH canon AS (
-    SELECT DISTINCT ON (part_sha1) part_sha1, id_tier, year_reliable, norm_subtype
-    FROM normalized_citation_parts
-    WHERE part_sha1 IN (SELECT canonical_part_sha1 FROM global_sources)
-    ORDER BY part_sha1, normalized_id, part_index
-), s AS (
+# Three statements, each over a table whose size the planner knows: as one
+# statement it estimated the distinct canonical sha1s at ~2M (~100M on enwiki)
+# and hash-joined and hash-aggregated far past work_mem for hours.
+_SCORE_CANON_SQL = """
+CREATE TEMP TABLE score_canon ON COMMIT DROP AS
+SELECT DISTINCT ON (part_sha1) part_sha1, id_tier, year_reliable, norm_subtype
+FROM normalized_citation_parts
+ORDER BY part_sha1, normalized_id, part_index
+"""
+_SCORE_S_SQL = """
+CREATE TEMP TABLE score_s ON COMMIT DROP AS
+SELECT global_source_id, score::double precision AS score,
+       CASE WHEN tmpl THEN 'high_confidence' WHEN tiered THEN 'high_confidence'
+            WHEN noise THEN 'likely_not_citation' WHEN score >= 50 THEN 'high_confidence'
+            WHEN score >= 25 THEN 'medium_confidence' WHEN score >= 10 THEN 'low_confidence'
+            ELSE 'questionable' END AS verdict
+FROM (
     SELECT gs.global_source_id,
            coalesce(gs.source_type, '') IN ('template', 'both') AS tmpl,
            coalesce(c.id_tier, 0) > 0 AS tiered,
@@ -383,28 +393,32 @@ WITH canon AS (
                WHEN 'arxiv' THEN 10 WHEN 'wikidata_qid' THEN 10 WHEN 'url' THEN 8 WHEN 'author_year' THEN 5
                WHEN 'title_fuzzy' THEN 3 WHEN 'strong_author_fuzzy' THEN 3 WHEN 'author_title_fuzzy' THEN 3
                ELSE 0 END AS score
-    FROM global_sources gs LEFT JOIN canon c ON c.part_sha1 = gs.canonical_part_sha1
-)
-UPDATE global_sources g
-SET reliability_score = s.score::double precision,
-    verdict = CASE WHEN s.tmpl THEN 'high_confidence' WHEN s.tiered THEN 'high_confidence'
-                   WHEN s.noise THEN 'likely_not_citation' WHEN s.score >= 50 THEN 'high_confidence'
-                   WHEN s.score >= 25 THEN 'medium_confidence' WHEN s.score >= 10 THEN 'low_confidence'
-                   ELSE 'questionable' END
-FROM s WHERE g.global_source_id = s.global_source_id
+    FROM global_sources gs LEFT JOIN score_canon c ON c.part_sha1 = gs.canonical_part_sha1
+) t
+"""
+_SCORE_UPDATE_SQL = """
+UPDATE global_sources g SET reliability_score = s.score, verdict = s.verdict
+FROM score_s s WHERE g.global_source_id = s.global_source_id
 """
 
 
 def step_f(pg, dsn: str) -> int:
     """Score every global source from its own columns plus the canonical
     member's ``id_tier`` / ``year_reliable`` / ``norm_subtype`` (parts on
-    ``canonical_part_sha1``; the same content has the same fields): one
-    set-based UPDATE (on enwiki ~131M sources; a server cursor, a LATERAL
-    lookup and a Python call per source would take hours)."""
+    ``canonical_part_sha1``; the same content has the same fields), set-based
+    (on enwiki ~122M sources; a server cursor, a LATERAL lookup and a Python
+    call per source would take hours): the canonical part per sha1 and the
+    scores go into analyzed temp tables, and the scores merge-join
+    global_sources in key order, as 7e's counts do."""
     with pg.cursor() as cur:
-        # its hash joins hold ~100M rows on enwiki: fewer, larger batches
         cur.execute(f"SET LOCAL work_mem = '{STAGE7_WORK_MEM}'")
-        cur.execute(_SCORE_SQL)
+        cur.execute(_SCORE_CANON_SQL)
+        cur.execute("ANALYZE score_canon")
+        cur.execute(_SCORE_S_SQL)
+        cur.execute("ANALYZE score_s")
+        cur.execute("SET LOCAL enable_hashjoin = off")
+        cur.execute("SET LOCAL enable_hashagg = off")
+        cur.execute(_SCORE_UPDATE_SQL)
         n = cur.rowcount
     pg.commit()
     return n
