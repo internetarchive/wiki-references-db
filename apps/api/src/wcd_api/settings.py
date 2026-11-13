@@ -35,6 +35,12 @@ class Settings:
     user_agent: str = "WikipediaCitationsDatabase/2.0"
     contact_email: str | None = None
     pool_size: int = 5
+    #: optional TSV ``old_id<TAB>name`` exported from the v1 database's wiki_templates, so old
+    #: ``/explorer/template/{id}/report`` links can be redirected (template ids were renumbered)
+    legacy_template_ids: str | None = None
+    #: the run that bare (unprefixed) global source ids belong to, reported as ``run_id``
+    #: (builds made with WCD_RUN_ID prefix their ids ``<run id>.``)
+    base_run_id: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -50,4 +56,6 @@ class Settings:
             user_agent=os.getenv("WIKIPEDIA_API_USER_AGENT", "WikipediaCitationsDatabase/2.0"),
             contact_email=os.getenv("WIKIPEDIA_API_CONTACT_EMAIL") or os.getenv("CONTACT_EMAIL"),
             pool_size=int(os.getenv("API_POOL_SIZE", "5")),
+            legacy_template_ids=os.getenv("API_LEGACY_TEMPLATE_IDS") or None,
+            base_run_id=os.getenv("API_BASE_RUN_ID") or None,
         )

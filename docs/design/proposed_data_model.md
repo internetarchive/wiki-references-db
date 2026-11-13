@@ -206,7 +206,7 @@ Hash-collision note for `citation_instances.id`: a 64-bit hash over N instances 
 
 ```sql
 global_sources (
-    global_source_id      VARCHAR PRIMARY KEY,        -- UVA: sha1("global:"+sorted members)[:16]
+    global_source_id      VARCHAR(64) PRIMARY KEY,    -- UVA: sha1("global:"+sorted members)[:16], prefixed "<WCD_RUN_ID>." when set (interim, per-build; see proposed_api.md principle 5)
     match_type            VARCHAR,          -- 'doi','isbn','pmid','pmc','arxiv','wikidata_qid',
                                             -- 'author_year_fuzzy','singleton'
     confidence            DOUBLE PRECISION, -- NULL for singletons (UVA semantics)

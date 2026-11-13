@@ -42,6 +42,23 @@ def page_top_sources(request: Request, domain: str, page_id: int = Path(..., ge=
     return pages.get_top_sources(_db(request), domain, page_id, limit)
 
 
+@router.get("/sources", response_model=models.SourceLookupResponse, tags=["sources"])
+def source_lookup(request: Request,
+                  doi: str | None = Query(None), isbn: str | None = Query(None, description="ISBN-10 or ISBN-13 (both forms are tried)"),
+                  pmid: str | None = Query(None), pmc: str | None = Query(None, description="with or without the PMC prefix"),
+                  arxiv: str | None = Query(None),
+                  wikidata: str | None = Query(None, description="Wikidata item id (Q…)"),
+                  librarybase: str | None = Query(None, description="LibraryBase item id (Q…), not a Wikidata id"),
+                  url: str | None = Query(None),
+                  key: str | None = Query(None, description="a source_key, scheme:value (e.g. doi:10.1093/mnras/108.3.252, part:<sha1>)"),
+                  limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0)):
+    """Global sources by standardized identifier: the durable way to refer to a source
+    (``global_source_id`` is a per-build handle). Exactly one identifier parameter."""
+    return sources.lookup_sources(_db(request), {"doi": doi, "isbn": isbn, "pmid": pmid, "pmc": pmc, "arxiv": arxiv,
+                                                 "wikidata": wikidata, "librarybase": librarybase, "url": url, "key": key},
+                                  limit, offset)
+
+
 @router.get("/sources/{global_source_id}", response_model=models.GlobalSourceResponse, tags=["sources"])
 def source(request: Request, global_source_id: str = Path(..., min_length=1)):
     return sources.get_source(_db(request), global_source_id)
@@ -77,16 +94,26 @@ def citation(request: Request, normalized_sha1: str = Path(..., min_length=40, m
 
 @router.get("/citations/{normalized_sha1}/history", response_model=models.CitationHistoryResponse, tags=["citations"])
 def citation_history(request: Request, normalized_sha1: str = Path(..., min_length=40, max_length=40),
-                     domain: str | None = Query(None), page_id: int | None = Query(None)):
-    return citations.get_citation_history(_db(request), normalized_sha1, domain, page_id)
+                     domain: str | None = Query(None), page_id: int | None = Query(None),
+                     limit: int = Query(1000, ge=1, le=10000), offset: int = Query(0, ge=0)):
+    return citations.get_citation_history(_db(request), normalized_sha1, domain, page_id, limit, offset)
+
+
+@router.get("/citations/{normalized_sha1}/pages", response_model=models.CitationPagesResponse, tags=["citations"])
+def citation_pages(request: Request, normalized_sha1: str = Path(..., min_length=40, max_length=40),
+                   limit: int = Query(100, ge=0, le=1000), offset: int = Query(0, ge=0)):
+    return citations.get_citation_pages(_db(request), normalized_sha1, limit, offset)
 
 
 # Group 4 -------------------------------------------------------------------
 
-@router.get("/templates/{wiki_template_id}/report", response_model=models.TemplateReportResponse, tags=["lookup"])
-def template_report(request: Request, wiki_template_id: int, parameter_key: str = Query(...), parameter_value: str = Query(...),
+@router.get("/templates/report", response_model=models.TemplateReportResponse, tags=["lookup"])
+def template_report(request: Request, domain: str = Query(..., examples=["en.wikipedia.org"]),
+                    template: str = Query(..., description="template name, e.g. Cite journal (normalized like the "
+                                                             "extractor: underscores → spaces, first letter capitalized)"),
+                    parameter_key: str = Query(...), parameter_value: str = Query(...),
                     limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
-    return lookup.get_template_report(_db(request), wiki_template_id, parameter_key, parameter_value, limit, offset)
+    return lookup.get_template_report(_db(request), domain, template, parameter_key, parameter_value, limit, offset)
 
 
 @router.get("/web-resources", response_model=models.WebResourceResponse, tags=["lookup"])

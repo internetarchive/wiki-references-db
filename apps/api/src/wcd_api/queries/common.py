@@ -25,6 +25,40 @@ def source_label(row) -> str:
     return f"Source {row['global_source_id']}"
 
 
+#: standardized identifiers in source-key order: intrinsic ids of the work first, then the
+#: knowledge-base items (created later, LibraryBase as the assigner of last resort), then the
+#: URL — so a key only ever moves toward a more standard identifier. (scheme, column)
+SOURCE_KEY_ORDER = (
+    ("doi", "extracted_doi"), ("isbn", "extracted_isbn"), ("pmid", "extracted_pmid"), ("pmc", "extracted_pmc"),
+    ("arxiv", "extracted_arxiv"), ("wikidata", "extracted_wikidata_qid"), ("librarybase", "extracted_librarybase_id"),
+    ("url", "extracted_url"),
+)
+#: the fallback key: a content hash of the source's canonical part
+SOURCE_KEY_FALLBACK = ("part", "canonical_part_sha1")
+
+
+def source_key(row) -> str | None:
+    """``scheme:value`` of the first standardized identifier the source has, else
+    ``part:<canonical_part_sha1>``; None if the row carries neither."""
+    for scheme, col in SOURCE_KEY_ORDER + (SOURCE_KEY_FALLBACK,):
+        v = row.get(col)
+        if v is not None and str(v).strip():
+            return f"{scheme}:{str(v).strip()}"
+    return None
+
+
+def page_titles(con: Connection, pages) -> dict[tuple[str, int], str]:
+    """Titles from ``page_metadata`` for ``(domain, page_id)`` pairs, in one query."""
+    pairs = sorted({(d, int(p)) for d, p in pages})
+    if not pairs:
+        return {}
+    rows = con.execute(text(
+        "SELECT q.dom, q.pid, m.page_title FROM unnest(CAST(:doms AS text[]), CAST(:pids AS integer[])) AS q(dom, pid) "
+        "JOIN domains d ON d.value = q.dom JOIN page_metadata m ON m.domain_id = d.id AND m.page_id = q.pid"),
+        {"doms": [d for d, _ in pairs], "pids": [p for _, p in pairs]}).all()
+    return {(r[0], r[1]): r[2] for r in rows if r[2] is not None}
+
+
 def require_domain_id(db, con: Connection, domain: str) -> int:
     did = db.domain_id(con, domain)
     if did is None:

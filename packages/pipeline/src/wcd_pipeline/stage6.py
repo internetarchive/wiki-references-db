@@ -36,10 +36,12 @@ import pyarrow.parquet as pq
 
 from wcd_schema import parquet as layout
 from wcd_schema.duckdb import bind_bucket_views
+from wcd_schema.ids import qualify_global_source_id
 from wcd_schema.parquet import SCHEMAS
 from wcd_semantic import match_global, match_reftag, match_template, merge_types
 
 from .config import duckdb_connect, load_dotenv  # noqa: F401
+from .config import run_id as config_run_id
 
 MI = "matching_intermediate/"
 BUCKET_DATASETS = ("sources", "citation_source_map", "template_sources", "template_citation_source_map",
@@ -305,6 +307,11 @@ def run_global(parquet_base: str, domain: str) -> dict:
         gs, gm, counts = pd.DataFrame(), pd.DataFrame(), {}
     else:
         gs, gm, counts = match_global.match_global(df)
+        # vendored ids are the bare UVA hash; qualify them with the run id (unchanged when unset)
+        run_id = config_run_id()
+        if run_id:
+            for frame in (gs, gm):
+                frame["global_source_id"] = frame["global_source_id"].map(lambda g: qualify_global_source_id(g, run_id))
         # the design's map carries the component's cross-page match_type / confidence
         gm = gm.merge(gs[["global_source_id", "match_type", "confidence"]], on="global_source_id", how="left")
         # source_type of the canonical member (7f needs it): the member whose

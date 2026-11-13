@@ -763,3 +763,23 @@ InternetArchiveBot needs the date a link was added to an article, to pick the ar
 **Decisions taken without asking:** emulating the bot account's request limits in the IABot port (the port itself was the user's call); leaving out the 9 largest articles; counting a link as "current" when it is in the dump's latest revision.
 
 **Open:** an API endpoint for the lookup (SCA-388), which should also read only the page's `citation_history` file (the citations endpoint takes 10 s on Albert Einstein for the same reason); keeping WCD current, since links added after the dump are unknown to it (SCA-389); throughput under concurrent lookups.
+
+## 26. Cutover preparation: explorer reports in the dashboard, and no build-dependent ids in the API (2026-11-13)
+
+**Context.** citations.scatteranalytics.com serves the v1 Flask app (`legacy/`: htmx explorer + `/api/v1`) over a June database holding one revision per page. The plan is to serve this build from the build VM, with the existing Caddy proxy pointing at it.
+
+**Explorer reports ported (branch `dashboard-reports`, 7fa63a3).** The dashboard gained a citations list (latest revision, or any revision from the timeline) linking to three report pages (`reports.html`): citation history (`/citations/{sha1}`), pages citing a citation (`/citations/{sha1}/pages`, new `GET /api/v2/citations/{sha1}/pages`) and template-parameter matches. `/explorer/…` and `/api/v1/docs` redirect (302). Found on enwiki while testing: the template report took ~60 s because `normalized_sha1 = ANY(:text[])` casts the CHAR(40) column and skips its index (now `bpchar[]`, 0.07–0.45 s); ten serving tables had never been analysed (ANALYZE, 12 s); an unscoped citation history on 122k pages took 181 s (now refused above 25 pages).
+
+**No build-dependent ids (this commit).** The API names everything by upstream ids, content hashes, names or URLs (`proposed_api.md`, principle 5):
+- templates are `(domain, name)`: `GET /api/v2/templates/report?domain=&template=…`; `wiki_template_id` is internal.
+- web resources are their URL: `web_resource_id` dropped.
+- citation instances are `(domain, page_id, raw_sha1)`: `citation_instance_id` dropped from v2, kept (as a string) in the v1 aliases until v1 is retired.
+- v1 template ids are the v1 database's, translated by name through `API_LEGACY_TEMPLATE_IDS` both ways.
+- `global_source_id` stays as the interim per-build handle, now qualified by a run id: `WCD_RUN_ID` makes 6d write `<run id>.<hash>` (both engines; bare when unset, so this build, its goldens and tests are unchanged); `run_id` is reported (`API_BASE_RUN_ID` for bare ids). Columns widened to `varchar(64)` (catalog-only on enwiki, 34 ms).
+- `source_key`: the standardized identifier (`doi`, `isbn`, `pmid`, `pmc`, `arxiv`, `wikidata`, `librarybase`, `url`, in that order), else `part:<canonical_part_sha1>`; `GET /api/v2/sources?doi=|…|key=` looks sources up by it. New indexes `idx_gs_librarybase`, `idx_gs_url` (hash), `idx_gs_canonical_part`.
+
+**Verified.** Full suite 401 (399 passed, 2 skipped) with Postgres; new tests for the v2 shapes (no row ids), template report by name, v1 template-id translation both ways, source lookup (ISBN-10/13, `key=`, `part:`, Wikidata vs LibraryBase), and both 6d engines writing identical run-qualified ids. Checked against the enwiki build after the index build.
+
+**Decisions taken without asking:** source-key order puts intrinsic identifiers before Wikidata/LibraryBase so a key only changes toward a more standard identifier (a source that gains a Wikidata item keeps its DOI key), and `url:` before the hash; the run id is a `.`-separated prefix (the hash part still compares across runs); lookups match the source's representative identifier, not every member's; `web_resource_id` is dropped from v1 too (its values never matched the v1 database's).
+
+**Open:** assigning standard identifiers (LibraryBase as assigner of last resort) and deciding which global sources become durable records; a lookup over member identifiers (parts) rather than the representative one; removing the v1 aliases.

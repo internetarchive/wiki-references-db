@@ -24,7 +24,8 @@ repository root with `.env` filled in (`example.env`).
 | `MATCH_GLOBAL_CHUNK_ROWS`, `MATCH_GLOBAL_BLOCK_ROWS` | Stage 6d | merged sources per output file of the component build (8M; memory follows it); rows of a fuzzy author+year group per rapidfuzz call (2048) |
 | `MATERIALIZE_CHUNK_ROWS`, `STAGE7_WORK_MEM` | Stage 7 | rows per COPY chunk (500k); Postgres `work_mem` of 7e/7f's whole-table UPDATEs (1GB; one backend, no parallel workers) |
 | `REVISION_BUNDLES_DIR` | Stage 1 | the `.mwrev.zst` bundles, one directory per domain |
-| `API_*`, `WIKIPEDIA_API_*` | the API | CORS, default domain, pool size, User-Agent for title lookups |
+| `WCD_RUN_ID` | Stage 6d | this build run's id (`[a-z0-9][a-z0-9_-]{0,39}`, e.g. `enwiki-20261101`); global source ids are written `<run id>.<hash>`. Unset: bare hashes, as the 2026-11 enwiki build. Set it for every new build so its ids cannot be confused with an earlier build's |
+| `API_*`, `WIKIPEDIA_API_*` | the API | CORS, default domain, pool size, User-Agent for title lookups; `API_LEGACY_TEMPLATE_IDS` (v1 template id table), `API_BASE_RUN_ID` (the run bare global source ids belong to) |
 
 Postgres 16 and Python ≥ 3.10 with `uv sync`; Rust ≥ 1.85 only to build
 RevisionChest (`cargo build --release` in `rust/revisionchest`; CI also
@@ -336,6 +337,25 @@ The service reads Postgres through a small pool and the Parquet tier one
 bucket partition per request; it needs read access to `$PARQUET_DIR` and no
 DuckDB extension. `/healthz` is the liveness check; `/openapi.json` the
 contract.
+
+**Before serving a new build.** Run `ANALYZE` on the serving tables: bulk loads leave
+most of them without planner statistics (on the 2026-11 enwiki build `normalized_citations`,
+`citation_instances`, `revisions`, `page_metadata`, `domains`, `web_resources` and the parts
+and link tables had never been analysed). It takes seconds:
+`psql "$DATABASE_URL" -c ANALYZE`.
+
+**Cutting over from the v1 site.** `wcd-api` answers the old URLs itself: `/explorer/…`
+redirects (302) to the dashboard and report pages, `/api/v1/…` are aliases, and
+`/api/v1/docs` redirects to `/docs`. A reverse proxy only has to send everything to
+`wcd-api` (bind it to an address the proxy can reach, e.g. `--host 0.0.0.0` behind a
+firewall, and run several `--workers`). The API names templates instead of numbering them,
+and the v1 database's template ids mean nothing here; to keep old template links and
+`/api/v1/template/{id}/report` working, export the v1 id → name table on the old server and
+point `API_LEGACY_TEMPLATE_IDS` at it:
+
+```
+psql "<v1 database URL>" -c "\copy (SELECT id, name FROM wiki_templates ORDER BY id) TO 'legacy_template_ids.tsv'"
+```
 
 **Refreshing under a running service.** Postgres steps are transactional per
 batch, so the API sees each table's new rows as they commit (a page can be

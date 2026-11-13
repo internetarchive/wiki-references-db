@@ -89,11 +89,13 @@ def test_top_sources_and_source_endpoints(client):
     assert top["match_type"] == "isbn" and top["confidence"] == 0.95 and top["n_self_closing_uses"] == 5
     assert top["is_current"] is True and top["first_seen"].startswith("2004-01-01")
     gid = top["global_source_id"]
+    # the durable key is the standardized identifier (here the ISBN); the synthetic build has no run id
+    assert top["source_key"] == f"isbn:{ISBN}" and "." not in gid
 
     s, j = get(client, f"/api/v2/sources/{gid}")
     assert s == 200 and j["n_pages"] == 2 and j["n_total_citations"] == 3 and j["source_type"] == "template"
     assert j["canonical"]["page_id"] in (PAGE_A, PAGE_B) and len(j["canonical"]["normalized_sha1"]) == 40
-    assert j["source_label"] == "Collapse"
+    assert j["source_label"] == "Collapse" and j["source_key"] == f"isbn:{ISBN}" and j["run_id"] is None
 
     s, j = get(client, f"/api/v2/sources/{gid}/pages")
     assert s == 200 and j["total_pages"] == 2 and [p["page_id"] for p in j["pages"]] == [PAGE_A, PAGE_B]
@@ -103,6 +105,29 @@ def test_top_sources_and_source_endpoints(client):
     assert [p["page_id"] for p in j["pages"]] == [PAGE_B] and j["total_pages"] == 2
     assert get(client, "/api/v2/sources/nope")[0] == 404
     assert get(client, "/api/v2/sources/nope/pages")[0] == 404
+
+
+def test_source_lookup_by_identifier(client):
+    s, top = get(client, f"/api/v2/pages/{D}/{PAGE_A}/top-sources", limit=3)
+    gid = top["sources"][0]["global_source_id"]
+    # by ISBN, in either form (ISBN-13 stored; the ISBN-10 of 9780143036555 is 0143036556), and by key
+    for params in ({"isbn": ISBN}, {"isbn": "0-14-303655-6"}, {"key": f"isbn:{ISBN}"}):
+        s, j = get(client, "/api/v2/sources", **params)
+        assert s == 200 and j["identifier"] == "isbn" and j["value"] in (ISBN, "0143036556"), params
+        assert gid in [x["global_source_id"] for x in j["sources"]] and j["total"] >= 1, params
+    # the hash fallback key resolves too
+    s, j = get(client, f"/api/v2/sources/{gid}")
+    s, k = get(client, "/api/v2/sources", key=f"part:{j['canonical_part_sha1']}")
+    assert s == 200 and gid in [x["global_source_id"] for x in k["sources"]]
+    # Wikidata and LibraryBase ids are both Q-ids: the scheme says which, and nothing matches across them
+    assert get(client, "/api/v2/sources", wikidata="q42")[1]["value"] == "Q42"
+    assert get(client, "/api/v2/sources", librarybase="Q42")[1]["identifier"] == "librarybase"
+    assert get(client, "/api/v2/sources", librarybase="42")[0] == 400
+    assert get(client, "/api/v2/sources", doi="https://doi.org/10.1000/NOPE")[1] == \
+        {"identifier": "doi", "value": "10.1000/nope", "total": 0, "sources": []}
+    assert get(client, "/api/v2/sources")[0] == 400                       # none given
+    assert get(client, "/api/v2/sources", doi="x", isbn="y")[0] == 400    # two given
+    assert get(client, "/api/v2/sources", key="qid:Q1")[0] == 400         # unknown scheme
 
 
 # Group 3 -------------------------------------------------------------------
@@ -136,6 +161,10 @@ def test_citations_at_revision(client):
     assert visits["extracted_links"][0]["url"] == "https://example.org/visits"
     block = next(c for c in j["citations"] if len(c["parts"]) == 2)
     assert [p["part_index"] for p in block["parts"]] == [0, 1]
+    # no row ids in v2: an instance is (domain, page_id, raw_sha1), a template is its name, a link its URL
+    assert all("citation_instance_id" not in c and len(c["raw_sha1"]) == 40 for c in j["citations"])
+    assert all("wiki_template_id" not in t for c in j["citations"] for t in c["templates"])
+    assert visits["extracted_links"] == [{"url": "https://example.org/visits"}]
 
     # latest revision by default; raw mode is per-instance without the normalized detail
     s, j = get(client, f"/api/v2/pages/{D}/{PAGE_A}/citations")
@@ -151,7 +180,8 @@ def test_citation_detail_and_history(client):
     sha = next(c["normalized_sha1"] for c in j["citations"] if c["parts"][0]["extracted_isbn"] == ISBN)
     s, j = get(client, f"/api/v2/citations/{sha}")
     assert s == 200 and j["citation_type"] == "template"
-    assert j["appears_on_articles"] == [{"domain": D, "page_id": PAGE_B}]
+    assert j["appears_on_articles"] == [{"domain": D, "page_id": PAGE_B, "page_title": "Second Page"}]
+    assert "citation_instance_id" not in j["instances"][0] and len(j["instances"][0]["raw_sha1"]) == 40
     assert len(j["instances"]) == 1 and j["instances"][0]["page_id"] == PAGE_B and j["instances"][0]["reference_type"] == "inline"
     assert j["parts"][0]["extracted_isbn"] == ISBN and j["parts"][0]["global_source_id"] is None
     res = j["parts"][0]["resolutions"]
@@ -167,25 +197,67 @@ def test_citation_detail_and_history(client):
     assert j["parts"][0]["resolutions"][0]["match_type"] == "isbn"
 
     s, j = get(client, f"/api/v2/citations/{sha}/history", domain=D, page_id=PAGE_B)
-    assert s == 200 and [h["revision_id"] for h in j["revisions"]] == [2201, 2202]
+    assert s == 200 and [h["revision_id"] for h in j["revisions"]] == [2201, 2202] and j["total"] == 2
     assert j["revisions"][0]["revision_timestamp"].startswith("2006-02-02")
+    assert j["revisions"][0]["page_title"] == "Second Page"
+    s, j = get(client, f"/api/v2/citations/{sha}/history", limit=1, offset=1)
+    assert s == 200 and j["total"] == 2 and [h["revision_id"] for h in j["revisions"]] == [2202]
+
+
+def test_unscoped_history_is_limited_by_page_count(client, monkeypatch):
+    from wcd_api.queries import citations as q
+
+    s, j = get(client, f"/api/v2/pages/{D}/{PAGE_B}/citations")
+    sha = j["citations"][0]["normalized_sha1"]
+    monkeypatch.setattr(q, "HISTORY_MAX_PAGES", 0)
+    s, j = get(client, f"/api/v2/citations/{sha}/history")
+    assert s == 400 and "page_id" in j["error"]
+    # one page's history is always served
+    assert get(client, f"/api/v2/citations/{sha}/history", domain=D, page_id=PAGE_B)[0] == 200
+    assert get(client, f"/api/v1/citation/{sha}/history", page_id=PAGE_B)[0] == 200
     assert get(client, "/api/v2/citations/" + "0" * 40)[0] == 404
     assert get(client, "/api/v2/citations/short")[0] == 422
+
+
+def test_citation_pages(client):
+    # prefer a citation shared between the two pages; any citation of page A checks the single-page case
+    cites = [c for rev in (1001, 1002, 1003)
+             for c in get(client, f"/api/v2/pages/{D}/{PAGE_A}/citations", revision_id=rev)[1]["citations"]]
+    shared = next((c for c in cites if c["other_articles"]), cites[0])
+    s, p = get(client, f"/api/v2/citations/{shared['normalized_sha1']}/pages")
+    assert s == 200 and p["reference_normalized"] == shared["reference_normalized"]
+    pages = {(x["domain"], x["page_id"]) for x in p["pages"]}
+    assert p["total"] == len(p["pages"]) == 1 + len(shared["other_articles"])
+    assert (D, PAGE_A) in pages and {(o["domain"], o["page_id"]) for o in shared["other_articles"]} <= pages
+    a = next(x for x in p["pages"] if x["page_id"] == PAGE_A)
+    assert a["page_title"] == "Example Island" and a["n_instances"] >= 1 and a["url"].endswith(f"curid={PAGE_A}")
+    if shared["reference_name"]:
+        assert shared["reference_name"] in a["reference_names"]
+    # limit=0: the header only (the report pages use it for the citation text and the page count)
+    s, h = get(client, f"/api/v2/citations/{shared['normalized_sha1']}/pages", limit=0)
+    assert s == 200 and h["pages"] == [] and h["total"] == p["total"]
+    assert get(client, "/api/v2/citations/" + "0" * 40 + "/pages")[0] == 404
 
 
 # Group 4 -------------------------------------------------------------------
 
 def test_template_report_and_web_resources(client):
     s, j = get(client, f"/api/v2/pages/{D}/{PAGE_B}/citations")
-    tpl = next(t for c in j["citations"] for t in c["templates"] if t["template_name"] == "Cite book")
-    # parameter values are stored trimmed, like keys (the wikitext has "Diamond " before the next pipe)
-    s, j = get(client, f"/api/v2/templates/{tpl['wiki_template_id']}/report", parameter_key="last", parameter_value="Diamond")
-    assert s == 200 and j["template_name"] == "Cite book" and j["domain"] == D and j["total"] == 3
+    assert any(t["template_name"] == "Cite book" for c in j["citations"] for t in c["templates"])
+    # templates are addressed by (domain, name); parameter values are stored trimmed, like keys
+    # (the wikitext has "Diamond " before the next pipe)
+    s, j = get(client, "/api/v2/templates/report", domain=D, template="Cite book", parameter_key="last", parameter_value="Diamond")
+    assert s == 200 and j["template_name"] == "Cite book" and j["domain"] == D and j["total"] == 3 and "wiki_template_id" not in j
     assert all(c["appears_on_domain"] == D and c["appears_on_article"] == c["appears_on_page_id"] for c in j["citations"])
-    assert get(client, "/api/v2/templates/999999/report", parameter_key="x", parameter_value="y")[0] == 404
+    assert {c["appears_on_page_title"] for c in j["citations"]} <= {"Example Island", "Second Page"}
+    # the name is normalized like the extractor's, the value compared trimmed (as the v1 explorer did)
+    s, k = get(client, "/api/v2/templates/report", domain=D, template="cite_book", parameter_key=" last", parameter_value=" Diamond ")
+    assert s == 200 and k["total"] == 3 and k["parameter_value"] == "Diamond" and k["template_name"] == "Cite book"
+    assert get(client, "/api/v2/templates/report", domain=D, template="No such template", parameter_key="x", parameter_value="y")[0] == 404
+    assert get(client, "/api/v2/templates/report", domain="xx.wikipedia.org", template="Cite book", parameter_key="x", parameter_value="y")[0] == 404
 
     s, j = get(client, "/api/v2/web-resources", url="https://example.org/page")
-    assert s == 200 and j["domain"] == "example.org" and len(j["referenced_by"]) == 1
+    assert s == 200 and j["domain"] == "example.org" and len(j["referenced_by"]) == 1 and "web_resource_id" not in j
     ref = j["referenced_by"][0]
     assert ref["appears_on_page_id"] == PAGE_B and ref["global_source_id"] and ref["verdict"] == "high_confidence"
     assert get(client, "/api/v2/web-resources", url="https://nowhere.example/")[0] == 404
@@ -196,14 +268,14 @@ def test_template_report_and_web_resources(client):
 def test_template_report_uses_precomputed_total(client):
     """A heavy (template, key, value) takes its total from template_value_counts."""
     from sqlalchemy import create_engine, text
-    s, j = get(client, f"/api/v2/pages/{D}/{PAGE_B}/citations")
-    tpl = next(t for c in j["citations"] for t in c["templates"] if t["template_name"] == "Cite book")
     engine = create_engine("postgresql+psycopg2://" + DSN.split("://", 1)[1])
     try:
         with engine.begin() as con:
-            con.execute(text("INSERT INTO template_value_counts VALUES (:w, 'last', md5('Diamond'), 'Diamond', 987654)"),
-                        {"w": tpl["wiki_template_id"]})
-        s, j = get(client, f"/api/v2/templates/{tpl['wiki_template_id']}/report", parameter_key="last", parameter_value="Diamond")
+            # the row id stays internal: template_value_counts is keyed on it, the API resolves it by name
+            con.execute(text("INSERT INTO template_value_counts SELECT w.id, 'last', md5('Diamond'), 'Diamond', 987654 "
+                             "FROM wiki_templates w JOIN domains d ON d.id = w.domain WHERE d.value = :d AND w.name = 'Cite book'"),
+                        {"d": D})
+        s, j = get(client, "/api/v2/templates/report", domain=D, template="Cite book", parameter_key="last", parameter_value="Diamond")
         assert s == 200 and j["total"] == 987654 and len(j["citations"]) == 3   # the listing still comes from Parquet
     finally:
         with engine.begin() as con:
@@ -219,10 +291,17 @@ def test_v1_aliases(client):
     assert s == 200 and j["total"] == 3 and j["domain"] == D
     s, j = get(client, f"/api/v1/article/{PAGE_A}/citations", revision_id=1001)
     assert s == 200 and j["citation_count"] == 6
+    # v1 keeps citation_instance_id (a string: 64-bit ids exceed JavaScript's safe integers)
+    assert all(isinstance(c["citation_instance_id"], str) and c["citation_instance_id"].lstrip("-").isdigit()
+               for c in j["citations"])
+    # without the v1 id table, v1 template ids are unknown (null), never this database's row ids
+    assert all(t["wiki_template_id"] is None for c in j["citations"] for t in c["templates"])
     sha = j["citations"][0]["normalized_sha1"]
-    assert get(client, f"/api/v1/citation/{sha}")[0] == 200
+    s, d = get(client, f"/api/v1/citation/{sha}")
+    assert s == 200 and isinstance(d["instances"][0]["citation_instance_id"], str)
     assert get(client, f"/api/v1/citation/{sha}/history", page_id=PAGE_A)[0] == 200
     assert get(client, "/api/v1/web_resource", url="https://example.org/page")[0] == 200
+    assert get(client, "/api/v1/template/1374/report", parameter_key="last", parameter_value="Diamond")[0] == 404
     spec = client.get("/openapi.json").json()
     assert "/api/v2/pages/{domain}/{page_id}/summary" in spec["paths"] and "/api/v1/article" in spec["paths"]
 
@@ -246,6 +325,44 @@ def test_article_title_resolution_failure_is_503(synthetic):
         assert c.get("/api/v2/article", params={"url": f"https://{D}/?curid={PAGE_A}"}).status_code == 200
 
 
+def test_legacy_redirects(synthetic, tmp_path):
+    sha = "e9377a9bf457a0586445507d958c19d15e1bc60e"
+    settings = Settings(database_url="postgresql+psycopg2://" + DSN.split("://", 1)[1], parquet_dir=synthetic["parquet_dir"])
+    with TestClient(create_app(settings, title_resolver=lambda *a: None, frontend_dir=None), follow_redirects=False) as c:
+        def loc(path, **params):
+            r = c.get(path, params=params)
+            assert r.status_code == 302, path
+            return r.headers["location"]
+
+        assert loc("/explorer/") == "/" and loc("/explorer") == "/"
+        assert loc("/explorer/article", url=f"https://{D}/wiki/Example_Island") == "/?url=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FExample_Island"
+        assert loc(f"/explorer/citation/{sha}/report", page_id=736) == f"/citations/{sha}?domain={D}&page_id=736"
+        assert loc(f"/explorer/citation/{sha}/report") == f"/citations/{sha}"
+        assert loc(f"/explorer/citation/{sha}/other-articles", page_id=736) == f"/citations/{sha}/pages?domain={D}&page_id=736"
+        assert loc("/api/v1/docs") == "/docs" and loc("/api/v1/openapi.json") == "/openapi.json"
+        # no id table configured: the landing page explains the link cannot be followed
+        assert loc("/explorer/template/1374/report", parameter_key="journal", parameter_value=" MNRAS ") == \
+            "/templates/report?legacy_id=1374&parameter_key=journal&parameter_value=MNRAS"
+
+    # with the v1 id → name table, an old id becomes the template's name
+    table = tmp_path / "legacy_template_ids.tsv"
+    table.write_text("1374\tCite book\n77\tNo Such Template\n", encoding="utf-8")
+    settings.legacy_template_ids = str(table)
+    with TestClient(create_app(settings, title_resolver=lambda *a: None, frontend_dir=None), follow_redirects=False) as c:
+        r = c.get("/explorer/template/1374/report", params={"parameter_key": "last", "parameter_value": "Diamond "})
+        assert r.headers["location"] == \
+            f"/templates/report?domain={D}&template=Cite+book&parameter_key=last&parameter_value=Diamond"
+        r = c.get("/explorer/template/5/report", params={"parameter_key": "a", "parameter_value": "b"})
+        assert r.headers["location"] == "/templates/report?legacy_id=5&parameter_key=a&parameter_value=b"
+        # and the v1 API speaks v1 template ids both ways
+        s, j = get(c, f"/api/v1/article/{PAGE_B}/citations")
+        assert {t["wiki_template_id"] for x in j["citations"] for t in x["templates"] if t["template_name"] == "Cite book"} == {1374}
+        s, j = get(c, "/api/v1/template/1374/report", parameter_key="last", parameter_value="Diamond")
+        assert s == 200 and j["wiki_template_id"] == 1374 and j["template_name"] == "Cite book" and j["total"] == 3
+        s, j = get(c, "/api/v1/template/77/report", parameter_key="a", parameter_value="b")
+        assert s == 404   # known v1 id, but no such template here
+
+
 def test_frontend_is_served(synthetic):
     from wcd_api.main import FRONTEND_DIR
 
@@ -256,3 +373,7 @@ def test_frontend_is_served(synthetic):
         assert index.status_code == 200 and "Wikipedia Citations Database" in index.text and "UVA" not in index.text
         assert c.get("/static/app.js").status_code == 200 and c.get("/static/styles.css").status_code == 200
         assert 'API_BASE = "/api/v2"' in c.get("/static/app.js").text
+        for path in ("/citations/" + "a" * 40, "/citations/" + "a" * 40 + "/pages", "/templates/report"):
+            r = c.get(path)
+            assert r.status_code == 200 and "/static/reports.js" in r.text, path
+        assert c.get("/static/reports.js").status_code == 200

@@ -31,6 +31,8 @@ by the conflict key so concurrent loaders take locks in the same order.
 
 import hashlib
 
+from .ids import GLOBAL_SOURCE_ID_MAX_LEN
+
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -537,9 +539,10 @@ class RefNameLink(Base):
 
 class GlobalSource(Base):
     """Stage 7a/7e/7f: one row per real-world source cited anywhere.
-    ``global_source_id`` is UVA's ``sha1("global:" + sorted members)[:16]``."""
+    ``global_source_id`` is UVA's ``sha1("global:" + sorted members)[:16]``, prefixed
+    ``<run id>.`` when the build ran with ``WCD_RUN_ID`` (``ids.qualify_global_source_id``)."""
     __tablename__ = 'global_sources'
-    global_source_id = Column(String(16), primary_key=True)
+    global_source_id = Column(String(GLOBAL_SOURCE_ID_MAX_LEN), primary_key=True)
     match_type = Column(String)        # doi, isbn, pmid, pmc, arxiv, wikidata_qid, author_year_fuzzy, singleton
     confidence = Column(Float)         # NULL for singletons
     canonical_part_sha1 = Column(CHAR(40))
@@ -566,6 +569,11 @@ class GlobalSource(Base):
         Index('idx_gs_pmc', 'extracted_pmc', postgresql_where=text('extracted_pmc IS NOT NULL')),
         Index('idx_gs_arxiv', 'extracted_arxiv', postgresql_where=text('extracted_arxiv IS NOT NULL')),
         Index('idx_gs_qid', 'extracted_wikidata_qid', postgresql_where=text('extracted_wikidata_qid IS NOT NULL')),
+        # the API's identifier lookup (/api/v2/sources?librarybase=|url=|key=part:…); URLs can pass
+        # B-tree's 2.7 KB key limit, so that one is a hash index
+        Index('idx_gs_librarybase', 'extracted_librarybase_id', postgresql_where=text('extracted_librarybase_id IS NOT NULL')),
+        Index('idx_gs_url', 'extracted_url', postgresql_using='hash', postgresql_where=text('extracted_url IS NOT NULL')),
+        Index('idx_gs_canonical_part', 'canonical_part_sha1'),
         Index('idx_gs_verdict', 'verdict'),
         Index('idx_gs_score', 'reliability_score'),
     )
@@ -579,7 +587,7 @@ class CitationSourceResolution(Base):
     part_index = Column(SmallInteger, nullable=False)
     domain_id = Column(Integer, ForeignKey('domains.id'), nullable=False)
     page_id = Column(Integer, nullable=False)
-    global_source_id = Column(String(16), ForeignKey('global_sources.global_source_id'), nullable=False)
+    global_source_id = Column(String(GLOBAL_SOURCE_ID_MAX_LEN), ForeignKey('global_sources.global_source_id'), nullable=False)
     source_type = Column(String)
     match_type = Column(String)
     confidence = Column(Float)
@@ -600,7 +608,7 @@ class PageSourceSummary(Base):
     __tablename__ = 'page_source_summary'
     domain_id = Column(Integer, ForeignKey('domains.id'), nullable=False)
     page_id = Column(Integer, nullable=False)
-    global_source_id = Column(String(16), ForeignKey('global_sources.global_source_id'), nullable=False)
+    global_source_id = Column(String(GLOBAL_SOURCE_ID_MAX_LEN), ForeignKey('global_sources.global_source_id'), nullable=False)
     author_key = Column(String)
     year = Column(String)
     title = Column(Text)

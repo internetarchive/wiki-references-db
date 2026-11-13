@@ -97,6 +97,28 @@ def test_scaled_engine_matches_vendored(tmp_path, monkeypatch, seed, n):
     assert "singleton" in types and "author_year_fuzzy" in types and len(types) >= 3
 
 
+def test_run_id_qualifies_global_source_ids(tmp_path, monkeypatch):
+    """WCD_RUN_ID prefixes every global source id ``<run>.``; the hash part, and so
+    everything else, is what the unqualified run writes. Both 6d engines agree."""
+    rows = _rows(4, 600)
+    bare, scaled, vendored = tmp_path / "bare", tmp_path / "scaled", tmp_path / "vendored"
+    for d in (bare, scaled, vendored):
+        _write_input(d, rows)
+    monkeypatch.delenv("WCD_RUN_ID", raising=False)
+    global_match.run_global_scaled(str(bare), DOMAIN)
+    monkeypatch.setenv("WCD_RUN_ID", "enwiki-test_1")
+    global_match.run_global_scaled(str(scaled), DOMAIN)
+    stage6.run_global(str(vendored), DOMAIN)
+    for ds in ("global_sources_stage", "global_source_map"):
+        gid = 0 if ds == "global_sources_stage" else 1   # column of global_source_id
+        want = sorted((tuple("enwiki-test_1." + v if i == gid else v for i, v in enumerate(r)) for r in _read(bare, ds)), key=repr)
+        assert _read(scaled, ds) == want, ds
+        assert _read(vendored, ds) == want, ds
+    monkeypatch.setenv("WCD_RUN_ID", "Not.Valid")
+    with pytest.raises(ValueError):
+        global_match.run_global_scaled(str(scaled), DOMAIN)
+
+
 def test_scaled_engine_reuses_saved_unions(tmp_path, capsys):
     rows = _rows(2, 1500)
     _write_input(tmp_path, rows)

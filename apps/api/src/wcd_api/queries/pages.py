@@ -10,7 +10,7 @@ from ..models import (
     SourceProfile, TemplateCount, TimelinePoint, TopSource,
 )
 from . import NotFound, Unavailable
-from .common import latest_revision, page_header, require_domain_id, source_label
+from .common import latest_revision, page_header, require_domain_id, source_key, source_label
 
 TYPE_COLUMNS = ("ref_tag", "template", "bare_url", "endnote", "shorthand", "external_link")
 
@@ -101,7 +101,7 @@ def get_timeline(db: Database, domain: str, page_id: int) -> PageTimelineRespons
 _TOP_SQL = """
 SELECT p.global_source_id, gs.author_key, gs.year, gs.title,
        gs.extracted_doi, gs.extracted_isbn, gs.extracted_pmid, gs.extracted_pmc, gs.extracted_arxiv,
-       gs.extracted_wikidata_qid, gs.extracted_librarybase_id, gs.extracted_url,
+       gs.extracted_wikidata_qid, gs.extracted_librarybase_id, gs.extracted_url, gs.canonical_part_sha1,
        p.source_type, p.n_citations AS page_citation_count, gs.n_pages AS cross_page_count,
        p.match_type, p.confidence, gs.reliability_score, gs.verdict,
        p.first_seen, p.last_seen, p.n_revisions_cited, p.n_self_closing_uses, p.is_current
@@ -119,5 +119,5 @@ def get_top_sources(db: Database, domain: str, page_id: int, limit: int = 10) ->
         total = con.execute(text("SELECT count(*) FROM page_source_summary WHERE domain_id = :d AND page_id = :p"),
                             {"d": domain_id, "p": page_id}).scalar() or 0
         rows = con.execute(text(_TOP_SQL), {"d": domain_id, "p": page_id, "limit": limit}).mappings().all()
-    sources = [TopSource(source_label=source_label(r), **{k: r[k] for k in r.keys()}) for r in rows]
+    sources = [TopSource(source_label=source_label(r), source_key=source_key(r), **{k: r[k] for k in r.keys()}) for r in rows]
     return PageTopSourcesResponse(**header.model_dump(), total_sources=int(total), sources=sources)

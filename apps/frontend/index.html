@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Wikipedia Citations Database</title>
-    <link rel="stylesheet" href="/static/styles.css?v=v3-20261021" />
+    <link rel="stylesheet" href="/static/styles.css?v=v3-20261113" />
   </head>
   <body>
     <div class="page-shell">
@@ -242,11 +242,27 @@
               <ul id="top-sources-list" class="source-list"></ul>
             </article>
           </section>
+
+          <section id="citations-section" class="sources-section">
+            <article class="card">
+              <div class="section-heading section-heading-row">
+                <div>
+                  <h3 id="citations-heading">Citations In The Latest Revision</h3>
+                  <p id="citations-summary" class="muted">Loading citations…</p>
+                </div>
+                <button id="citations-latest" type="button" class="timeline-action-link hidden">Back to latest revision</button>
+              </div>
+              <ul id="citations-list" class="citation-list"></ul>
+              <div class="button-row">
+                <button id="citations-more" type="button" class="secondary-button hidden">Show more citations</button>
+              </div>
+            </article>
+          </section>
         </section>
       </main>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/echarts@6.0.0/dist/echarts.min.js" defer></script>
-    <script src="/static/app.js?v=v3-20261021" defer></script>
+    <script src="/static/app.js?v=v3-20261113" defer></script>
   </body>
 </html>

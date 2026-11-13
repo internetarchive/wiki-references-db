@@ -28,5 +28,26 @@ Changes from the UVA original:
 * Errors follow the v2 `{"error", "code"}` shape (FastAPI's `detail` is still
   understood).
 
+Ported from the v1 Citation Explorer (`legacy/explorer.py`):
+
+* **Citations section** on the dashboard: the citations at the latest revision (or the
+  revision picked with "Citations at this revision" in the timeline inspector), 25 at a
+  time, with badges, the normalized text, first/last seen, extracted links and template
+  parameters. Each card links to the report pages.
+* **Report pages** (`reports.html` + `reports.js`, served by `wcd-api` at the paths
+  below; the script routes on the path):
+  * `/citations/{sha1}?domain=&page_id=` — every revision containing the citation, on
+    one page or (for citations on ≤ 25 pages) every page. Was `/explorer/citation/{sha1}/report`.
+  * `/citations/{sha1}/pages?domain=&page_id=` — the pages citing it, by title, the
+    current page highlighted. Was `/explorer/citation/{sha1}/other-articles`.
+  * `/templates/report?domain=&template=&parameter_key=&parameter_value=` — citations whose
+    template (by name) has that parameter value ("Find matches" on a parameter). Was
+    `/explorer/template/{id}/report`.
+  * `/templates/report?legacy_id=…` — landing page for an old template link whose id
+    could not be translated.
+* `?url=<article URL>` loads a page by URL (old `/explorer/article?url=` links redirect here).
+
+The explorer's revision slider is not ported; the timeline plays that role.
+
 ECharts is loaded from jsDelivr as before; without it the page degrades to the
 textual timeline inspector and highlights.

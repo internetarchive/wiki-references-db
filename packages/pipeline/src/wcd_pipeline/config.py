@@ -46,6 +46,15 @@ def database_url() -> str:
     )
 
 
+def run_id() -> str | None:
+    """``WCD_RUN_ID``: this build run's identifier, which qualifies the global
+    source ids Stage 6d writes (``<run id>.<hash>``). Unset: bare ids, as the
+    builds before run ids. See ``wcd_schema.ids.qualify_global_source_id``."""
+    from wcd_schema.ids import check_run_id
+
+    return check_run_id(os.getenv("WCD_RUN_ID") or None)
+
+
 def staging_dir(default: str = "./staging") -> str:
     return os.getenv("STAGING_DIR", default)
 
