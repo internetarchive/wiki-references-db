@@ -93,6 +93,8 @@ _GS_DDL = ("global_source_id varchar(16), match_type varchar, confidence double 
            "extracted_wikidata_qid varchar, extracted_url text")
 # rows per COPY into a temp table and set-based upsert (one transaction each)
 CHUNK_ROWS = int(os.getenv("MATERIALIZE_CHUNK_ROWS", "500000"))
+# work_mem for 7e/7f's whole-table UPDATEs (single backend, no parallel workers)
+STAGE7_WORK_MEM = os.getenv("STAGE7_WORK_MEM", "1GB")
 
 
 def _batches(con, sql: str):
@@ -336,7 +338,15 @@ def step_d(pg, con, domain: str, domain_id: int, parquet_base: str, force: bool)
 # ---------------------------------------------------------------------------
 
 def step_e(pg) -> int:
+    """Each global source's page and citation counts from page_source_summary.
+    Sort-based: the planner takes the ~121M groups on enwiki for ~16M and
+    hash-aggregates and hash-joins them in work_mem, which spilled for over an
+    hour without writing a row; sorted, the groups merge-join global_sources
+    through its primary key (7a loads the table in key order)."""
     with pg.cursor() as cur:
+        cur.execute(f"SET LOCAL work_mem = '{STAGE7_WORK_MEM}'")
+        cur.execute("SET LOCAL enable_hashagg = off")
+        cur.execute("SET LOCAL enable_hashjoin = off")
         cur.execute("""
             UPDATE global_sources gs
             SET n_pages = sub.n_pages, n_total_citations = sub.n_total_citations
@@ -392,6 +402,8 @@ def step_f(pg, dsn: str) -> int:
     set-based UPDATE (on enwiki ~131M sources; a server cursor, a LATERAL
     lookup and a Python call per source would take hours)."""
     with pg.cursor() as cur:
+        # its hash joins hold ~100M rows on enwiki: fewer, larger batches
+        cur.execute(f"SET LOCAL work_mem = '{STAGE7_WORK_MEM}'")
         cur.execute(_SCORE_SQL)
         n = cur.rowcount
     pg.commit()
