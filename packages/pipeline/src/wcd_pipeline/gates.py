@@ -23,7 +23,8 @@ from wcd_schema.postgres import (
     CitationInstance, Domain, NormalizedCitation, RefNameLink, Revision,
 )
 
-from .config import database_url, load_dotenv  # noqa: F401
+from . import fkeys
+from .config import database_url, duckdb_connect, load_dotenv  # noqa: F401
 
 
 def log(msg: str) -> None:
@@ -78,7 +79,7 @@ def stage0(session: Session | None, domain: str, parquet_base: str | None) -> li
         if ts_type not in ("timestamp without time zone", "timestamp with time zone"):
             failures.append(f"revisions.revision_timestamp is {ts_type!r}, not TIMESTAMP")
     if parquet_base is not None:
-        con = duckdb.connect()
+        con = duckdb_connect()
         pq_count = _parquet_count(con, layout.partition_glob(parquet_base, "revisions", domain))
         if pq_count == 0:
             failures.append(f"no revisions Parquet for domain {domain} under {parquet_base}")
@@ -114,7 +115,11 @@ def stage3(session: Session, domain: str, parquet_base: str, sample_buckets: int
     if null_types:
         failures.append(f"{null_types} normalized_citations rows have NULL citation_type")
 
-    con = duckdb.connect()
+    # load may drop these tables' foreign keys while it fills them (--defer-fks)
+    failures += fkeys.problems(session, ("web_resources", "normalized_citations", "citation_instances",
+                                         "normalized_citation_web_resources"))
+
+    con = duckdb_connect()
     buckets = layout.list_buckets(parquet_base, "citation_history", domain)
     if not buckets:
         failures.append(f"no citation_history Parquet for domain {domain} under {parquet_base}")
@@ -149,9 +154,11 @@ def stage3(session: Session, domain: str, parquet_base: str, sample_buckets: int
 # ---------------------------------------------------------------------------
 
 def stage4(session: Session, domain: str, sample: int = 1000, seed: int = 0) -> list[str]:
-    """every normalized citation of the domain has ≥ 1 part; bare_url /
-    external_link parts carry extracted_url; template parts carry
-    template_name; part_sha1 = sha1(content) on a sample."""
+    """every normalized citation of the domain has ≥ 1 part; every bare_url /
+    external_link citation whose text has a URL with a host has a part carrying
+    extracted_url; template parts carry
+    template_name; part_sha1 = sha1(content) on a sample; the foreign key
+    to normalized_citations exists and is validated."""
     failures = []
     domain_id = _domain_id(session, domain)
     if domain_id is None:
@@ -161,12 +168,17 @@ def stage4(session: Session, domain: str, sample: int = 1000, seed: int = 0) -> 
         "WHERE nc.appears_on_domain_id = :d AND p.normalized_id IS NULL"), {"d": domain_id}).scalar_one()
     if no_parts:
         failures.append(f"{no_parts} normalized_citations rows have no part")
+    # per citation: an embedded template ({{Citation needed}}) is a part of its own
+    # without a URL; a citation whose "URL" has no host (http://'"…) has none to give
     no_url = session.execute(text(
-        "SELECT count(*) FROM normalized_citation_parts p JOIN normalized_citations nc ON nc.id = p.normalized_id "
-        "WHERE nc.appears_on_domain_id = :d AND nc.citation_type IN ('bare_url', 'external_link') AND p.extracted_url IS NULL"),
+        "SELECT count(*) FROM normalized_citations nc "
+        "WHERE nc.appears_on_domain_id = :d AND nc.citation_type IN ('bare_url', 'external_link') "
+        "AND regexp_replace(nc.reference_normalized, '''{2,}', '', 'g') ~ '(https?|ftps?|git)://[[:alnum:]]' "
+        "AND NOT EXISTS (SELECT 1 FROM normalized_citation_parts p "
+        "                WHERE p.normalized_id = nc.id AND p.extracted_url IS NOT NULL)"),
         {"d": domain_id}).scalar_one()
     if no_url:
-        failures.append(f"{no_url} bare_url/external_link parts have no extracted_url")
+        failures.append(f"{no_url} bare_url/external_link citations with a URL have no part carrying extracted_url")
     no_tpl = session.execute(text(
         "SELECT count(*) FROM normalized_citation_parts p JOIN normalized_citations nc ON nc.id = p.normalized_id "
         "WHERE nc.appears_on_domain_id = :d AND p.part_type = 'template' AND p.template_name IS NULL"),
@@ -180,6 +192,8 @@ def stage4(session: Session, domain: str, sample: int = 1000, seed: int = 0) -> 
     bad = sum(1 for sha, content in rows if part_sha1(content) != sha)
     if bad:
         failures.append(f"{bad} of {len(rows)} sampled parts have part_sha1 <> sha1(content)")
+    # parts may drop the table's foreign key while it fills it (--defer-fks)
+    failures += fkeys.problems(session, ("normalized_citation_parts",))
     return failures
 
 
@@ -187,21 +201,62 @@ def stage4(session: Session, domain: str, sample: int = 1000, seed: int = 0) -> 
 # Stage 5 (after ref_name_links)
 # ---------------------------------------------------------------------------
 
+_RANGE_OVERLAP_SQL = """
+WITH r AS (
+    SELECT l.page_id, l.ref_name, l.first_revision_id AS fid, f.revision_timestamp AS fts,
+           l.last_revision_id AS lid, e.revision_timestamp AS lts
+    FROM {links} l
+    JOIN {revisions} f ON f.revision_id = l.first_revision_id
+    LEFT JOIN {revisions} e ON e.revision_id = l.last_revision_id
+    {where}
+), o AS (
+    SELECT fid, fts,
+           lag(fid) OVER w AS p_fid, lag(lid) OVER w AS p_lid, lag(lts) OVER w AS p_lts
+    FROM r WINDOW w AS (PARTITION BY page_id, ref_name ORDER BY fts, fid)
+)
+SELECT count(*) FROM o
+WHERE p_fid IS NOT NULL AND (p_lid IS NULL OR p_lts > fts OR (p_lts = fts AND p_lid >= fid))
+"""
+
+
+def _ref_name_overlaps(session: Session, domain: str, domain_id: int, parquet_base: str | None) -> int:
+    """Ranges of ``ref_name_links`` that start before the previous range of
+    their (page, name) ends, in revision order: per bucket from the Parquet
+    copies when ``parquet_base`` is given, else in Postgres."""
+    if parquet_base is None:
+        return session.execute(text(_RANGE_OVERLAP_SQL.format(
+            links="ref_name_links", revisions="revisions", where="WHERE l.domain_id = :d"
+        )), {"d": domain_id}).scalar_one()
+    from wcd_schema.duckdb import bind_bucket_views
+
+    con = duckdb_connect()
+    try:
+        total = 0
+        for b in layout.list_buckets(parquet_base, "ref_name_links", domain):
+            bind_bucket_views(con, parquet_base, domain, b, ("ref_name_links", "revisions"))
+            total += con.execute(_RANGE_OVERLAP_SQL.format(
+                links="ref_name_links", revisions="revisions", where="")).fetchone()[0]
+        return total
+    finally:
+        con.close()
+
+
 def stage5(session: Session, domain: str, parquet_base: str | None = None) -> list[str]:
     """no overlapping revision ranges per (domain_id, page_id, ref_name); every
-    defining_instance_id exists; the Parquet copy matches Postgres."""
+    defining_instance_id exists; the Parquet copy matches Postgres; the
+    foreign keys exist and are validated."""
     failures = []
     domain_id = _domain_id(session, domain)
     if domain_id is None:
         return [f"domain {domain!r} is not in domains"]
-    overlaps = session.execute(text("""
-        SELECT count(*) FROM ref_name_links a JOIN ref_name_links b
-          ON a.domain_id = b.domain_id AND a.page_id = b.page_id AND a.ref_name = b.ref_name
-         AND a.first_revision_id < b.first_revision_id
-         AND (a.last_revision_id IS NULL OR a.last_revision_id >= b.first_revision_id)
-        WHERE a.domain_id = :d"""), {"d": domain_id}).scalar_one()
+    # Ranges are in revision order, (revision_timestamp, revision_id), as Stage 5
+    # walks them; revision ids alone are not (imported/merged histories: on enwiki
+    # an id comparison reported 703 overlapping pairs on 126 pages, none real).
+    # Sorted by start, a set of ranges overlaps iff some range starts no later
+    # than its predecessor ends.
+    overlaps = _ref_name_overlaps(session, domain, domain_id, parquet_base)
     if overlaps:
-        failures.append(f"{overlaps} overlapping ref_name_links range pair(s)")
+        failures.append(f"{overlaps} ref_name_links range(s) overlap the previous range of their name (revision order)")
     dangling = session.execute(text(
         "SELECT count(*) FROM ref_name_links r LEFT JOIN citation_instances ci ON ci.id = r.defining_instance_id "
         "WHERE r.domain_id = :d AND ci.id IS NULL"), {"d": domain_id}).scalar_one()
@@ -209,9 +264,11 @@ def stage5(session: Session, domain: str, parquet_base: str | None = None) -> li
         failures.append(f"{dangling} ref_name_links rows point at a missing citation instance")
     if parquet_base is not None:
         pg_n = session.execute(select(func.count()).select_from(RefNameLink).where(RefNameLink.domain_id == domain_id)).scalar_one()
-        pq_n = _parquet_count(duckdb.connect(), layout.partition_glob(parquet_base, "ref_name_links", domain))
+        pq_n = _parquet_count(duckdb_connect(), layout.partition_glob(parquet_base, "ref_name_links", domain))
         if pg_n != pq_n:
             failures.append(f"ref_name_links Parquet has {pq_n} rows but Postgres has {pg_n} for the domain")
+    # ref-name-links may drop the table's foreign keys while it fills it (--defer-fks)
+    failures += fkeys.problems(session, ("ref_name_links",))
     return failures
 
 
@@ -235,13 +292,12 @@ def run(stage: str, session: Session, domain: str, parquet_base: str | None, **k
         from .stage6 import gate as stage6
         return stage6(parquet_base, domain)
     if stage == "7":
-        import duckdb as _duckdb
         import psycopg2
         from .config import psycopg_dsn
         from .stage7 import _domain_id, gate as stage7
         pg = psycopg2.connect(psycopg_dsn())
         try:
-            return stage7(pg, _duckdb.connect(), domain, _domain_id(pg, domain), parquet_base)
+            return stage7(pg, duckdb_connect(), domain, _domain_id(pg, domain), parquet_base)
         finally:
             pg.close()
     if stage == "8":

@@ -27,25 +27,25 @@ Usage:
 import io
 import itertools
 import os
+import shutil
 import time
 import argparse
 from collections import OrderedDict
 
 
 import duckdb
-import pyarrow as pa
 import pyarrow.csv as pa_csv
 from sqlalchemy import create_engine, select as sa_select, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
-from wcd_schema.ids import instance_id
+from wcd_schema.ids import instance_id_sql
 from wcd_schema.postgres import (
-    CitationInstance, Container, Domain, NormalizedCitation,
-    NormalizedCitationWebResource, WebResource, WikiTemplate,
+    Container, Domain, WikiTemplate,
 )
 from wcd_schema import parquet as layout
 from wcd_schema.ids import PAGE_BUCKETS, template_search_bucket_sql
 
+from . import fkeys
 from .config import database_url
 
 def make_session():
@@ -58,6 +58,16 @@ def make_session():
 BATCH_SIZE = int(os.getenv('LOAD_BATCH_SIZE', '5000'))
 # Rows per COPY chunk for the set-based loaders (one transaction per chunk).
 COPY_ROWS = int(os.getenv('LOAD_COPY_ROWS', '1000000'))
+# Connections for the citation tables (copy_parquet_parallel); --jobs overrides.
+LOAD_JOBS = int(os.getenv('LOAD_JOBS', '8'))
+# Rows per row group (= per unit) of the key-sorted copies the citation tables load from
+SORTED_GROUP = 500_000
+# Keep the key-sorted copies after a successful load (for repeated loads of the same staging)
+KEEP_SORTED = os.getenv('LOAD_KEEP_SORTED', '') not in ('', '0', 'false')
+# Drop the foreign keys of citation_instances / normalized_citation_web_resources when the table
+# is empty at the start of its phase, and add them back (NOT VALID, then VALIDATE) after it;
+# --defer-fks / --no-defer-fks override
+DEFER_FKS = os.getenv('LOAD_DEFER_FKS', '1') not in ('', '0', 'false')
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +112,41 @@ def read_parquet_batches(filepath, batch_size=BATCH_SIZE):
     con.close()
 
 
+_CSV_OPTIONS = pa_csv.WriteOptions(include_header=False, quoting_style="all_valid")
+
+
+def _copy_and_insert(cur, rows, temp_table, temp_ddl, columns, insert_sql, index_lookups=False):
+    """``COPY`` the Arrow table or batch ``rows`` into the temporary table
+    ``temp_table`` (created if missing, emptied first) and run ``insert_sql``;
+    returns the rows it wrote. The caller commits.
+
+    NULLs travel as unquoted empty CSV fields and every non-NULL value is
+    quoted, so an empty string stays an empty string.
+
+    ``index_lookups=True`` turns hash and merge joins off for ``insert_sql``:
+    use it when the rows join a table far larger than themselves (half a
+    million staged rows against hundreds of millions of
+    ``normalized_citations``), where a hash join would scan the whole table for
+    each unit, and the planner's costs for that and for the index probes are
+    close.
+    """
+    buf = io.BytesIO()
+    pa_csv.write_csv(rows, buf, write_options=_CSV_OPTIONS)
+    buf.seek(0)
+    cur.execute(f"CREATE TEMP TABLE IF NOT EXISTS {temp_table} ({temp_ddl})")
+    cur.execute(f"TRUNCATE {temp_table}")
+    cur.copy_expert(f"COPY {temp_table} ({', '.join(columns)}) FROM STDIN WITH (FORMAT csv)", buf)
+    # a freshly filled temp table has no statistics, and autovacuum never
+    # analyzes temp tables
+    cur.execute(f"ANALYZE {temp_table}")
+    if index_lookups:
+        # SET LOCAL lasts until the caller's commit
+        cur.execute("SET LOCAL enable_hashjoin = off")
+        cur.execute("SET LOCAL enable_mergejoin = off")
+    cur.execute(insert_sql)
+    return cur.rowcount
+
+
 def copy_parquet_in_chunks(session, source_sql, temp_table, temp_ddl, columns, insert_sql,
                            duck_tables=None, chunk_rows=None):
     """Set-based load: run ``source_sql`` in DuckDB (it reads the staged
@@ -112,8 +157,7 @@ def copy_parquet_in_chunks(session, source_sql, temp_table, temp_ddl, columns, i
 
     This replaces per-batch Python id lookups and multi-row ``INSERT … VALUES``
     statements, which ran at ~10k rows/s; the rows never become Python
-    objects. NULLs travel as unquoted empty CSV fields and every non-NULL value
-    is quoted, so an empty string stays an empty string.
+    objects. ``copy_parquet_parallel`` does the same on several connections.
 
     Keep ``insert_sql`` to single-column joins on columns typed as in
     ``temp_ddl``: Postgres multiplies the selectivities of a multi-column join
@@ -124,9 +168,6 @@ def copy_parquet_in_chunks(session, source_sql, temp_table, temp_ddl, columns, i
     chunk_rows = chunk_rows or COPY_ROWS
     dbapi = session.connection().connection.dbapi_connection
     cur = dbapi.cursor()
-    cur.execute(f"CREATE TEMP TABLE IF NOT EXISTS {temp_table} ({temp_ddl})")
-    col_list = ", ".join(columns)
-    options = pa_csv.WriteOptions(include_header=False, quoting_style="all_valid")
     con = duckdb.connect()
     staged = written = 0
     try:
@@ -136,16 +177,7 @@ def copy_parquet_in_chunks(session, source_sql, temp_table, temp_ddl, columns, i
         for batch in reader:
             if batch.num_rows == 0:
                 continue
-            buf = io.BytesIO()
-            pa_csv.write_csv(batch, buf, write_options=options)
-            buf.seek(0)
-            cur.execute(f"TRUNCATE {temp_table}")
-            cur.copy_expert(f"COPY {temp_table} ({col_list}) FROM STDIN WITH (FORMAT csv)", buf)
-            # a freshly filled temp table has no statistics, and autovacuum
-            # never analyzes temp tables
-            cur.execute(f"ANALYZE {temp_table}")
-            cur.execute(insert_sql)
-            written += cur.rowcount
+            written += _copy_and_insert(cur, batch, temp_table, temp_ddl, columns, insert_sql)
             staged += batch.num_rows
             dbapi.commit()
     except Exception:
@@ -154,6 +186,142 @@ def copy_parquet_in_chunks(session, source_sql, temp_table, temp_ddl, columns, i
     finally:
         con.close()
         cur.close()
+    return staged, written
+
+
+def _sorted_copy(filepath, sort_by, work_dir):
+    """A copy of ``filepath`` ordered by the SQL expression ``sort_by``
+    (DuckDB, under ``LOAD_MEMORY_LIMIT``), in row groups of ``SORTED_GROUP``
+    rows, at ``work_dir/<name>.<fingerprint>.sorted.parquet``; returns
+    (path, reused).
+
+    The fingerprint covers the source file (path, size, mtime), ``sort_by``
+    and ``SORTED_GROUP``, so a copy left by an interrupted load is reused (the
+    sort is the slow part: 43 min for enwiki's normalized_citations) and a
+    stale one is replaced. The copy is written under a temporary name and
+    renamed when complete. Spill directories of earlier, killed sorts are
+    removed first (loads do not run concurrently on one staging directory)."""
+    import hashlib
+    import tempfile
+
+    os.makedirs(work_dir, exist_ok=True)
+    st = os.stat(filepath)
+    fp = hashlib.sha1(f"{os.path.abspath(filepath)}|{st.st_size}|{st.st_mtime_ns}|{sort_by}|{SORTED_GROUP}"
+                      .encode()).hexdigest()[:12]
+    stem = os.path.basename(filepath).removesuffix('.parquet')
+    out = os.path.join(work_dir, f"{stem}.{fp}.sorted.parquet")
+    if os.path.exists(out):
+        return out, True
+    for name in os.listdir(work_dir):
+        stale = os.path.join(work_dir, name)
+        if name.startswith('spill-') or (name.startswith(f"{stem}.") and '.sorted.parquet' in name):
+            shutil.rmtree(stale, ignore_errors=True) if os.path.isdir(stale) else os.remove(stale)
+    spill = tempfile.mkdtemp(prefix='spill-', dir=work_dir)
+    partial = out + '.partial'
+    con = _duck(temp_dir=spill)
+    try:
+        con.execute(f"""COPY (SELECT * FROM read_parquet('{_q(filepath)}') ORDER BY {sort_by})
+                        TO '{_q(partial)}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {SORTED_GROUP})""")
+        os.replace(partial, out)
+    finally:
+        con.close()
+        shutil.rmtree(spill, ignore_errors=True)
+        if os.path.exists(partial):
+            os.remove(partial)
+    return out, False
+
+
+def copy_parquet_parallel(engine, filepath, source_sql, temp_table, temp_ddl, columns, insert_sql,
+                          jobs=None, index_lookups=False, progress=None, sort_by=None, work_dir=None):
+    """``copy_parquet_in_chunks`` on ``jobs`` connections: each row group of
+    the Parquet file ``filepath`` is one unit, read with pyarrow, put through
+    ``source_sql`` in DuckDB (which reads it as the relation ``src``), copied
+    into a temporary table and inserted with ``insert_sql``, then committed.
+    Returns (rows staged, rows written).
+
+    One backend was the bottleneck at ~32k rows/s on enwiki: each row's index
+    entries and foreign-key checks run in that backend while the machine idles.
+    Units may run in any order and at the same time, so ``insert_sql`` must not
+    depend on another unit's rows, and two units must not write the same
+    conflict key (the deduped tables have one row per key). A unit commits on
+    its own, so a load that fails part way leaves the committed units in
+    place, and a re-run upserts them again. After a failure, units not yet
+    started are cancelled.
+
+    ``progress``, if given, is called as ``progress(units_done, units, staged,
+    written)`` in the calling thread.
+
+    ``sort_by`` (an SQL expression over the file's columns) first writes a
+    copy of the file in that order under ``work_dir`` (``_sorted_copy``; it is
+    deleted after a successful load unless ``LOAD_KEEP_SORTED`` is set, and
+    reused by the next load if one fails), and the units are its row groups,
+    started in key order. Use the key of the table's largest random-keyed
+    index (a SHA-1, an md5): the units in flight then cover adjacent key
+    ranges, so that index is written in a few narrow regions instead of all
+    over. Unsorted, enwiki's ``normalized_citations`` fell from ~114k to ~14k
+    rows/s as its ``normalized_sha1`` index (18 GB) outgrew the cache and
+    every insert became a random read.
+    """
+    jobs = jobs or LOAD_JOBS
+    sorted_file = None
+    if sort_by:
+        if not work_dir:
+            raise ValueError("sort_by needs a work_dir")
+        t0 = time.time()
+        sorted_file, reused = _sorted_copy(filepath, sort_by, work_dir)
+        filepath = sorted_file
+        log(f"{temp_table}: " + (f"reusing the copy sorted by {sort_by}" if reused
+                                 else f"sorted by {sort_by} in {time.time() - t0:.0f}s"))
+    result = _run_units(engine, filepath, source_sql, temp_table, temp_ddl, columns, insert_sql,
+                        jobs, index_lookups, progress)
+    if sorted_file and not KEEP_SORTED:
+        os.remove(sorted_file)
+    return result
+
+
+def _run_units(engine, filepath, source_sql, temp_table, temp_ddl, columns, insert_sql,
+               jobs, index_lookups, progress):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import pyarrow.parquet as pq
+
+    n_units = pq.ParquetFile(filepath).metadata.num_row_groups
+
+    def unit(i):
+        table = pq.ParquetFile(filepath).read_row_group(i)
+        con = duckdb.connect()
+        try:
+            con.register('src', table)
+            result = con.execute(source_sql)
+            # to_arrow_table() replaces fetch_arrow_table() in newer DuckDB
+            rows = (getattr(result, 'to_arrow_table', None) or result.fetch_arrow_table)()
+        finally:
+            con.close()
+        if rows.num_rows == 0:
+            return 0, 0
+        raw = engine.raw_connection()
+        try:
+            with raw.cursor() as cur:
+                n = _copy_and_insert(cur, rows, temp_table, temp_ddl, columns, insert_sql, index_lookups)
+            raw.commit()
+        finally:
+            raw.close()
+        return rows.num_rows, n
+
+    staged = written = done = 0
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = [pool.submit(unit, i) for i in range(n_units)]
+        try:
+            for f in as_completed(futures):
+                s, w = f.result()
+                staged += s
+                written += w
+                done += 1
+                if progress:
+                    progress(done, n_units, staged, written)
+        except BaseException:
+            for f in futures:
+                f.cancel()
+            raise
     return staged, written
 
 
@@ -216,28 +384,87 @@ def load_domains(session, staging_dir):
     log(f"domains: {count} rows loaded")
 
 
+def _analyze(session, *tables, vacuum=False):
+    """Refresh planner statistics on lookup tables an earlier phase just
+    filled (autovacuum may not have analyzed them yet).
+
+    ``vacuum=True`` runs ``VACUUM (ANALYZE)`` instead, for tables the next
+    phase probes row by row: a freshly loaded table otherwise gets an
+    insert-triggered, throttled autovacuum that reads the whole heap (68 GB
+    for enwiki's normalized_citations) while that phase competes for the
+    same disk. Run here it is unthrottled, once, and later runs skip the
+    pages it marked all-visible."""
+    session.commit()
+    if not vacuum:
+        for t in tables:
+            session.execute(text(f"ANALYZE {t}"))
+        session.commit()
+        return
+    t0 = time.time()
+    with session.get_bind().connect().execution_options(isolation_level="AUTOCOMMIT") as con:
+        for t in tables:
+            con.execute(text(f"VACUUM (ANALYZE) {t}"))
+    log(f"vacuumed {', '.join(tables)} in {time.time() - t0:.0f}s")
+
+
+def _copy_load(session, name, filepath, target=None, defer_fks=False, **kwargs):
+    """``copy_parquet_parallel`` with progress lines (every 40 units) and a
+    summary; ``source_sql`` reads one row group as ``src``. ``target`` is the
+    table written: its foreign keys are restored and validated afterwards in
+    any case, and with ``defer_fks`` (and ``DEFER_FKS``) dropped first if it is
+    empty.
+
+    Deferral is for tables whose keys reference large tables: on enwiki
+    citation_instances went from <6k to ~82k rows/s with it (plus
+    ``INCLUDE (id)`` on normalized_citations' normalized_sha1), and validating
+    took 9.4 min. normalized_citations, whose only key references a domain,
+    loaded no faster without it and its validation cost 7.5 min (plan §22)."""
+    if target and defer_fks and DEFER_FKS:
+        fkeys.drop_if_empty(session, target, log)
+    session.commit()  # earlier phases' rows are visible to the other connections
+    t0 = time.time()
+
+    def progress(done, units, staged, written):
+        if done % 40 == 0 or done == units:
+            dt = time.time() - t0
+            log(f"{name}: {done}/{units} units, {staged:,} staged, {written:,} written, "
+                f"{staged / dt:,.0f} rows/s")
+
+    # sorted copies go under <staging>/.load-sort (filepath is <staging>/deduped/<table>.parquet)
+    kwargs.setdefault('work_dir', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(filepath))),
+                                               '.load-sort'))
+    staged, written = copy_parquet_parallel(session.get_bind(), filepath, progress=progress, **kwargs)
+    dt = time.time() - t0
+    log(f"{name}: {staged:,} rows staged, {written:,} written in {dt:.1f}s "
+        f"({staged / dt if dt else 0:,.0f} rows/s, {LOAD_JOBS} jobs)")
+    if target:
+        fkeys.restore(session, target, log)
+    return staged, written
+
+
 def load_web_resources(session, staging_dir):
-    """Cited URLs (article curid rows are written at Stage 0)."""
+    """Cited URLs (article curid rows are written at Stage 0). A URL already
+    present (an article row, or a re-run) keeps its other columns; a resolved
+    domain replaces the stored one."""
     filepath = find_deduped_parquet(staging_dir, 'web_resources')
     if not filepath:
         return
     log(f"web_resources: loading from {filepath}")
-
-    count = 0
-    for batch in read_parquet_batches(filepath):
-        domain_to_id = _domain_ids(session, (r.get('domain_label') for r in batch))
-        cleaned = []
-        for r in batch:
-            wr = {'url': r['url']}
-            dl = r.get('domain_label')
-            if dl and dl in domain_to_id:
-                wr['domain_id'] = domain_to_id[dl]
-            cleaned.append(wr)
-        if cleaned:
-            WebResource.bulk_upsert(session, cleaned)
-            session.commit()
-        count += len(cleaned)
-    log(f"web_resources: {count} rows loaded")
+    _analyze(session, 'domains')
+    _copy_load(
+        session, 'web_resources', filepath, target='web_resources',
+        # md5 of the UTF-8 bytes as lowercase hex, as WebResource.compute_url_hash
+        source_sql="SELECT url, md5(url) AS url_hash, domain_label FROM src WHERE url IS NOT NULL",
+        temp_table='_wr_stage', temp_ddl='url text, url_hash char(32), domain_label text',
+        columns=['url', 'url_hash', 'domain_label'],
+        insert_sql="""
+            INSERT INTO web_resources (url, url_hash, domain_id)
+            SELECT s.url, s.url_hash, d.id
+            FROM _wr_stage s LEFT JOIN domains d ON d.value = s.domain_label
+            ON CONFLICT (url_hash) DO UPDATE SET
+                url = EXCLUDED.url,
+                domain_id = COALESCE(EXCLUDED.domain_id, web_resources.domain_id)""",
+        sort_by='md5(url)')  # url_hash order
 
 
 def _domain_ids(session, labels):
@@ -283,32 +510,32 @@ def load_normalized_citations(session, staging_dir):
     if not filepath:
         return
     log(f"normalized_citations: loading from {filepath}")
-
-    count = 0
-    skipped = 0
-    for batch in read_parquet_batches(filepath):
-        domain_to_id = _domain_ids(session, (r.get('appears_on_domain') for r in batch))
-        cleaned = []
-        for r in batch:
-            domain_id = domain_to_id.get(r.get('appears_on_domain'))
-            page_id = r.get('appears_on_page_id')
-            if domain_id is None or page_id is None or not r.get('citation_type'):
-                skipped += 1
-                continue
-            cleaned.append({
-                'normalized_sha1': r['normalized_sha1'],
-                'reference_normalized': r['reference_normalized'],
-                'appears_on_domain_id': domain_id,
-                'appears_on_page_id': page_id,
-                'citation_type': r['citation_type'],
-            })
-        if cleaned:
-            NormalizedCitation.bulk_upsert(session, cleaned)
-            session.commit()
-            count += len(cleaned)
-    if skipped:
-        log(f"normalized_citations: warning: {skipped} rows skipped (unknown domain, missing page id or citation_type)")
-    log(f"normalized_citations: {count} rows loaded")
+    _analyze(session, 'domains')
+    staged, written = _copy_load(
+        session, 'normalized_citations', filepath, target='normalized_citations',
+        source_sql="SELECT normalized_sha1, reference_normalized, appears_on_domain, appears_on_page_id, "
+                   "citation_type FROM src WHERE normalized_sha1 IS NOT NULL",
+        temp_table='_nc_stage',
+        temp_ddl='normalized_sha1 char(40), reference_normalized text, appears_on_domain text, '
+                 'appears_on_page_id integer, citation_type text',
+        columns=['normalized_sha1', 'reference_normalized', 'appears_on_domain', 'appears_on_page_id',
+                 'citation_type'],
+        # rows with an unknown domain, no page id or no citation_type are skipped
+        insert_sql="""
+            INSERT INTO normalized_citations
+                (normalized_sha1, reference_normalized, appears_on_domain_id, appears_on_page_id, citation_type)
+            SELECT s.normalized_sha1, s.reference_normalized, d.id, s.appears_on_page_id, s.citation_type
+            FROM _nc_stage s JOIN domains d ON d.value = s.appears_on_domain
+            WHERE s.appears_on_page_id IS NOT NULL AND s.citation_type <> ''
+            ON CONFLICT (normalized_sha1) DO UPDATE SET
+                reference_normalized = EXCLUDED.reference_normalized,
+                appears_on_domain_id = EXCLUDED.appears_on_domain_id,
+                appears_on_page_id = EXCLUDED.appears_on_page_id,
+                citation_type = EXCLUDED.citation_type""",
+        sort_by='normalized_sha1')
+    if staged != written:
+        log(f"normalized_citations: warning: {staged - written} rows skipped "
+            f"(unknown domain, missing page id or citation_type)")
 
 
 def load_citation_instances(session, staging_dir):
@@ -320,50 +547,41 @@ def load_citation_instances(session, staging_dir):
     if not filepath:
         return
     log(f"citation_instances: loading from {filepath}")
-
-    count = 0
-    skipped = 0
-    for batch in read_parquet_batches(filepath):
-        sha1s = list({r['normalized_sha1'] for r in batch if r.get('normalized_sha1')})
-        sha1_to_norm = {}
-        for chunk in chunked_iterable(sha1s, 1000):
-            result = session.execute(
-                sa_select(NormalizedCitation.normalized_sha1, NormalizedCitation.id)
-                .where(NormalizedCitation.normalized_sha1.in_(chunk))
-            ).all()
-            sha1_to_norm.update(dict(result))
-        domain_to_id = _domain_ids(session, (r.get('domain') for r in batch))
-
-        cleaned = []
-        for r in batch:
-            norm_id = sha1_to_norm.get(r.get('normalized_sha1'))
-            domain_id = domain_to_id.get(r.get('domain'))
-            if norm_id is None or domain_id is None:
-                skipped += 1
-                continue
-            expected = instance_id(r['domain'], r['page_id'], r['raw_sha1'])
-            staged = r.get('citation_instance_id')
-            if staged is not None and staged != expected:
-                raise RuntimeError(
-                    f"citation_instance_id mismatch for ({r['domain']}, {r['page_id']}, {r['raw_sha1']}): "
-                    f"staged {staged}, computed {expected}")
-            cleaned.append({
-                'id': expected,
-                'domain_id': domain_id,
-                'page_id': r['page_id'],
-                'raw_sha1': r['raw_sha1'],
-                'normalized_id': norm_id,
-                'reference_type': r.get('reference_type', 0),
-                'reference_name': r.get('reference_name'),
-            })
-
-        if cleaned:
-            CitationInstance.bulk_upsert(session, cleaned)
-            session.commit()
-            count += len(cleaned)
-    if skipped:
-        log(f"citation_instances: warning: {skipped} rows skipped (no matching normalized citation or unknown domain)")
-    log(f"citation_instances: {count} rows loaded")
+    _analyze(session, 'domains', 'normalized_citations', vacuum=True)
+    computed = instance_id_sql('domain', 'page_id', 'raw_sha1')
+    staged, written = _copy_load(
+        session, 'citation_instances', filepath, target='citation_instances', defer_fks=True,
+        source_sql=f"""
+            SELECT CASE WHEN citation_instance_id IS NOT NULL AND citation_instance_id <> computed
+                        THEN error('citation_instance_id mismatch for (' || domain || ', ' || page_id || ', '
+                                   || raw_sha1 || '): staged ' || citation_instance_id || ', computed ' || computed)
+                        ELSE computed END AS id,
+                   domain, page_id, raw_sha1, normalized_sha1,
+                   COALESCE(reference_type, 0) AS reference_type, reference_name
+            FROM (SELECT *, {computed} AS computed FROM src)""",
+        temp_table='_ci_stage',
+        temp_ddl='id bigint, domain text, page_id integer, raw_sha1 char(40), normalized_sha1 char(40), '
+                 'reference_type smallint, reference_name text',
+        columns=['id', 'domain', 'page_id', 'raw_sha1', 'normalized_sha1', 'reference_type', 'reference_name'],
+        # rows without a matching normalized citation or domain are skipped
+        insert_sql="""
+            INSERT INTO citation_instances
+                (id, domain_id, page_id, raw_sha1, normalized_id, reference_type, reference_name)
+            SELECT s.id, d.id, s.page_id, s.raw_sha1, n.id, s.reference_type, s.reference_name
+            FROM _ci_stage s
+            JOIN domains d ON d.value = s.domain
+            JOIN normalized_citations n ON n.normalized_sha1 = s.normalized_sha1
+            ON CONFLICT (id) DO UPDATE SET
+                normalized_id = EXCLUDED.normalized_id,
+                reference_type = EXCLUDED.reference_type,
+                reference_name = EXCLUDED.reference_name""",
+        index_lookups=True,
+        # the order of uix_ci_domain_page_raw, the largest index; the 8-byte
+        # primary key and the normalized_sha1 lookups stay random but small
+        sort_by='domain, page_id, raw_sha1')
+    if staged != written:
+        log(f"citation_instances: warning: {staged - written} rows skipped "
+            f"(no matching normalized citation or unknown domain)")
 
 
 def load_ncwr(session, staging_dir):
@@ -372,42 +590,27 @@ def load_ncwr(session, staging_dir):
     if not filepath:
         return
     log(f"ncwr: loading from {filepath}")
-
-    count = 0
-    for batch in read_parquet_batches(filepath):
-        # Resolve URLs to web_resource_ids
-        urls = list(set(r['url'] for r in batch))
-        url_to_id = {}
-        for chunk in chunked_iterable(urls, 1000):
-            result = session.execute(
-                sa_select(WebResource.url, WebResource.id).where(WebResource.url.in_(chunk))
-            ).all()
-            url_to_id.update({u: i for u, i in result})
-
-        # Resolve normalized_sha1 -> normalized_id
-        sha1s = list(set(r['normalized_sha1'] for r in batch))
-        sha1_to_id = {}
-        for chunk in chunked_iterable(sha1s, 1000):
-            result = session.execute(
-                sa_select(NormalizedCitation.normalized_sha1, NormalizedCitation.id)
-                .where(NormalizedCitation.normalized_sha1.in_(chunk))
-            ).all()
-            sha1_to_id.update({s: i for s, i in result})
-
-        cleaned = []
-        for r in batch:
-            wr_id = url_to_id.get(r['url'])
-            norm_id = sha1_to_id.get(r['normalized_sha1'])
-            if wr_id is not None and norm_id is not None:
-                cleaned.append({
-                    'normalized_id': norm_id,
-                    'web_resource_id': wr_id,
-                })
-        if cleaned:
-            NormalizedCitationWebResource.bulk_upsert(session, cleaned)
-            session.commit()
-            count += len(cleaned)
-    log(f"ncwr: {count} rows loaded")
+    _analyze(session, 'normalized_citations', 'web_resources', vacuum=True)
+    staged, written = _copy_load(
+        session, 'ncwr', filepath, target='normalized_citation_web_resources', defer_fks=True,
+        # URLs resolve through url_hash, the indexed unique key (there is no index on url)
+        source_sql="SELECT normalized_sha1, md5(url) AS url_hash FROM src "
+                   "WHERE normalized_sha1 IS NOT NULL AND url IS NOT NULL",
+        temp_table='_ncwr_stage', temp_ddl='normalized_sha1 char(40), url_hash char(32)',
+        columns=['normalized_sha1', 'url_hash'],
+        insert_sql="""
+            INSERT INTO normalized_citation_web_resources (normalized_id, web_resource_id)
+            SELECT n.id, w.id
+            FROM _ncwr_stage s
+            JOIN normalized_citations n ON n.normalized_sha1 = s.normalized_sha1
+            JOIN web_resources w ON w.url_hash = s.url_hash
+            ON CONFLICT DO NOTHING""",
+        index_lookups=True,
+        # normalized_citations were inserted in normalized_sha1 order, so their
+        # ids, and this table's primary key, grow with it
+        sort_by='normalized_sha1, url')
+    if staged != written:
+        log(f"ncwr: {staged - written} rows not written (unresolved citation or URL, or already present)")
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +794,7 @@ def _write_template_counts(session, domains, counts):
 # ---------------------------------------------------------------------------
 
 def main(argv=None):
-    global BATCH_SIZE
+    global BATCH_SIZE, LOAD_JOBS, DEFER_FKS
     parser = argparse.ArgumentParser(description='Load staged Parquet files into PostgreSQL')
     parser.add_argument('-d', '--staging-dir', default=os.environ.get('STAGING_DIR', './staging'),
                         help='Staging directory (default: STAGING_DIR env or ./staging)')
@@ -600,6 +803,13 @@ def main(argv=None):
                              'required for the template_data phase')
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE,
                         help=f'Rows per INSERT batch (default: {BATCH_SIZE})')
+    parser.add_argument('--jobs', type=int, default=LOAD_JOBS,
+                        help='Connections loading web_resources, normalized_citations, citation_instances '
+                             f'and ncwr in parallel, one Parquet row group per unit (default: LOAD_JOBS or {LOAD_JOBS})')
+    parser.add_argument('--defer-fks', action=argparse.BooleanOptionalAction, default=DEFER_FKS,
+                        help='Drop the foreign keys of citation_instances / normalized_citation_web_resources '
+                             'when the table is empty at the start of its phase, and add and validate them '
+                             'after it (default: on; LOAD_DEFER_FKS=0 turns it off)')
 
     all_phases = OrderedDict([
         ('containers',           ('Phase 1: containers',            lambda s, d, ctx: load_containers(s, d))),
@@ -624,6 +834,11 @@ def main(argv=None):
         raise SystemExit(f"Staging directory does not exist: {staging_dir}")
 
     BATCH_SIZE = args.batch_size
+    if args.jobs < 1:
+        raise SystemExit("--jobs must be at least 1")
+    LOAD_JOBS = args.jobs
+    DEFER_FKS = args.defer_fks
+    log(f"jobs {LOAD_JOBS}, defer foreign keys {DEFER_FKS}")
 
     session = make_session()
     t0 = time.time()

@@ -23,7 +23,7 @@ the result through `/api/v2` and a dashboard. Work happens on the **`v3`** branc
 | `docs/design/` | The design (`proposed_*.md`, decisions, implementation plan) | Update when behaviour changes |
 | `docs/runbook.md` | Build order, what each step owns, re-run units, serving | Update when a step's outputs or re-run behaviour change |
 | `docs/uva/` | Upstream UVA docs, reference for `wcd_semantic` | No |
-| `scripts/` | Fixture page selection, history export, extractor sample | Yes |
+| `scripts/` | Fixture page selection, history export, extractor sample; the Stage-0 dump pipeline; `benchmarks/` (Stage 0 fingerprint, Stage 1 sample estimate, link-addition vs IABot, plan §§18–19, §25) | Yes (`benchmarks/link_added/iabot_get_times_added_port.py` is AGPL-3.0, a port of IABot) |
 
 ## Commands
 

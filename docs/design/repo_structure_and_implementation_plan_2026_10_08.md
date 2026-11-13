@@ -584,3 +584,182 @@ The database already has the new schema (`template_data` dropped, `template_valu
 **Decisions taken without asking:** `dedup` partitioned by `page_id` / `hash(normalized_sha1)` with a 20M-row default; template rows keyed by name and `normalized_sha1` (not Postgres ids), so `load` never resolves 2.5 billion ids; md5 for the search bucket (DuckDB's `hash()` is not stable across versions); a 1,000-citation threshold for precomputed totals; report order by `normalized_sha1`.
 
 **Open:** add the disk, then Stage 3 `load` onward; the deduped files' compression; whether `normalized_citation_parts` needs every historical normalized citation; response caching for the API (the build-id-keyed LRU of the discussion, not built); Stage 1's ~1,200 files per Parquet bucket (§18).
+
+## 21. Stage 3 `load` at enwiki scale: COPY, parallel units, key order, and where it stops (2026-11-09/10)
+
+The disk was grown to 2.5 TB (1.6 TB free), enough for the rest of the build by §20's estimate. This section benchmarks `wcd load` on enwiki-20261001 namespace 0. All runs used the 28 GB systemd scope, `LOAD_MEMORY_LIMIT=8GB`, and the Postgres settings in the runbook. Before each run, the tables were reset to the post-Stage-0 state: the cited `web_resources` rows were deleted (`numeric_page_id IS NULL`; all 19,314,502 Stage-0 rows have it set) and `normalized_citations` was truncated with its cascade. Logs and a per-minute row sampler are in `/home/jh/wcd-data/stage3-load/`.
+
+**Baseline (39424d5: Python lookups plus multi-row `INSERT … VALUES`).** `domains` took 5 min 50 s for 7,509,746 rows (21.5k rows/s). `web_resources` ran at a steady 7.8k rows/s over 16 minutes, about 3.85 h for its 107,961,812 rows; the four citation tables hold ~1.02 billion rows. The `ncwr` loader looked URLs up by `web_resources.url`, which has no index (only `url_hash` does), so on enwiki it would have scanned ~127M rows per 1,000 URLs and never finished. The run was stopped during `web_resources`.
+
+**COPY and `INSERT … SELECT` (454a3c6).** `web_resources`, `normalized_citations`, `citation_instances` and `ncwr` now go through the COPY path that §20 wrote for template data. DuckDB reads the deduped Parquet and computes `url_hash` (`md5(url)`) and the checked `citation_instance_id` (`instance_id_sql`; a mismatch raises). COPY fills a temp table, and one `INSERT … SELECT` per unit resolves the natural keys in Postgres. `ncwr` resolves URLs through `url_hash`. The skip rules, the upsert onto Stage-0 article rows, and the id check are unchanged; `test_load_sets` covers them, and the ci fixture golden run is identical. With one connection, `web_resources` took 3,653 s (29.6k rows/s), with that one backend at 100 % of a core and the machine otherwise idle.
+
+**Parallel units (6052d06).** `copy_parquet_parallel` loads one Parquet row group per unit on `--jobs` connections (`LOAD_JOBS`, default 8), each unit committed on its own, as Stage 0 loads revisions. The deduped tables have one row per conflict key, so units never write the same key, and an interrupted load resumes on re-run. With 16 jobs, `web_resources` took 1,039 s (103.9k rows/s). `normalized_citations` started at ~114k rows/s and fell steadily to ~12k (9,822 s for 284,514,231 rows, 29.0k rows/s on average). Its `normalized_sha1` unique index (18 GB; random keys leave pages ~70 % full) outgrew the cache, so every insert became a random read: 14 of 16 backends in `IO:DataFileRead`, the disk 87 % busy at ~5.7k IOPS. `citation_instances` then committed no unit (500k rows) in 16.6 min, while an insert-triggered, throttled autovacuum read `normalized_citations`' 68 GB heap.
+
+**Key-ordered units and a VACUUM before the lookups (0b1cbe1, 13d7532).** With `sort_by`, DuckDB first writes a copy of the deduped file in key order (in `<staging>/.load-sort`, removed afterwards; a SIGTERM skips that cleanup). The units are its row groups, started in key order, so the 16 in flight cover adjacent key ranges. Keys: `md5(url)` for `web_resources`, `normalized_sha1` for `normalized_citations`, `(domain, page_id, raw_sha1)` for `citation_instances` (the order of its largest index), and `(normalized_sha1, url)` for `ncwr`. `VACUUM (ANALYZE)` now runs on the lookup tables before `citation_instances` and `ncwr`, unthrottled and only once. Results with 16 jobs:
+
+| phase | unsorted, 16 jobs | sorted, 16 jobs |
+|---|---|---|
+| `web_resources` (108.0M) | 1,039 s | 127 s sort + 1,077 s load = 1,204 s |
+| `normalized_citations` (284.5M) | 9,822 s, 114k → 12k rows/s | 2,558 s sort + 3,543 s load (80k rows/s, no decline) = 6,101 s |
+| VACUUM `normalized_citations` | — (throttled autovacuum during the next phase) | 387 s |
+| `citation_instances` (338.1M) | no unit committed in 16.6 min | 606 s sort; no unit committed in 22 min |
+
+Sorting gains nothing for `web_resources`, whose 9 GB `url_hash` index stays cached. It removes the collapse for `normalized_citations`, but the sort itself (43 min, mostly DuckDB writing the ordered run on about one core) eats much of the gain. With sorted units, 10–14 of 16 backends wait on `LWLock:BufferContent`. The likely cause is that every connection takes ids from the same sequence and appends to the rightmost leaf of the primary key.
+
+**Why `citation_instances` still stalls.** An `EXPLAIN (ANALYZE, BUFFERS)` of the real INSERT on 20,000 sorted rows, in one extra connection beside the 16 loaders, took 241 s (83 rows/s):
+
+- 44.5 s (2.2 ms per row) went on the `normalized_sha1` lookups: 52k pages read, and 45k dirty pages that backend had to write out first to get free buffers.
+- Most of the rest went to the INSERT itself, mostly waiting for buffers to be written back. Each write is a synchronous random 8 kB write (this disk: ~30 ms write latency, ~240 MB/s writes, ~25k read IOPS).
+
+The dirt comes from the foreign key on `normalized_id`. Each check takes a `FOR KEY SHARE` lock on the referenced row, which writes `xmax` into a random page of the 68 GB `normalized_citations` heap. Across 338M rows, the whole referenced heap becomes random writes. No single input order fixes this: `citation_instances` is keyed by page, the lookup by normalized citation. `ncwr` has the same pattern against `web_resources`. The run was stopped there. The database keeps `web_resources` (127,276,314 rows) and `normalized_citations` (284,514,231) fully loaded; `citation_instances` and `ncwr` are empty.
+
+**Decisions taken without asking:** the COPY and parallel rewrite of the four loaders (output identical, re-run behaviour unchanged); index lookups forced per unit (`index_lookups`: hash and merge joins off) for `citation_instances` and `ncwr`; key-ordered units; VACUUM before the probing phases; `LOAD_JOBS` default 8 (16 on enwiki). All tiers: 370 passed, 3 skipped.
+
+**Open (needs a decision):**
+1. **Defer the foreign keys of `citation_instances` (`normalized_id`, `domain_id`) and `ncwr` when loading into empty tables:** drop, load, then `ADD CONSTRAINT … NOT VALID` plus `VALIDATE CONSTRAINT`, one set-based join without row locks. §18 measured this on `revisions` and did not adopt it. There the referenced tables were small. Here the referenced table is 68 GB and the per-row lock is the bottleneck. A crash between drop and re-add has to be handled on re-run.
+2. **Resolve `normalized_sha1` to an id without a heap fetch per row:** `INCLUDE (id)` on the unique `normalized_sha1` index (index-only lookups), or resolution in DuckDB from an exported `(normalized_sha1, id)` file.
+3. **The hot rightmost primary-key leaf:** have the loader assign each unit a disjoint id range (offset plus row position in the sorted file, then `setval`), as Stage 0's units have disjoint `rev_id` ranges.
+4. **The sort's cost:** have `dedup` write the citation tables in key order (it already partitions by key), or sort only the key and a row index.
+5. **I/O:** a larger `max_wal_size` (57 requested checkpoints during `normalized_citations`) and the disk's throughput limit.
+
+## 22. Stage 3 `load`: deferred foreign keys, `INCLUDE (id)`, per-unit id ranges, measured; Stage 3 complete on enwiki (2026-11-10)
+
+This section follows up §21's open items 1–3, which the user asked to try alone and in combination. All runs used 16 jobs, the 28 GB scope, and the key-sorted units of §21. The sorted copies were kept between runs (`LOAD_KEEP_SORTED=1`, `52b3f82`: copies are named after their source and reused). Times below are load time, without the sort, unless a row says otherwise. Partial runs compare the first 200 units. Logs: `/home/jh/wcd-data/stage3-load/exp-*.log`.
+
+**normalized_citations (284.5M rows).**
+
+| variant | first 200 units | full load | notes |
+|---|---|---|---|
+| sorted, sequence ids, FK kept (§21) | 1,246 s | 3,543 s | 10–14 of 16 backends on `LWLock:BufferContent` |
+| per-unit id ranges | 1,212 s | — | the BufferContent waits are gone; backends now wait on `WALInsert` / `WALWrite` |
+| deferred FK | 1,302 s | 3,578 s, + 449 s to validate | — |
+
+With id ranges, each unit takes ids `max(id) + 1 + row position`, so the units append to separate ranges of the primary key. That removes the contention on its rightmost leaf, but the load is WAL-bound and throughput did not change. The FK on `appears_on_domain_id` references a single domain row, and deferring it saves nothing while its validation costs 7.5 min. Neither was adopted; the id-range code was removed and stays in `52b3f82`.
+
+**citation_instances (338.1M rows).**
+
+| variant | rate | notes |
+|---|---|---|
+| FKs kept, plain `normalized_sha1` index (§21) | < 6k rows/s | no unit committed in 22 min |
+| `INCLUDE (id)`, FKs kept | ≈ 0 | no unit committed in 13 min; 541 read IOPS but 3.7k random write IOPS at 89 % busy (the FK row locks dirtying `normalized_citations`' heap) |
+| FKs deferred, plain index | 42–54k rows/s | 20–38k read IOPS: the `normalized_sha1` leaf plus a heap fetch for `id`, per row |
+| FKs deferred, `INCLUDE (id)` | 81.8k rows/s average (up to ~140k) | full run: 4,132 s, + 225 s and 336 s to validate the two keys |
+
+Building the `INCLUDE (id)` index on the loaded table took 8.6 min (18 GB, the size of the old index, which inserts had left ~70 % full). Both changes are needed: the per-row FK lock is the bottleneck, and once it is gone the heap fetch for `id` is.
+
+**ncwr (289.8M rows), keys deferred:** 650 s sort, ~1,460 s load (255k rows/s steady, 617 read IOPS: `web_resources` stays cached, so `url_hash` needs no `INCLUDE`), and 655 s + 148 s to validate: 49 min in all. Every row resolved.
+
+**Template parameters (phase 8, first run at enwiki scale):** `template_param_index` 1,365,988,136 rows in 24 min; `template_params` 6,438,109,681 rows in 86 min (one row per template parameter per page that uses the citation); `template_value_counts` 122,757 heavy values. 1 h 51 min in all, peak RSS 11.6 GB (`LOAD_MEMORY_LIMIT=8GB`). The Parquet takes 35 GB and 25 GB.
+
+**Adopted (`9003000`):**
+
+- `load` defers the foreign keys of `citation_instances` and `normalized_citation_web_resources` when the table is empty at the start of its phase (`--defer-fks`, `LOAD_DEFER_FKS`, default on). Afterwards it adds every missing declared key `NOT VALID` and validates every unvalidated one. This runs after every load phase, so a load killed in between restores the keys on its re-run, and gate 3 fails while any is missing or unvalidated (`test_interrupted_deferred_load_restores_foreign_keys`).
+- `normalized_citations`' natural key is now `UNIQUE INDEX normalized_citations_normalized_sha1_key (normalized_sha1) INCLUDE (id)`, which replaces the unique constraint under the same name. `ON CONFLICT (normalized_sha1)` infers it, and `init-db` always creates unique indexes. An existing database needs the swap by hand: create the new index, drop the constraint, rename.
+
+**Stage 3 on enwiki, end to end** (phase by phase across these runs; the sum is ≈ 6 h 25 min for `load`):
+
+| phase | rows | time |
+|---|---|---|
+| domains | 7.5M | 6–8 min |
+| web_resources (cited) | 108.0M | 20 min |
+| normalized_citations | 284.5M | 1 h 42 min (incl. 43–48 min sort) |
+| citation_instances | 338.1M | 1 h 28 min (10 min sort, 69 min load, 9.4 min validation) |
+| ncwr | 289.8M | 49 min |
+| template Parquet | 2.5B → 1.37B + 6.44B | 1 h 51 min |
+
+Against the §21 baseline (row-by-row upserts at ~7.8k rows/s, with ncwr never finishing), the four Postgres phases went from 36+ hours (projected) to ~4.3 h. **Gate 3 passes** (11 min; it now includes the foreign-key check), so Stage 3 is complete for enwiki-20261001.
+
+**Decisions taken without asking:** dropping id ranges after measuring no gain; keeping `normalized_citations`' FK; making deferral the default for the two tables; no `INCLUDE` on `url_hash`; reusing a kept sorted copy, matched by source size and mtime.
+
+**Open:** the sort is now the largest single cost (43–48 min of DuckDB writing the ordered run on about one core for `normalized_citations`). Having `dedup` write the citation tables in key order, or sorting only the key and a row index, would remove most of it. `init-db --add-indexes` (Stage 3's secondary indexes) has not been run yet. WAL and checkpoint I/O is the remaining Postgres limit (§21 item 5).
+
+## 23. Stages 4–6 at enwiki scale: what broke and what changed (2026-11-10/11)
+
+Run on enwiki-20261001 after Stage 3 (§22), on the 28-core, 62 GB VM, each step in a memory-capped systemd scope. All changes keep the output identical unless a bullet says otherwise; the fixture goldens and the upstream `wcd_semantic` goldens pass throughout (full suite: 374 → ~390 tests, all passing).
+
+**Indexes after Stage 3.** `init-db --add-indexes` built every secondary index in the schema, including the Stage 4–7 tables', which would then have been loaded through 8 indexes on `normalized_citation_parts` alone. `--table` (several tables) now scopes it: the 7 indexes of `web_resources`, `citation_instances` and `revisions` took 28 min (`revisions` 2 × ~11 min); each later table's indexes are built after its stage (`normalized_citation_parts` 8 indexes in 28 + 14 min, `ref_name_links` 47 s).
+
+**Stage 4 `parts`** (`8449043`, `4cb61c7`, `1cd5389`, `81f2850`): 295,029,274 parts (211 GB) from 284.5M citations, gate 4 passes.
+- One process would have taken a day: the normalizers cost ~4,170 citations per CPU-second (sample of 58,754). `--jobs` (24) spawned processes now take 1M-id ranges; ~2 h, Python-bound (~46k citations/s).
+- The parts table's foreign key is deferred like Stage 3's (`fkeys` module, shared by load, parts, ref-name-links and gates 3–5); validation 12 min.
+- One citation (a 227,137-character vandalised `<ref>`) held a worker for ~85 CPU-min: the vendored `_RELIABLE_YEAR_RE` retried two name alternatives at every letter of a word. They now start only at a word start (NOTICE deviation 2; identical matches on the corpus and 20,000 random strings; 227k letters 0.56 s). A first fix that cut long letter runs before the normalizer was replaced at the user's request: it would also have cut real base64 URL parameters.
+- Gate 4 found URL citations without `extracted_url`: 2,385 `ftp://` (the normalizer extracts only http/https), 127 whose only part was an embedded `{{Citation needed}}` (the splitter dropped the URL text), ~30 malformed. Stage 4 now falls back to the citation's first URL (templates and wiki quote markup removed, a host required) and, decided with the user, adds a URL part when no part carries one. Gate 4 checks per citation, and only citations whose text has a URL with a host (90 have none, e.g. `[http://'"around%2080%20…`).
+
+**Stage 4.6 `denorm-export`** (`93e3640` … `ec5c5b1`): 348,766,774 rows (50 GB), gate passes; ~2 h.
+- A server-side cursor never runs a parallel plan: the 3-way join spilled 95 GB of hash batches on one backend without a row in 30 min. The export is now `COPY (SELECT …) TO STDOUT` (8 parallel workers) into a CSV (203 GB, 45 min), read by DuckDB with explicit types into Parquet (26 min; one core, quoted newlines), then repartitioned.
+- `work_mem` 1GB × 9 parallel processes took Postgres past RAM: the kernel OOM-killed a worker and the server restarted (crash recovery, no loss). `DENORM_WORK_MEM` 256MB.
+- A 2.8 MB row (one URL repeated) exceeded DuckDB's 2 MB CSV line limit (`DENORM_MAX_LINE_SIZE`, 64 MB); the cleanup then deleted the export. The CSV and the converted Parquet are now kept on failure and `--reuse-export` reuses them.
+- The one-statement repartition (sort + 512-way partitioned write) ran DuckDB out of memory at 16 GB: it now splits by bucket group (16) first and sorts each group alone (41 min).
+
+**Stage 5 `ref-name-links`** (`aad31fc`, `333c258`, `dbbaaca`): 92,759,078 links from 72.8M named instances, gate 5 passes; 1 h 34 min.
+- Named instances move into DuckDB as Arrow batches, bucket results go to Postgres by COPY, foreign keys deferred (was `executemany` and `execute_values`; the fixture step went 5.1 → 1.5 s).
+- A B-tree entry is limited to ~2.7 KB: 14 ref names exceed it (longest 83 KB, all vandalism). Decided with the user: `ref_name_links` is keyed on `ref_name_md5`, a stored generated column. `idx_ncp_doi` / `idx_gs_doi` are hash indexes (a 3,984-byte extracted DOI).
+- Gate 5 compared range bounds as revision ids and reported 703 overlapping pairs on 126 pages; none overlap in time (imported histories whose ids run backwards). It now orders ranges by (timestamp, id), per bucket in DuckDB.
+
+**Stage 6 `match`** (`0c5bc92`, `f5f3e10`, `7583cec`, `dd6bacf`): running at the time of writing; one bucket (~14k pages, ~610k parts) takes ~21 min on one core.
+- Each page's rows were found by a boolean mask over the whole bucket (O(pages × rows)); now one `groupby`.
+- py-spy put 56 % of the time in `DataFrame.iterrows` inside the vendored `build_merged_sources` Pass 3, which rebuilt the template side per unmerged ref-tag source; it is now built once per page (NOTICE deviation 3). The rest is spread over per-page pandas overhead (~85 ms per page) in the vendored matchers.
+- Every DuckDB connection now takes `DUCKDB_MEMORY_LIMIT` / `DUCKDB_THREADS` / `DUCKDB_TEMP_DIRECTORY` (unset, each of 14 workers would take 80 % of RAM). Materialising a bucket with 28 threads under 8 GB made DuckDB 1.5.6 segfault in `.df()`; buckets are now matched in 8 page slices, each written as it finishes (peak 9.4 → 4.3 GB per worker). Bucket 0's outputs are identical, as row multisets, to the one-piece run's.
+- Full run: 9 workers (DuckDB 3 GB, 2 threads each) in a 44 GB scope beside Postgres' 16 GB of shared buffers; ~20 h for 6a–6c. 6d (cross-page, single process) and gate 6 follow.
+
+**Decisions taken without asking:** per-table index builds; `parts` worker count; hash DOI indexes; gate 4 skipping URL citations without a host; the denorm export via CSV; Stage 6 slicing and worker sizing.
+
+**Open:** Stage 6's per-page pandas cost (vectorising the vendored matchers is the only large lever left); 6d's memory; Stage 7 (7b moves the whole match result through Python into a table with foreign keys to the 295M-row parts table, the pattern that stalled Stage 3); Stage 8.
+
+## 24. Stages 6d–8 at enwiki scale: the build completes (2026-11-12/13)
+
+Continues §23 on the same VM and scopes. Every change keeps the output identical: the fixture goldens pass throughout (full suite 392 passed, 3 skipped), and each rewrite was also compared with the code it replaced, as each bullet says.
+
+**Stage 6 `match`** (`50bf090`, `1fc859f`, `eff2d59`, `30ef2d8`): 131,713,712 merged sources → 121,902,075 global sources, gate 6 passes.
+- 6a–6c, rerun with `--force` after the shared-spill-directory fix (`1fc859f`, one DuckDB temp directory per connection): 512/512 buckets in 22 h 12 min, 9 workers, peak ~4.3 GB each.
+- 6d is the scaled engine of `50bf090` (integer union-find; author+year groups scored with rapidfuzz `cdist`); on the fixture and random inputs it writes exactly what the vendored `match_global` writes. On enwiki: numbering 19–22 min; hard identifiers (doi 1,260,602, isbn 3,412,601, pmid 509,616, pmc 203,262, arxiv 74,865, wikidata 13,312 merges) in 22 s; author+year 145,599,163 pairs over the threshold in 64 min, nearly all inside components already joined. 13,393,378 sources fall in 3,581,741 multi-member components.
+- The component build ran DuckDB out of memory twice. First the per-root `string_agg(… ORDER BY …)` / `list()` aggregates over all 131.7M sources (ordered aggregates hold every group); now a singleton is emitted from its own row and only the 13.4M members of multi-member components are aggregated, their sha1 and page list computed in Python over a stream sorted by (root, merged_source_id). Then the one `gs` table of ~118M wide rows joined to `canon_type` on a sha1 string; now the global sources and their map are built and written per 8M-source range (`MATCH_GLOBAL_CHUNK_ROWS`), 17 files per dataset.
+- The union-find result is saved (`_global_unions/`); `match --reuse-unions` skipped the hour-long pass on the third run: 32 min, peak 31.9 GB with DuckDB at 28 GB.
+
+**Stage 7 `materialize`** (`379a27d`, `5457685`, `4c1f1c6`, `1a637ba`, `a34c62f`): first run on enwiki; 7a–7h ~10 h of run time once fixed.
+- 7a: 121,902,075 global sources streamed in 25 min. 7b: 332,975,833 `citation_source_resolution` rows per bucket in DuckDB, 72 min, plus 30 min validating its three deferred foreign keys. 7c: the resolved denorm (348,766,774 rows, as Stage 4.6) in 2 h 06 min.
+- 7d joined each bucket's ~256k `page_source_summary` rows to `global_sources` in Postgres: one random primary-key read per row into a 29 GB table, ~2 min per bucket (~17 h). Now each bucket's rows go to scratch Parquet (the file is its checkpoint) and one DuckDB join with `global_sources_stage` (what 7a loaded) adds the source columns before a plain COPY: 131,510,883 rows in 1 h 57 min, foreign keys validated. The step fails if fewer rows load than were computed, where the old inner join dropped them silently.
+- 7e and 7f, each one UPDATE of every global source, both met the planner's estimate of ~16M / ~2M groups where there are ~121M / ~100M: hash aggregates and hash joins in 64 MB of `work_mem`, spilling for over an hour (7e) and 2 h 20 min (7f, ~800 GB read) without writing a row; both were cancelled. 7e now sorts and merge-joins `global_sources` through its primary key (7a loads it in key order): 40 min. 7f now builds the canonical part per sha1 and the scores into analyzed temp tables and applies them the same way: 57 min. Both with `STAGE7_WORK_MEM` (1GB). `test_stage7_score` (25,200 input combinations against the per-row `compute_score`) passes for both.
+- 7g 11 min; 7h 19,314,502 pages, 65 min. The 12 secondary indexes of the three Stage 7 tables: 48 min (`idx_gs_doi` 16 min).
+- Gate 7 (after the indexes) passes in 42 min, most of it the orphan anti-joins.
+
+**Stage 8 `revision-stats`** (`3481bbb`): 895,604,187 rows (one per revision), gate 8 passes, 45.6 min with 6 workers (DuckDB 4 GB, 3 threads; 9.1 GB of Parquet).
+- The first run went at ~11 min per bucket (~16 h): ten `count(DISTINCT …) FILTER` aggregates over the ~62M-row history ⋈ denorm join per bucket. The denorm is now reduced per instance and per (instance, source) first, and the revision counts are plain counts (`citation_history` has one row per (instance, revision); an instance has one type, both checked on a bucket). Old and new queries give the same rows on buckets 0, 30 and 257, 5–6× faster.
+
+**Decisions taken without asking:** stopping and rewriting 7d, 7e, 7f and Stage 8 mid-run rather than letting them finish; 6d's saved unions and `--reuse-unions`; 7d's scratch files under `$PARQUET_DIR/_scratch/`; `STAGE7_WORK_MEM` 1GB; running Stage 8 beside the Stage 7 index build.
+
+**Open:** gate 7's orphan anti-joins re-check foreign keys Postgres already validated (each a full scan of a 100M+-row table); 7e and 7f still rewrite all of `global_sources` twice (~55 GB of heap before VACUUM), which a single rewrite of the table could avoid; Stage 6a–6c's per-page pandas cost (§23); the API against the enwiki database is not yet exercised.
+
+## 25. When was this link added? WCD against InternetArchiveBot's search (2026-11-13)
+
+InternetArchiveBot needs the date a link was added to an article, to pick the archive snapshot closest to when it was cited. It finds the date by binary-searching the article's history through the Wikipedia API. This section times the same lookup from the enwiki build (§24) on 50 articles and runs IABot's own algorithm on the same links (SCA-349). Scripts: `scripts/benchmarks/link_added/` (README there). Report for the client: https://claude.ai/artifact/4jAKdP7PjMxmFW97An2G4r.
+
+**The lookup.** For one page: the URLs of all its citation instances (`citation_instances` → `normalized_citation_web_resources` → `web_resources`), then each instance's revisions from `citation_history`, joined to the page's revisions in (timestamp, id) order. Each instance's revisions become runs of consecutive revisions; the runs are mapped to URLs and merged per URL. For each link in the latest revision this gives its **first addition**, the **start of its current run** (the revision that last put it back), and its number of runs. Two choices made it fast. The interval form gives the same rows as a per-(URL, revision) DISTINCT, 2–6× faster. The instance→URL map goes into DuckDB as an Arrow table; `executemany` took 4 s on India.
+
+**Sample.** Pages with at least one reference, ten per band of revision count (1–9 up to 10,000+), spread over each band by reference count, fixed seed (`pick_sample.sql`): 1 to 30,569 revisions, 5,684 current links. 7 pages have references with no URL.
+
+**WCD timings** (one process on the build machine, no HTTP layer or network):
+
+| | median | 90th percentile | max |
+|---|---|---|---|
+| cold (OS page cache dropped; Postgres buffers kept) | 0.19 s | 0.95 s | 6.5 s (Syrian civil war, 750 links) |
+| warm | 0.08 s | 0.22 s | 1.2 s |
+| whole-bucket `citation_history` read, as the API does today | 0.70 s | 0.96 s | 4.1 s |
+
+46 of 50 pages answer in under a second cold. A bucket's `citation_history` is 1,203 files, one per dump shard. Their names carry the page range, so the lookup opens only the page's file; the whole-bucket read gave the same links on all 50 pages.
+
+**IABot's algorithm.** `APII::getTimesAdded()` and `getPageHistory()` were ported line by line (`iabot_get_times_added_port.py`, AGPL-3.0 like IABot) and run against live Wikipedia, with all of a page's links in one call, as on its first visit to a page. Without a bot account, revisions come 50 at a time; the port follows continuation up to what one bot response holds (500 revisions or 8 MiB) and counts the bot's requests. The history was cut at the dump's last revision. Articles with more than 150 links (9) were left out to limit the load on Wikipedia. On the other 34 articles (1,076 links):
+
+* IABot took 308 s in total (median 2.1 s, worst 65 s on Federer–Nadal rivalry), with 480 bot requests and 314 MB of wikitext. These times include all network traffic, from the build machine rather than from Wikimedia Cloud.
+* WCD answered the same articles in 8.4 s cold, a median of 13× faster per article, with no requests to Wikipedia.
+
+**Agreement.** 969 links get the same revision from both. 70 more agree once `http` and `https` count as one link, IABot's definition (`any_scheme.py`). 12 IABot dates to the start of the current run. That makes 1,051 of 1,076 (97.7 %). The other 25 are IABot artefacts:
+
+* 20 dated earlier. IABot's pattern is a substring match, so it also fires inside a longer URL that contains the link: `http://www.ctv.ca` inside `…/servlet/…`, or the original inside its own `web.archive.org/web/…/` URL (`explain_disagreements.py` shows each match).
+* 5 dated later. These links were removed and re-added 3 to 18 times, and a binary search can land on any re-addition.
+
+**WCD checked against Wikipedia.** For 45 links (the 5 above and 40 at random), every URL is in the revision WCD names. 42 are absent from the revision before it (2 had no earlier revision); the other 3 had the same link with `http://` there. Of the 5,786 URLs in the 50 articles' current wikitext, WCD returns 5,681; the other 104 are all inside HTML comments. 2,503 of the 5,684 links (44 %) have been removed and re-added at least once, mostly vandalism and its revert, so both dates matter.
+
+**Decisions taken without asking:** emulating the bot account's request limits in the IABot port (the port itself was the user's call); leaving out the 9 largest articles; counting a link as "current" when it is in the dump's latest revision.
+
+**Open:** an API endpoint for the lookup (SCA-388), which should also read only the page's `citation_history` file (the citations endpoint takes 10 s on Albert Einstein for the same reason); keeping WCD current, since links added after the dump are unknown to it (SCA-389); throughput under concurrent lookups.

@@ -20,8 +20,10 @@ DuckDB computes per bucket from the Parquet tier; psycopg2 writes to Postgres
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -29,15 +31,15 @@ import duckdb
 import psycopg2
 import psycopg2.extras
 import pyarrow as pa
-import pyarrow.parquet as pq
+import pyarrow.csv as pa_csv
 
 from wcd_schema import parquet as layout
 from wcd_schema.duckdb import bind_bucket_views
-from wcd_schema.parquet import SCHEMAS
 from wcd_semantic.profile import build_source_profile
 from wcd_semantic.scoring import compute_score
 
-from .config import load_dotenv, psycopg_dsn  # noqa: F401
+from .config import duckdb_connect, load_dotenv, psycopg_dsn  # noqa: F401
+from .load import _CSV_OPTIONS, _copy_and_insert
 from .materialize import export_citation_instances_denorm
 
 MI = "matching_intermediate/"
@@ -85,51 +87,108 @@ _GS_COLS = ("global_source_id", "match_type", "confidence", "canonical_part_sha1
             "extracted_wikidata_qid", "extracted_url")
 
 
+_GS_DDL = ("global_source_id varchar(16), match_type varchar, confidence double precision, canonical_part_sha1 char(40), "
+           "source_type varchar, author_key varchar, year varchar, title text, extracted_doi varchar, "
+           "extracted_isbn varchar, extracted_pmid varchar, extracted_pmc varchar, extracted_arxiv varchar, "
+           "extracted_wikidata_qid varchar, extracted_url text")
+# rows per COPY into a temp table and set-based upsert (one transaction each)
+CHUNK_ROWS = int(os.getenv("MATERIALIZE_CHUNK_ROWS", "500000"))
+# work_mem for 7e/7f's whole-table UPDATEs (single backend, no parallel workers)
+STAGE7_WORK_MEM = os.getenv("STAGE7_WORK_MEM", "1GB")
+
+
+def _batches(con, sql: str):
+    """``sql``'s result from DuckDB as Arrow record batches of CHUNK_ROWS."""
+    result = con.execute(sql)
+    reader = (getattr(result, "to_arrow_reader", None) or result.fetch_record_batch)(CHUNK_ROWS)
+    yield from reader
+
+
 def step_a(pg, con, domain: str, parquet_base: str) -> int:
+    """Upsert the domain's global sources (~131M on enwiki: streamed from DuckDB in
+    chunks, COPY + one INSERT … ON CONFLICT per chunk, in id order so the primary
+    key grows at its end)."""
     pattern = layout.partition_glob(parquet_base, MI + "global_sources_stage", domain)
-    rows = con.execute(f"SELECT {', '.join(_GS_COLS)} FROM read_parquet('{pattern}') ORDER BY global_source_id").fetchall()
+    cols = ", ".join(_GS_COLS)
+    upsert = (f"INSERT INTO global_sources ({cols}) SELECT {cols} FROM gs_in "
+              "ON CONFLICT (global_source_id) DO UPDATE SET "
+              + ", ".join(f"{c} = EXCLUDED.{c}" for c in _GS_COLS[1:])
+              + ", n_pages = NULL, n_total_citations = NULL, reliability_score = NULL, verdict = NULL")
+    n = 0
     with pg.cursor() as cur:
-        psycopg2.extras.execute_values(
-            cur,
-            f"INSERT INTO global_sources ({', '.join(_GS_COLS)}) VALUES %s "
-            "ON CONFLICT (global_source_id) DO UPDATE SET "
-            + ", ".join(f"{c} = EXCLUDED.{c}" for c in _GS_COLS[1:])
-            + ", n_pages = NULL, n_total_citations = NULL, reliability_score = NULL, verdict = NULL",
-            rows, page_size=5000)
-    pg.commit()
-    return len(rows)
+        for batch in _batches(con, f"SELECT {cols} FROM read_parquet('{pattern}') ORDER BY global_source_id"):
+            _copy_and_insert(cur, batch, "gs_in", _GS_DDL, list(_GS_COLS), upsert)
+            pg.commit()
+            n += batch.num_rows
+    return n
 
 
 # ---------------------------------------------------------------------------
 # 7b citation_source_resolution
 # ---------------------------------------------------------------------------
 
+_CSR_COLS = ["normalized_id", "part_index", "page_id", "global_source_id", "source_type", "match_type", "confidence",
+             "is_canonical"]
+_CSR_DDL = ("normalized_id integer, part_index integer, page_id integer, global_source_id varchar(16), "
+            "source_type varchar, match_type varchar, confidence double precision, is_canonical boolean")
+# A part_sha1 can belong to several normalized citations; the ones with an instance
+# on that page are the denorm rows of (page_id, part_sha1) (citation_instances ⋈
+# normalized_citations ⋈ parts for the domain), so the join runs per bucket in DuckDB
+# instead of through the 295M-row parts table in Postgres.
+_CSR_SQL = """
+SELECT DISTINCT dn.normalized_id, dn.part_index, m.page_id, g.global_source_id,
+       m.source_type, m.match_type, m.confidence, m.is_canonical
+FROM read_parquet('{mmap}', hive_partitioning = false) m
+JOIN read_parquet('{gmap}', hive_partitioning = false) g USING (merged_source_id)
+JOIN citation_instances_denorm dn ON dn.page_id = m.page_id AND dn.part_sha1 = m.part_sha1
+"""
+
+
 def step_b(pg, con, domain: str, domain_id: int, parquet_base: str) -> int:
-    mmap = layout.partition_glob(parquet_base, MI + "merged_citation_source_map", domain)
-    gmap = layout.partition_glob(parquet_base, MI + "global_source_map", domain)
-    rows = con.execute(f"""
-        SELECT m.part_sha1, m.page_id, g.global_source_id, m.source_type, m.match_type, m.confidence, m.is_canonical
-        FROM read_parquet('{mmap}', hive_partitioning=true) m
-        JOIN read_parquet('{gmap}') g USING (merged_source_id)
-        ORDER BY m.page_id, m.part_sha1""").fetchall()
+    """citation_source_resolution for the domain, per page bucket: the matches
+    (merged_citation_source_map ⋈ global_source_map) joined to the denorm in
+    DuckDB, COPY + INSERT … ON CONFLICT DO NOTHING per bucket, the table's
+    foreign keys deferred while it is empty."""
+    from . import fkeys
+    from .gates import make_session
+
+    gmap_all = layout.partition_glob(parquet_base, MI + "global_source_map", domain)
+    split = Path(parquet_base) / MI / f"_scratch_7b_{domain}"
+    shutil.rmtree(split, ignore_errors=True)
+    # global_source_map is one file for the domain; split it by page bucket once
+    con.execute(f"""COPY (SELECT merged_source_id, global_source_id, page_id % {layout.PAGE_BUCKETS} AS page_bucket
+                          FROM read_parquet('{gmap_all}', hive_partitioning = false))
+                    TO '{split}' (FORMAT PARQUET, PARTITION_BY (page_bucket))""")
     with pg.cursor() as cur:
         cur.execute("DELETE FROM citation_source_resolution WHERE domain_id = %s", (domain_id,))
-        cur.execute("""CREATE TEMP TABLE csr_in (part_sha1 CHAR(40), page_id INTEGER, global_source_id VARCHAR(16),
-                       source_type VARCHAR, match_type VARCHAR, confidence DOUBLE PRECISION, is_canonical BOOLEAN)
-                       ON COMMIT DROP""")
-        psycopg2.extras.execute_values(cur, "INSERT INTO csr_in VALUES %s", rows, page_size=10000)
-        # a part_sha1 can belong to several normalized citations; keep the ones that have an
-        # instance on that page
-        cur.execute("""
-            INSERT INTO citation_source_resolution
-                (normalized_id, part_index, domain_id, page_id, global_source_id, source_type, match_type, confidence, is_canonical)
-            SELECT DISTINCT p.normalized_id, p.part_index, %(d)s, t.page_id, t.global_source_id,
-                   t.source_type, t.match_type, t.confidence, t.is_canonical
-            FROM csr_in t
-            JOIN normalized_citation_parts p ON p.part_sha1 = t.part_sha1
-            JOIN citation_instances ci ON ci.domain_id = %(d)s AND ci.page_id = t.page_id AND ci.normalized_id = p.normalized_id
-            ON CONFLICT (normalized_id, part_index, domain_id, page_id) DO NOTHING""", {"d": domain_id})
-        n = cur.rowcount
+    pg.commit()
+    session = make_session()
+    n = 0
+    try:
+        fkeys.drop_if_empty(session, "citation_source_resolution", log)
+        insert = (f"INSERT INTO citation_source_resolution (domain_id, {', '.join(_CSR_COLS)}) "
+                  f"SELECT {int(domain_id)}, {', '.join(_CSR_COLS)} FROM csr_in "
+                  "ON CONFLICT (normalized_id, part_index, domain_id, page_id) DO NOTHING")
+        buckets = layout.list_buckets(parquet_base, MI + "merged_citation_source_map", domain)
+        for i, b in enumerate(buckets, 1):
+            gmap = split / f"page_bucket={b}" / "*.parquet"
+            if not list((split / f"page_bucket={b}").glob("*.parquet")):
+                continue
+            bind_bucket_views(con, parquet_base, domain, b, ("citation_instances_denorm",))
+            mmap = layout.partition_glob(parquet_base, MI + "merged_citation_source_map", domain, b)
+            result = con.execute(_CSR_SQL.format(mmap=mmap, gmap=gmap))
+            rows = (getattr(result, "to_arrow_table", None) or result.fetch_arrow_table)()
+            if rows.num_rows:
+                with pg.cursor() as cur:
+                    n += _copy_and_insert(cur, rows, "csr_in", _CSR_DDL, _CSR_COLS, insert)
+                pg.commit()
+            if i % 32 == 0:
+                log(f"7b: {i}/{len(buckets)} buckets, {n:,} rows")
+        fkeys.restore(session, "citation_source_resolution", log)
+    finally:
+        session.close()
+        shutil.rmtree(split, ignore_errors=True)
+    with pg.cursor() as cur:
         # global sources no longer referenced by any resolution row
         cur.execute("""DELETE FROM global_sources gs WHERE NOT EXISTS
                        (SELECT 1 FROM citation_source_resolution r WHERE r.global_source_id = gs.global_source_id)""")
@@ -190,53 +249,87 @@ LEFT JOIN reuse ru USING (page_id, global_source_id)
 ORDER BY t.page_id, t.global_source_id
 """
 
-_PSS_INSERT = """
-INSERT INTO page_source_summary
-    (domain_id, page_id, global_source_id, author_key, year, title,
-     extracted_doi, extracted_isbn, extracted_pmid, extracted_pmc, extracted_arxiv, extracted_wikidata_qid,
-     extracted_librarybase_id, extracted_url,
-     source_type, match_type, confidence, first_rev_id, first_seen, last_rev_id, last_seen,
-     n_citations, n_revisions_cited, n_self_closing_uses, is_current)
-SELECT %(d)s, t.page_id, t.global_source_id, gs.author_key, gs.year, gs.title,
-       gs.extracted_doi, gs.extracted_isbn, gs.extracted_pmid, gs.extracted_pmc, gs.extracted_arxiv, gs.extracted_wikidata_qid,
-       gs.extracted_librarybase_id, gs.extracted_url,
-       t.source_type, t.match_type, t.confidence, t.first_rev_id, t.first_seen, t.last_rev_id, t.last_seen,
-       t.n_citations, t.n_revisions_cited, t.n_self_closing_uses, t.is_current
-FROM pss_in t JOIN global_sources gs USING (global_source_id)
-"""
+# global_sources columns page_source_summary carries (from global_sources_stage, as 7a loads them)
+_PSS_GS_COLS = ["author_key", "year", "title", "extracted_doi", "extracted_isbn", "extracted_pmid",
+                "extracted_pmc", "extracted_arxiv", "extracted_wikidata_qid", "extracted_url"]
+
+
+_PSS_COLS = ["page_id", "global_source_id", "source_type", "match_type", "confidence", "first_rev_id", "first_seen",
+             "last_rev_id", "last_seen", "n_citations", "n_revisions_cited", "n_self_closing_uses", "is_current"]
+_PSS_DDL = ("page_id integer, global_source_id varchar(16), source_type varchar, match_type varchar, "
+            "confidence double precision, first_rev_id bigint, first_seen timestamp, last_rev_id bigint, "
+            "last_seen timestamp, n_citations integer, n_revisions_cited integer, n_self_closing_uses integer, "
+            "is_current boolean")
+
+
+def _pss_scratch(parquet_base: str, domain: str) -> Path:
+    return Path(parquet_base) / "_scratch" / "7d" / f"domain={domain}"
 
 
 def step_d(pg, con, domain: str, domain_id: int, parquet_base: str, force: bool) -> int:
-    ck = Checkpoint(parquet_base, "7d", domain)
-    if force:
-        ck.clear()
+    """page_source_summary for the domain. Each bucket's rows are computed in
+    DuckDB and written to a scratch Parquet file (the file is the bucket's
+    checkpoint); then one DuckDB join adds the global source's columns from
+    ``global_sources_stage`` (what 7a loaded into ``global_sources``; nothing
+    sets ``extracted_librarybase_id`` there, so it is NULL) and the rows go in
+    by COPY, the domain's old rows deleted first and the table's foreign keys
+    deferred while it is empty. (Joining ``global_sources`` in Postgres per
+    bucket was one random primary-key read per row into a table larger than
+    shared_buffers: ~2 min per bucket on enwiki.)"""
+    from . import fkeys
+    from .gates import make_session
+
+    scratch = _pss_scratch(parquet_base, domain)
+    Checkpoint(parquet_base, "7d", domain).clear()      # the per-bucket checkpoint of earlier versions
+    if force and scratch.exists():
+        shutil.rmtree(scratch)
+    scratch.mkdir(parents=True, exist_ok=True)
     buckets = layout.list_buckets(parquet_base, "citation_instances_denorm", domain)
-    with pg.cursor() as cur:
-        if not ck.done:
-            cur.execute("DELETE FROM page_source_summary WHERE domain_id = %s", (domain_id,))
-            pg.commit()
-    total = 0
-    for b in buckets:
-        if b in ck.done:
-            continue
+    todo = [b for b in buckets if not (scratch / f"bucket={b}.parquet").exists()]
+    t0 = time.time()
+    for i, b in enumerate(todo, 1):
         bind_bucket_views(con, parquet_base, domain, b,
-                          ("citation_instances_denorm", "citation_history", "revisions", "named_ref_uses", "ref_name_links"))
-        rows = con.execute(_PSS_SQL).fetchall()
+                          ("citation_instances_denorm", "citation_history", "revisions", "named_ref_uses",
+                           "ref_name_links"))
+        tmp = scratch / f"bucket={b}.parquet.tmp"
+        con.execute(f"COPY ({_PSS_SQL}) TO '{tmp}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+        tmp.rename(scratch / f"bucket={b}.parquet")
+        if i % 32 == 0:
+            log(f"7d: {i}/{len(todo)} buckets computed ({time.time() - t0:.0f}s)")
+
+    gs_pattern = layout.partition_glob(parquet_base, MI + "global_sources_stage", domain)
+    cols = ["domain_id", "page_id", "global_source_id"] + _PSS_GS_COLS + ["extracted_librarybase_id"] + _PSS_COLS[2:]
+    select = ", ".join([f"CAST({int(domain_id)} AS INTEGER) AS domain_id", "t.page_id", "t.global_source_id"]
+                       + [f"gs.{c}" for c in _PSS_GS_COLS] + ["CAST(NULL AS VARCHAR) AS extracted_librarybase_id"]
+                       + [f"t.{c}" for c in _PSS_COLS[2:]])
+    sql = (f"SELECT {select} FROM read_parquet('{scratch}/bucket=*.parquet') t "
+           f"JOIN read_parquet('{gs_pattern}') gs USING (global_source_id) ORDER BY t.page_id, t.global_source_id")
+    with pg.cursor() as cur:
+        cur.execute("DELETE FROM page_source_summary WHERE domain_id = %s", (domain_id,))
+    pg.commit()
+    session = make_session()
+    total = n_batches = 0
+    try:
+        fkeys.drop_if_empty(session, "page_source_summary", log)
         with pg.cursor() as cur:
-            cur.execute("DELETE FROM page_source_summary WHERE domain_id = %s AND page_id %% %s = %s",
-                        (domain_id, layout.PAGE_BUCKETS, b))
-            if rows:
-                cur.execute("""CREATE TEMP TABLE IF NOT EXISTS pss_in (page_id INTEGER, global_source_id VARCHAR(16),
-                               source_type VARCHAR, match_type VARCHAR, confidence DOUBLE PRECISION,
-                               first_rev_id BIGINT, first_seen TIMESTAMP, last_rev_id BIGINT, last_seen TIMESTAMP,
-                               n_citations INTEGER, n_revisions_cited INTEGER, n_self_closing_uses INTEGER, is_current BOOLEAN)""")
-                cur.execute("TRUNCATE pss_in")
-                psycopg2.extras.execute_values(cur, "INSERT INTO pss_in VALUES %s", rows, page_size=10000)
-                cur.execute(_PSS_INSERT, {"d": domain_id})
-                total += cur.rowcount
-        pg.commit()
-        ck.mark(b)
-    ck.clear()
+            for batch in _batches(con, sql):
+                buf = io.BytesIO()
+                pa_csv.write_csv(batch, buf, write_options=_CSV_OPTIONS)
+                buf.seek(0)
+                cur.copy_expert(f"COPY page_source_summary ({', '.join(cols)}) FROM STDIN WITH (FORMAT csv)", buf)
+                pg.commit()
+                total += batch.num_rows
+                n_batches += 1
+                if n_batches % 64 == 0:
+                    log(f"7d: {total:,} rows loaded ({time.time() - t0:.0f}s)")
+        n_scratch = con.execute(f"SELECT count(*) FROM read_parquet('{scratch}/bucket=*.parquet')").fetchone()[0]
+        if n_scratch != total:
+            raise RuntimeError(f"7d: {n_scratch} summary rows computed but {total} loaded "
+                               "(a global source missing from global_sources_stage?)")
+        fkeys.restore(session, "page_source_summary", log)
+    finally:
+        session.close()
+    shutil.rmtree(scratch)
     return total
 
 
@@ -245,7 +338,15 @@ def step_d(pg, con, domain: str, domain_id: int, parquet_base: str, force: bool)
 # ---------------------------------------------------------------------------
 
 def step_e(pg) -> int:
+    """Each global source's page and citation counts from page_source_summary.
+    Sort-based: the planner takes the ~121M groups on enwiki for ~16M and
+    hash-aggregates and hash-joins them in work_mem, which spilled for over an
+    hour without writing a row; sorted, the groups merge-join global_sources
+    through its primary key (7a loads the table in key order)."""
     with pg.cursor() as cur:
+        cur.execute(f"SET LOCAL work_mem = '{STAGE7_WORK_MEM}'")
+        cur.execute("SET LOCAL enable_hashagg = off")
+        cur.execute("SET LOCAL enable_hashjoin = off")
         cur.execute("""
             UPDATE global_sources gs
             SET n_pages = sub.n_pages, n_total_citations = sub.n_total_citations
@@ -257,10 +358,75 @@ def step_e(pg) -> int:
     return n
 
 
-def step_f(pg, dsn: str, batch: int = 20000) -> int:
+# wcd_semantic.scoring.compute_score set-based: the same terms, with Python's
+# truthiness (NULL and '' are false) and its `x or ''` / `x or 0` defaults; the
+# canonical part is the first by (normalized_id, part_index) with that sha1, as the
+# per-row LATERAL lookup chose it. test_stage7_score holds it to compute_score.
+# Three statements, each over a table whose size the planner knows: as one
+# statement it estimated the distinct canonical sha1s at ~2M (~100M on enwiki)
+# and hash-joined and hash-aggregated far past work_mem for hours.
+_SCORE_CANON_SQL = """
+CREATE TEMP TABLE score_canon ON COMMIT DROP AS
+SELECT DISTINCT ON (part_sha1) part_sha1, id_tier, year_reliable, norm_subtype
+FROM normalized_citation_parts
+ORDER BY part_sha1, normalized_id, part_index
+"""
+_SCORE_S_SQL = """
+CREATE TEMP TABLE score_s ON COMMIT DROP AS
+SELECT global_source_id, score::double precision AS score,
+       CASE WHEN tmpl THEN 'high_confidence' WHEN tiered THEN 'high_confidence'
+            WHEN noise THEN 'likely_not_citation' WHEN score >= 50 THEN 'high_confidence'
+            WHEN score >= 25 THEN 'medium_confidence' WHEN score >= 10 THEN 'low_confidence'
+            ELSE 'questionable' END AS verdict
+FROM (
+    SELECT gs.global_source_id,
+           coalesce(gs.source_type, '') IN ('template', 'both') AS tmpl,
+           coalesce(c.id_tier, 0) > 0 AS tiered,
+           coalesce(c.norm_subtype, '') = 'noise' AS noise,
+           CASE WHEN coalesce(gs.source_type, '') IN ('template', 'both') THEN 30 ELSE 0 END
+         + CASE WHEN coalesce(c.id_tier, 0) > 0 THEN 25 ELSE 0 END
+         + CASE WHEN coalesce(gs.author_key, '') <> '' THEN 15 ELSE 0 END
+         + CASE WHEN coalesce(c.year_reliable, false) THEN 15 ELSE 0 END
+         + CASE WHEN coalesce(gs.year, '') <> '' THEN 5 ELSE 0 END
+         + CASE coalesce(gs.match_type, '')
+               WHEN 'doi' THEN 10 WHEN 'isbn' THEN 10 WHEN 'pmid' THEN 10 WHEN 'pmc' THEN 10
+               WHEN 'arxiv' THEN 10 WHEN 'wikidata_qid' THEN 10 WHEN 'url' THEN 8 WHEN 'author_year' THEN 5
+               WHEN 'title_fuzzy' THEN 3 WHEN 'strong_author_fuzzy' THEN 3 WHEN 'author_title_fuzzy' THEN 3
+               ELSE 0 END AS score
+    FROM global_sources gs LEFT JOIN score_canon c ON c.part_sha1 = gs.canonical_part_sha1
+) t
+"""
+_SCORE_UPDATE_SQL = """
+UPDATE global_sources g SET reliability_score = s.score, verdict = s.verdict
+FROM score_s s WHERE g.global_source_id = s.global_source_id
+"""
+
+
+def step_f(pg, dsn: str) -> int:
     """Score every global source from its own columns plus the canonical
     member's ``id_tier`` / ``year_reliable`` / ``norm_subtype`` (parts on
-    ``canonical_part_sha1``; the same content has the same fields)."""
+    ``canonical_part_sha1``; the same content has the same fields), set-based
+    (on enwiki ~122M sources; a server cursor, a LATERAL lookup and a Python
+    call per source would take hours): the canonical part per sha1 and the
+    scores go into analyzed temp tables, and the scores merge-join
+    global_sources in key order, as 7e's counts do."""
+    with pg.cursor() as cur:
+        cur.execute(f"SET LOCAL work_mem = '{STAGE7_WORK_MEM}'")
+        cur.execute(_SCORE_CANON_SQL)
+        cur.execute("ANALYZE score_canon")
+        cur.execute(_SCORE_S_SQL)
+        cur.execute("ANALYZE score_s")
+        cur.execute("SET LOCAL enable_hashjoin = off")
+        cur.execute("SET LOCAL enable_hashagg = off")
+        cur.execute(_SCORE_UPDATE_SQL)
+        n = cur.rowcount
+    pg.commit()
+    return n
+
+
+def _step_f_rowwise(pg, dsn: str, batch: int = 20000) -> int:
+    """The previous, per-row implementation (compute_score in Python); kept as
+    the reference ``test_stage7_score`` compares the UPDATE with."""
     n = 0
     # A second connection for the named (server-side) read cursor. Not pg.dsn: psycopg2
     # masks the password there ("password=xxx"), so it fails wherever auth needs one.
@@ -297,20 +463,29 @@ def step_f(pg, dsn: str, batch: int = 20000) -> int:
     return n
 
 
-def step_g(pg, parquet_base: str) -> int:
-    with pg.cursor() as cur:
-        cur.execute("SELECT global_source_id, n_pages, n_total_citations, reliability_score, verdict "
-                    "FROM global_sources ORDER BY global_source_id")
-        rows = cur.fetchall()
+def step_g(pg, con, parquet_base: str) -> int:
+    """global_source_scores: COPY out of Postgres as CSV, typed and written as
+    Parquet by DuckDB (~131M rows on enwiki; fetchall + from_pylist would hold
+    them all as Python objects)."""
     d = layout.dataset_dir(parquet_base, "global_source_scores")
     d.mkdir(parents=True, exist_ok=True)
     for old in d.glob("*.parquet*"):
         old.unlink()
-    schema = SCHEMAS["global_source_scores"]
-    names = [f.name for f in schema]
-    pq.write_table(pa.Table.from_pylist([dict(zip(names, r)) for r in rows], schema=schema),
-                   d / "data.parquet", compression="zstd")
-    return len(rows)
+    csv_path = d / "_scores.csv"
+    try:
+        with pg.cursor() as cur, open(csv_path, "wb") as f:
+            cur.copy_expert("COPY (SELECT global_source_id, n_pages, n_total_citations, reliability_score, verdict "
+                            "FROM global_sources ORDER BY global_source_id) TO STDOUT WITH (FORMAT csv)", f)
+        con.execute(f"""COPY (SELECT * FROM read_csv('{csv_path}', header = false, quote = '"', escape = '"',
+                                  allow_quoted_nulls = false,
+                                  columns = {{'global_source_id': 'VARCHAR', 'n_pages': 'INTEGER',
+                                             'n_total_citations': 'INTEGER', 'reliability_score': 'DOUBLE',
+                                             'verdict': 'VARCHAR'}}))
+                        TO '{d / 'data.parquet'}' (FORMAT PARQUET, COMPRESSION ZSTD)""")
+        return con.execute(f"SELECT count(*) FROM read_parquet('{d / 'data.parquet'}')").fetchone()[0]
+    finally:
+        if csv_path.exists():
+            csv_path.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +551,13 @@ def build_cache_rows(con, domain_id: int) -> list[tuple]:
     return out
 
 
+_CACHE_COLS = ["page_id", "revision_count", "first_revision_ts", "latest_revision_ts", "latest_rev_id",
+               "reference_count", "type_breakdown", "top_templates", "source_profile"]
+_CACHE_DDL = ("page_id integer, revision_count integer, first_revision_ts timestamp, latest_revision_ts timestamp, "
+              "latest_rev_id bigint, reference_count integer, type_breakdown jsonb, top_templates jsonb, "
+              "source_profile jsonb")
+
+
 def step_h(pg, con, domain: str, domain_id: int, parquet_base: str, force: bool) -> int:
     ck = Checkpoint(parquet_base, "7h", domain)
     if force:
@@ -386,21 +568,35 @@ def step_h(pg, con, domain: str, domain_id: int, parquet_base: str, force: bool)
             cur.execute("DELETE FROM page_summary_cache WHERE domain_id = %s", (domain_id,))
         pg.commit()
     total = 0
-    for b in buckets:
+    for i, b in enumerate(buckets, 1):
         if b in ck.done:
             continue
         bind_bucket_views(con, parquet_base, domain, b, ("revisions", "citation_history", "citation_instances_denorm"))
         rows = build_cache_rows(con, domain_id)
         with pg.cursor() as cur:
-            cur.execute("DELETE FROM page_summary_cache WHERE domain_id = %s AND page_id %% %s = %s",
-                        (domain_id, layout.PAGE_BUCKETS, b))
-            psycopg2.extras.execute_values(
-                cur, "INSERT INTO page_summary_cache (domain_id, page_id, revision_count, first_revision_ts, latest_revision_ts, "
-                     "latest_rev_id, reference_count, type_breakdown, top_templates, source_profile) VALUES %s",
-                rows, page_size=2000)
+            # by page ids (the primary key leads with domain_id, page_id); a
+            # page_id % 512 filter scanned the whole table once per bucket
+            cur.execute("DELETE FROM page_summary_cache WHERE domain_id = %s AND page_id = ANY(%s)",
+                        (domain_id, [r[1] for r in rows]))
+            if rows:
+                cols = list(zip(*rows))
+                table = pa.table({
+                    "page_id": pa.array(cols[1], pa.int32()), "revision_count": pa.array(cols[2], pa.int32()),
+                    "first_revision_ts": pa.array(cols[3], pa.timestamp("us")),
+                    "latest_revision_ts": pa.array(cols[4], pa.timestamp("us")),
+                    "latest_rev_id": pa.array(cols[5], pa.int64()), "reference_count": pa.array(cols[6], pa.int32()),
+                    # psycopg2's Json would dump the same objects with json.dumps
+                    **{name: pa.array([json.dumps(j.adapted) for j in cols[k]], pa.string())
+                       for name, k in (("type_breakdown", 7), ("top_templates", 8), ("source_profile", 9))},
+                })
+                _copy_and_insert(cur, table, "cache_in", _CACHE_DDL, _CACHE_COLS,
+                                 f"INSERT INTO page_summary_cache (domain_id, {', '.join(_CACHE_COLS)}) "
+                                 f"SELECT {int(domain_id)}, {', '.join(_CACHE_COLS)} FROM cache_in")
         pg.commit()
         ck.mark(b)
         total += len(rows)
+        if i % 32 == 0:
+            log(f"7h: {i}/{len(buckets)} buckets, {total:,} pages")
     ck.clear()
     return total
 
@@ -467,7 +663,7 @@ def gate(pg, con, domain: str, domain_id: int, parquet_base: str) -> list[str]:
 
 def run(dsn: str, domain: str, parquet_base: str, steps=STEPS, force: bool = False) -> dict:
     pg = psycopg2.connect(dsn)
-    con = duckdb.connect()
+    con = duckdb_connect()
     counts = {}
     try:
         domain_id = _domain_id(pg, domain)
@@ -486,7 +682,7 @@ def run(dsn: str, domain: str, parquet_base: str, steps=STEPS, force: bool = Fal
             elif s == "f":
                 counts["7f scored"] = step_f(pg, dsn)
             elif s == "g":
-                counts["7g global_source_scores"] = step_g(pg, parquet_base)
+                counts["7g global_source_scores"] = step_g(pg, con, parquet_base)
             elif s == "h":
                 counts["7h page_summary_cache"] = step_h(pg, con, domain, domain_id, parquet_base, force)
             else:
@@ -520,7 +716,7 @@ def main(argv=None) -> int:
     log(f"done: {counts}")
     if not args.no_gate and steps == list(STEPS):
         pg = psycopg2.connect(dsn)
-        con = duckdb.connect()
+        con = duckdb_connect()
         try:
             failures = gate(pg, con, args.domain, _domain_id(pg, args.domain), args.parquet_dir)
         finally:

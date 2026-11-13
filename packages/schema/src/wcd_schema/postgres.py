@@ -36,6 +36,7 @@ from sqlalchemy import (
     Boolean,
     CHAR,
     Column,
+    Computed,
     DateTime,
     Float,
     ForeignKey,
@@ -290,12 +291,22 @@ class NormalizedCitation(Base):
     included). Semantic columns are on ``normalized_citation_parts``."""
     __tablename__ = 'normalized_citations'
     id = Column(Integer, primary_key=True, nullable=False, autoincrement=True)
-    normalized_sha1 = Column(CHAR(40), nullable=False, unique=True)
+    normalized_sha1 = Column(CHAR(40), nullable=False)
     reference_normalized = Column(Text, nullable=False)
     appears_on_domain_id = Column(Integer, ForeignKey('domains.id'), nullable=False)
     appears_on_page_id = Column(Integer, nullable=False)
     # ref_tag | template | bare_url | endnote | shorthand | external_link (Stage 1)
     citation_type = Column(String, nullable=False)
+
+    # The natural key, with the id in the index: Stage 3 resolves every
+    # citation instance's normalized_sha1 to an id, and with INCLUDE that is
+    # an index-only lookup instead of an index probe plus a heap fetch in a
+    # 68 GB table (enwiki; plan §22). Named like the unique constraint it
+    # replaces; ON CONFLICT (normalized_sha1) infers it.
+    __table_args__ = (
+        Index('normalized_citations_normalized_sha1_key', 'normalized_sha1', unique=True,
+              postgresql_include=['id']),
+    )
 
     @staticmethod
     def bulk_upsert(session: Session, rows):
@@ -488,7 +499,9 @@ class NormalizedCitationPart(Base):
     __table_args__ = (
         PrimaryKeyConstraint('normalized_id', 'part_index', name='pk_normalized_citation_parts'),
         Index('idx_ncp_part_sha1', 'part_sha1'),
-        Index('idx_ncp_doi', 'extracted_doi', postgresql_where=text('extracted_doi IS NOT NULL')),
+        # hash, not B-tree: equality lookups only, and enwiki has extracted DOIs over the
+        # B-tree entry limit (~2.7 KB; one of 3,984 bytes, from a garbled citation)
+        Index('idx_ncp_doi', 'extracted_doi', postgresql_using='hash', postgresql_where=text('extracted_doi IS NOT NULL')),
         Index('idx_ncp_isbn', 'extracted_isbn', postgresql_where=text('extracted_isbn IS NOT NULL')),
         Index('idx_ncp_pmid', 'extracted_pmid', postgresql_where=text('extracted_pmid IS NOT NULL')),
         Index('idx_ncp_pmc', 'extracted_pmc', postgresql_where=text('extracted_pmc IS NOT NULL')),
@@ -509,11 +522,15 @@ class RefNameLink(Base):
     domain_id = Column(Integer, ForeignKey('domains.id'), nullable=False)
     page_id = Column(Integer, nullable=False)
     ref_name = Column(String, nullable=False)
+    # The key carries md5(ref_name), not the name: a B-tree entry is limited to
+    # ~2.7 KB and enwiki has ref names up to 83 KB (vandalism). Postgres computes
+    # it; writers leave the column out.
+    ref_name_md5 = Column(CHAR(32), Computed('md5(ref_name)', persisted=True), nullable=False)
     defining_instance_id = Column(BigInteger, ForeignKey('citation_instances.id'), nullable=False)
     first_revision_id = Column(BigInteger, nullable=False)
     last_revision_id = Column(BigInteger)  # NULL = still current
     __table_args__ = (
-        PrimaryKeyConstraint('domain_id', 'page_id', 'ref_name', 'first_revision_id', name='pk_ref_name_links'),
+        PrimaryKeyConstraint('domain_id', 'page_id', 'ref_name_md5', 'first_revision_id', name='pk_ref_name_links'),
         Index('idx_rnl_instance', 'defining_instance_id'),
     )
 
@@ -543,7 +560,7 @@ class GlobalSource(Base):
     reliability_score = Column(Float)  # Stage 7f (UVA scorer)
     verdict = Column(String)           # high_confidence | medium_confidence | low_confidence | questionable | likely_not_citation
     __table_args__ = (
-        Index('idx_gs_doi', 'extracted_doi', postgresql_where=text('extracted_doi IS NOT NULL')),
+        Index('idx_gs_doi', 'extracted_doi', postgresql_using='hash', postgresql_where=text('extracted_doi IS NOT NULL')),  # see idx_ncp_doi
         Index('idx_gs_isbn', 'extracted_isbn', postgresql_where=text('extracted_isbn IS NOT NULL')),
         Index('idx_gs_pmid', 'extracted_pmid', postgresql_where=text('extracted_pmid IS NOT NULL')),
         Index('idx_gs_pmc', 'extracted_pmc', postgresql_where=text('extracted_pmc IS NOT NULL')),

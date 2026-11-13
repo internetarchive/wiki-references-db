@@ -95,12 +95,15 @@ page_metadata (
 -- Semantic (Stage 4) columns live on normalized_citation_parts, not here.
 normalized_citations (
     id                    SERIAL PRIMARY KEY,
-    normalized_sha1       CHAR(40) UNIQUE NOT NULL,
+    normalized_sha1       CHAR(40) NOT NULL,
     reference_normalized  TEXT NOT NULL,             -- full wikitext incl. <ref …> wrapper
     appears_on_domain_id  INTEGER REFERENCES domains(id) NOT NULL,   -- replaces appears_on_article
     appears_on_page_id    INTEGER NOT NULL,
     citation_type         VARCHAR NOT NULL           -- extraction-time kind, see below
 )
+-- the natural key carries the id, so Stage 3's sha1 → id lookups are index-only
+CREATE UNIQUE INDEX normalized_citations_normalized_sha1_key
+    ON normalized_citations (normalized_sha1) INCLUDE (id);
 
 -- citation_type (set in Stage 1, per reference, from the extractor's candidate class):
 --   'ref_tag'        <ref>…</ref> whose content is not a citation template or a bare URL

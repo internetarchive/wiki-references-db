@@ -113,3 +113,44 @@ def test_merged_sources_list_every_member():
     assert both.name in ("r1", "r2")
     alone = merged.loc["r3"]
     assert alone["rt_source_ids"] == ["r3"] and alone["tm_source_ids"] == [] and alone["tmpl_source_id"] is None
+
+
+# NOTICE deviation 2: _RELIABLE_YEAR_RE's name alternatives start at a word start.
+def _upstream_year_re():
+    import re
+    return re.compile(reftag._RELIABLE_YEAR_RE.pattern.replace("(?<![A-Za-z])", ""), reftag._RELIABLE_YEAR_RE.flags)
+
+
+def _same(a, b, s):
+    ma, mb = a.search(s), b.search(s)
+    return (ma and (ma.span(), ma.groups())) == (mb and (mb.span(), mb.groups()))
+
+
+def test_reliable_year_re_matches_upstream():
+    import random
+
+    from corpus import CONTENTS
+
+    up = _upstream_year_re()
+    assert up.pattern != reftag._RELIABLE_YEAR_RE.pattern
+    for s in CONTENTS:
+        assert _same(up, reftag._RELIABLE_YEAR_RE, s), s
+    for s in ["Smith (1995). T", "in Smith Jones (1995, p. 3)", "xSmith (1995).", "abc1def (1995)", "ÖSmith (2001).",
+              "(March 2001).", "{{harvnb|Lee|2001|p=3}}", "Sandburg 1974, p. 3", "ABCsandburg 1974,", "ſmith (1990)."]:
+        assert _same(up, reftag._RELIABLE_YEAR_RE, s), s
+    # random strings over the characters the pattern cares about
+    rng = random.Random(1)
+    alphabet = list("abSsmithJONESQſKÖé19720 ()[],.|{}") + ["1995", "2001", " (", "harvnb|", "sfn|", "March "]
+    for _ in range(20_000):
+        s = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 40)))
+        assert _same(up, reftag._RELIABLE_YEAR_RE, s), s
+
+
+def test_reliable_year_re_is_linear_in_word_length():
+    import time
+
+    s = "Alan Bush Music Trust – More" + "a" * 200_000
+    t = time.process_time()
+    reftag._RELIABLE_YEAR_RE.search(s)
+    reftag.classify("[http://example.org/x " + s + "]")
+    assert time.process_time() - t < 5     # upstream: ~2 CPU-hours

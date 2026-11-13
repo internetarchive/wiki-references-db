@@ -202,7 +202,18 @@ def build_merged_sources(
         #####################################################################################
         # non-vectorized
         ####################################################################################
-        
+
+        # DEVIATION (wcd, NOTICE 3): the template side's key, title and author are
+        # computed once per page, with the same iterrows() and expressions, instead of
+        # once per unmerged ref_tag source; the loop below reads them unchanged.
+        # Rebuilding a pandas Series per (rt, tm) pair was ~56 % of Stage 6 on enwiki.
+        tm_rows = [
+            (f"tm:{tm_row['source_id']}",
+             str(tm_row['title']).lower().strip(),
+             str(tm_row.get('author_key') or '').lower().strip())
+            for _, tm_row in tm_with_titles.iterrows()
+        ]
+
         for rt_key in unmerged_rt:
             content = rt_content.get(rt_key, '').lower()
             s_author = rt_author.get(rt_key, '')
@@ -214,11 +225,8 @@ def build_merged_sources(
             best_tm_key = None
             best_match_t = None
 
-            for _, tm_row in tm_with_titles.iterrows():
-                tm_key = f"tm:{tm_row['source_id']}"
-                t_title = str(tm_row['title']).lower().strip()
-                t_author = str(tm_row.get('author_key') or '').lower().strip()
-        
+            for tm_key, t_title, t_author in tm_rows:
+
                 # Title comparison: use extracted ref_title if available (title-to-title),
                 # otherwise fall back to norm_content (title-to-full-content)
                 if s_title:

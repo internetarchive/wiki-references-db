@@ -15,7 +15,14 @@ repository root with `.env` filled in (`example.env`).
 | `STAGING_DIR` | Stages 0, 1, 3 | per-shard staging Parquet, consumed by `dedup`/`load`, disposable afterwards; Stage 0's default `--work-dir` |
 | `STAGE0_MEMORY_LIMIT` | Stage 0 | DuckDB memory limit for `stage0-load` (default for `--memory-limit`) |
 | `DEDUP_ROWS_PER_PARTITION` | Stage 3 | staged rows per key partition in `dedup` (memory follows it) |
+| `LOAD_JOBS`, `LOAD_DEFER_FKS`, `LOAD_KEEP_SORTED` | Stage 3 | connections for the citation tables in `load` (`--jobs`; one Parquet row group per unit); deferred foreign keys for `citation_instances` / `ncwr` (`--defer-fks`, default on); keep the key-sorted copies after a successful load |
 | `LOAD_MEMORY_LIMIT`, `LOAD_ROWS_PER_PARTITION`, `TEMPLATE_COUNT_MIN` | Stage 3 | DuckDB memory limit and join partition size for the template Parquet written by `load`; the citation count from which a template value's report total is precomputed |
+| `PARTS_JOBS`, `PARTS_UNIT_IDS` | Stage 4 | worker processes for `parts` (`--jobs`) and normalized-citation ids per unit |
+| `DUCKDB_MEMORY_LIMIT`, `DUCKDB_THREADS`, `DUCKDB_TEMP_DIRECTORY` | Stages 4.6–8, gates | per DuckDB connection, so per worker in `match` / `revision-stats`; unset, DuckDB takes 80 % of RAM and every core per connection |
+| `DENORM_WORK_MEM`, `DENORM_MAX_LINE_SIZE`, `DENORM_GROUPS` | Stage 4.6 / 7c | Postgres `work_mem` for the parallel export (256MB: 1GB took enwiki past RAM); longest CSV row DuckDB accepts (64 MB); bucket groups of the repartition (16) |
+| `MATCH_PAGE_SLICES` | Stage 6 | page slices a bucket is matched in (8; memory follows the slice) |
+| `MATCH_GLOBAL_CHUNK_ROWS`, `MATCH_GLOBAL_BLOCK_ROWS` | Stage 6d | merged sources per output file of the component build (8M; memory follows it); rows of a fuzzy author+year group per rapidfuzz call (2048) |
+| `MATERIALIZE_CHUNK_ROWS`, `STAGE7_WORK_MEM` | Stage 7 | rows per COPY chunk (500k); Postgres `work_mem` of 7e/7f's whole-table UPDATEs (1GB; one backend, no parallel workers) |
 | `REVISION_BUNDLES_DIR` | Stage 1 | the `.mwrev.zst` bundles, one directory per domain |
 | `API_*`, `WIKIPEDIA_API_*` | the API | CORS, default domain, pool size, User-Agent for title lookups |
 
@@ -69,21 +76,30 @@ uv run wcd extract-all -d $BUNDLES/en.wikipedia.org -o $STAGING --domain en.wiki
 
 # 3  dedup (instance-id collision gate) → load → gate 3 → indexes
 uv run wcd dedup -d $STAGING
-uv run wcd load -d $STAGING --parquet-dir $PARQUET_DIR
+uv run wcd load -d $STAGING --parquet-dir $PARQUET_DIR --jobs 16
 uv run wcd gate 3 --domain en.wikipedia.org
-uv run wcd init-db --add-indexes
+# secondary indexes of the loaded tables only; each later table's after its own stage
+uv run wcd init-db --add-indexes --table web_resources citation_instances revisions
 
 # 4  parts (gate 4), 4.6 denorm export; 5 ref_name_links (gate 5)
-uv run wcd parts --domain en.wikipedia.org
+export DUCKDB_MEMORY_LIMIT=16GB DUCKDB_TEMP_DIRECTORY=$STAGING/.duck-spill   # Stages 4.6–8 (see below)
+uv run wcd parts --domain en.wikipedia.org --jobs 24
+uv run wcd init-db --add-indexes --table normalized_citation_parts
 uv run wcd denorm-export --domain en.wikipedia.org
 uv run wcd ref-name-links --domain en.wikipedia.org
+uv run wcd init-db --add-indexes --table ref_name_links
 
-# 6  matching per bucket + cross-page (gate 6)
-uv run wcd match --domain en.wikipedia.org --jobs 8
+# 6  matching per bucket, then cross-page 6d (gate 6). 6a–6c per worker: DuckDB 3 GB, 2 threads;
+#    6d is one process (enwiki: ~32 GB peak with DuckDB 28 GB; --reuse-unions after a failure past
+#    its union-find)
+DUCKDB_MEMORY_LIMIT=3GB DUCKDB_THREADS=2 uv run wcd match --domain en.wikipedia.org --jobs 9 --skip-global
+DUCKDB_MEMORY_LIMIT=28GB DUCKDB_THREADS=8 uv run wcd match --domain en.wikipedia.org --jobs 1
 
-# 7  materialization 7a–7h (gate 7);  8  revision stats (gate 8)
-uv run wcd materialize --domain en.wikipedia.org
-uv run wcd revision-stats --domain en.wikipedia.org --jobs 8
+# 7  materialization 7a–7h (gate 7), then its tables' indexes and gate 7 again with them
+DUCKDB_MEMORY_LIMIT=20GB DUCKDB_THREADS=8 uv run wcd materialize --domain en.wikipedia.org
+uv run wcd init-db --add-indexes --table global_sources citation_source_resolution page_source_summary
+# 8  revision stats (gate 8); per worker: DuckDB 4 GB, 3 threads
+DUCKDB_MEMORY_LIMIT=4GB DUCKDB_THREADS=3 uv run wcd revision-stats --domain en.wikipedia.org --jobs 6
 ```
 
 `scripts/run_pipeline.sh <bundles> <metadata> [domain] [jobs]` runs exactly
@@ -179,6 +195,43 @@ page boundaries first. A worker that crashes or is killed leaves
 `STARTED.txt` + `FAILED.txt` and no `DONE.txt`; `extract-all` reports it,
 exits non-zero, and the next run clears and redoes that shard only.
 
+### Stage 3 load: parallelism, order, disk
+
+`wcd load` loads `web_resources`, `normalized_citations`, `citation_instances`
+and `ncwr` with COPY and `INSERT … SELECT` on `--jobs` connections
+(`LOAD_JOBS`). Each unit is one row group of a copy of the deduped file sorted
+by the table's random key, written to `$STAGING_DIR/.load-sort/` and deleted
+after a successful load. Budget disk for the largest sorted copy plus its spill
+(~150 GB for enwiki's `normalized_citations`). A failed or killed load keeps
+its copy and the next load reuses it (the copy is named after its source's
+size and mtime, so a re-deduped file is sorted again); delete
+`$STAGING_DIR/.load-sort/` to reclaim the space. Units commit on their own, so
+a re-run upserts the committed ones again.
+
+`citation_instances` and `ncwr` load into empty tables without their foreign
+keys (`--defer-fks`, default on), which are then added `NOT VALID` and
+validated in one pass each. Checked row by row, each check locks a row of the
+68 GB `normalized_citations` heap, and the load stalls. The keys are restored
+after every load, also after an interrupted one, and gate 3 fails while any is
+missing or unvalidated. `normalized_citations` keeps its key; deferring it
+saved nothing.
+
+Measured on enwiki-20261001 with 16 jobs (plan §22), phase by phase; `wcd load`
+end to end ≈ 6 h 25 min (sum of the phases, plus ~5 min of VACUUM before
+`citation_instances`):
+
+| phase | rows | time |
+|---|---|---|
+| `domains` | 7.5M | 6–8 min |
+| `web_resources` (cited) | 108M | 20 min (2 min sort) |
+| `normalized_citations` | 285M | 1 h 42 min (43–48 min sort) |
+| `citation_instances` | 338M | 1 h 28 min (10 min sort, 9.4 min validation) |
+| `ncwr` | 290M | 49 min (11 min sort, 13.4 min validation) |
+| template Parquet + `template_value_counts` | 2.5B → 1.37B / 6.44B | 1 h 51 min |
+
+The disk was the limit throughout (WAL, then checkpoints); give Postgres the
+runbook's `max_wal_size` or more, and watch `pg_stat_bgwriter.checkpoints_req`.
+
 ## What each step owns, and the unit of re-run
 
 | Step | Writes | Replaces | Re-run unit |
@@ -187,12 +240,12 @@ exits non-zero, and the next run clears and redoes that shard only.
 | `stage0-load` | `domains`, `revision_bundles`, `revisions`, `page_metadata`, article `web_resources`; `revisions/` Parquet | Postgres rows upserted / `ON CONFLICT DO NOTHING`, committed per page batch and per `rev_id` unit (an interrupted load resumes on re-run); the domain's `revisions/` partitions rebuilt from **everything under `--metadata`** | domain |
 | `extract` (`extract-all`) | staging files of the shard; `citation_history/`, `named_ref_uses/`, `revision_signals/` files named after the shard | that shard's files only (`<shard>-<i>.parquet` in every bucket) | shard (one bundle) |
 | `dedup` | `$STAGING/deduped/*.parquet` | per table (`.done` markers; delete `deduped/` to redo) | staging set |
-| `load` | `containers`, `domains`, `web_resources` (cited), `wiki_templates`, `normalized_citations`, `citation_instances`, `normalized_citation_web_resources`, `template_value_counts`; Parquet `template_params/`, `template_param_index/` | upserts — idempotent; the template datasets' domain partitions and that domain's `template_value_counts` replaced | staging set |
+| `load` | `containers`, `domains`, `web_resources` (cited), `wiki_templates`, `normalized_citations`, `citation_instances`, `normalized_citation_web_resources`, `template_value_counts`; Parquet `template_params/`, `template_param_index/` | upserts — idempotent, the citation tables committed per Parquet row group (an interrupted load resumes on re-run); the template datasets' domain partitions and that domain's `template_value_counts` replaced | staging set |
 | `parts` | `normalized_citation_parts` | DELETE + INSERT per batch; `--resume` skips citations that already have parts | domain (or all) |
 | `denorm-export` | `citation_instances_denorm/` | the domain's partitions | domain |
 | `ref-name-links` | `ref_name_links` table and Parquet | the domain | domain |
-| `match` | `matching_intermediate/*` | bucket directories with a `_SUCCESS` marker are skipped unless `--force`; `--buckets 3,17` selects | bucket (6a–6c), domain (6d) |
-| `materialize` | `global_sources`, `citation_source_resolution`, resolved `citation_instances_denorm/`, `page_source_summary`, counts, scores, `global_source_scores/`, `page_summary_cache` | the domain, step by step; 7d/7h checkpoint per bucket under `$PARQUET_DIR/_checkpoints/` and resume; `--steps a,b` selects; `--force` ignores checkpoints | domain |
+| `match` | `matching_intermediate/*` (6d: `global_source_map/`, `global_sources_stage/` as several `data-NNNN.parquet`, and its saved unions in `_global_unions/`) | bucket directories with a `_SUCCESS` marker are skipped unless `--force`; `--buckets 3,17` selects; 6d always reruns, from the saved unions with `--reuse-unions` (only when 6a–6c are unchanged) | bucket (6a–6c), domain (6d) |
+| `materialize` | `global_sources`, `citation_source_resolution`, resolved `citation_instances_denorm/`, `page_source_summary`, counts, scores, `global_source_scores/`, `page_summary_cache` | the domain, step by step; 7d keeps each bucket's summary rows in `$PARQUET_DIR/_scratch/7d/` (a bucket with its file is skipped; the load into Postgres reruns whole; the scratch is removed when 7d is done), 7h checkpoints per bucket under `$PARQUET_DIR/_checkpoints/`; `--steps a,b` selects; `--force` ignores both | domain |
 | `revision-stats` | `page_revision_stats/` | bucket directories | bucket |
 
 Rules of thumb:
@@ -211,6 +264,57 @@ Rules of thumb:
 * **Several domains** run one after another with the same commands; the
   per-domain outputs are independent except `global_sources` (upserted) — see
   the cross-domain note in the plan (§10).
+
+## Operating a large build
+
+What the enwiki build (plan §§17–24) taught about running these steps on one
+machine beside Postgres.
+
+**Building bundles while the dump downloads.** A 7z dump file can only be
+read once it is complete. `scripts/revisionchest_dump_pipeline.sh` runs
+`RevisionChest build` on each file as soon as its `<file>.ok` checksum marker
+appears, several at once, and records per-file timings; it is re-runnable and
+stops when free disk runs low.
+
+**Run heavy steps in a memory-capped scope.** Start each DuckDB-heavy step with
+`sudo systemd-run --scope --uid=$USER --gid=$(id -g) -p MemoryMax=<cap> …` and
+set `DUCKDB_MEMORY_LIMIT` several GB below the cap: a worker's resident memory
+runs 5–7 GB above DuckDB's own limit with its Python state. Without a cap,
+each DuckDB connection takes 80 % of RAM, and next to Postgres' shared buffers
+that runs the host out of memory. For several workers, the limit is per
+worker (`match`, `revision-stats`).
+
+**Look at the plan before a whole-table statement.** On tables of 100M+ rows,
+run `EXPLAIN` before any `UPDATE … FROM`, `INSERT … SELECT` or large
+aggregate. Postgres often estimates far fewer groups than there are (7e saw
+16M estimated against 121M real), then hash-aggregates and hash-joins in
+`work_mem` and spills for hours without writing a row. Prefer a sort and a
+merge join through the primary key, or put the inputs in temp tables and
+`ANALYZE` them first. One random index lookup per row into a table larger
+than `shared_buffers` runs at about 2k rows/s: join set-wise instead.
+`work_mem` applies per sort or hash node and per parallel worker, so 1 GB with
+8 workers has run the host out of memory. A server-side cursor never gets a
+parallel plan; export with `COPY (query) TO STDOUT`.
+
+**Stopping a long query.** Killing the client does not stop the Postgres
+backend: a long statement runs to completion. Find its pid in
+`pg_stat_activity` and call `pg_cancel_backend(pid)`. Select the pid by its
+query text only with a pattern your own lookup does not also match.
+
+**Redoing a Stage 3 load.** Return the database to its post-Stage-0 state:
+
+```
+TRUNCATE normalized_citations RESTART IDENTITY CASCADE;  -- cascades to instances, ncwr, parts, ref_name_links, …
+SET session_replication_role = replica;                  -- as a superuser: skips the unindexed is_archive_of self-reference,
+DELETE FROM web_resources WHERE numeric_page_id IS NULL; -- without which this delete never finishes
+SET session_replication_role = DEFAULT;
+VACUUM web_resources;                                    -- 12–18 min on enwiki
+```
+
+**Checking a change to Stage 0.** `scripts/benchmarks/stage0_fingerprint.sh`
+prints order-independent fingerprints of the Stage-0 tables and the
+`revisions` Parquet. Two loads of the same dump must print the same lines,
+whatever their job count or file layout (all but the file count).
 
 ## Incremental updates (RevisionChest `sync`)
 

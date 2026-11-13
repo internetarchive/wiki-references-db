@@ -39,7 +39,7 @@ from wcd_schema.duckdb import bind_bucket_views
 from wcd_schema.parquet import SCHEMAS
 from wcd_semantic import match_global, match_reftag, match_template, merge_types
 
-from .config import load_dotenv  # noqa: F401
+from .config import duckdb_connect, load_dotenv  # noqa: F401
 
 MI = "matching_intermediate/"
 BUCKET_DATASETS = ("sources", "citation_source_map", "template_sources", "template_citation_source_map",
@@ -89,6 +89,7 @@ SELECT dn.page_id, dn.part_sha1,
        min(dn.reference_name)         AS ref_name
 FROM citation_instances_denorm dn
 JOIN citation_history ch ON ch.citation_instance_id = dn.citation_instance_id
+WHERE (dn.page_id // {buckets}) % {slices} = {slice}
 GROUP BY dn.page_id, dn.part_sha1, dn.part_type = 'template'
 ORDER BY dn.page_id, dn.part_sha1
 """
@@ -98,9 +99,16 @@ def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [match] {msg}", flush=True)
 
 
-def load_bucket_inputs(con: duckdb.DuckDBPyConnection, parquet_base: str, domain: str, bucket: int) -> pd.DataFrame:
+# A bucket is matched in this many page slices ((page_id // PAGE_BUCKETS) % slices):
+# its whole input as one pandas frame (~600k wide rows on enwiki) did not fit an
+# 8 GB DuckDB limit, and pages are matched independently (MATCH_PAGE_SLICES).
+PAGE_SLICES = int(os.getenv("MATCH_PAGE_SLICES", "8"))
+
+
+def load_bucket_inputs(con: duckdb.DuckDBPyConnection, parquet_base: str, domain: str, bucket: int,
+                       slice_: int = 0, slices: int = 1) -> pd.DataFrame:
     bind_bucket_views(con, parquet_base, domain, bucket, ("citation_instances_denorm", "citation_history"))
-    df = con.execute(_INPUT_SQL).df()
+    df = con.execute(_INPUT_SQL.format(buckets=layout.PAGE_BUCKETS, slices=slices, slice=slice_)).df()
     # pandas turns nullable ints into floats; the matchers compare raw values
     for c in ("id_tier", "n_revisions", "first_rev_id", "page_id"):
         if c in df.columns:
@@ -209,13 +217,29 @@ def _to_table(df: pd.DataFrame, dataset: str) -> pa.Table:
     return pa.Table.from_pylist(rows, schema=schema)
 
 
-def write_bucket(outputs: dict[str, pd.DataFrame], parquet_base: str, domain: str, bucket: int) -> None:
+def clear_bucket(parquet_base: str, domain: str, bucket: int) -> None:
+    """Empty the bucket's output directories (marker included) before a run."""
     for ds in BUCKET_DATASETS:
         d = layout.partition_dir(parquet_base, MI + ds, domain, bucket)
         if d.exists():
             shutil.rmtree(d)
         d.mkdir(parents=True)
-        pq.write_table(_to_table(outputs.get(ds, pd.DataFrame()), ds), d / "data.parquet", compression="zstd")
+
+
+def write_slice(outputs: dict[str, list], parquet_base: str, domain: str, bucket: int, slice_: int) -> int:
+    """Write one page slice's outputs as ``data-<slice>.parquet`` in each dataset's
+    bucket directory (readers glob ``*.parquet``); returns its merged_sources rows."""
+    n = 0
+    for ds in BUCKET_DATASETS:
+        frame = pd.concat(outputs[ds], ignore_index=True) if outputs[ds] else pd.DataFrame()
+        if ds == "merged_sources":
+            n = len(frame)
+        d = layout.partition_dir(parquet_base, MI + ds, domain, bucket)
+        pq.write_table(_to_table(frame, ds), d / f"data-{slice_}.parquet", compression="zstd")
+    return n
+
+
+def finish_bucket(parquet_base: str, domain: str, bucket: int) -> None:
     (layout.partition_dir(parquet_base, MI + "merged_citation_source_map", domain, bucket) / MARKER).touch()
 
 
@@ -225,26 +249,34 @@ def bucket_done(parquet_base: str, domain: str, bucket: int) -> bool:
 
 def run_bucket(parquet_base: str, domain: str, bucket: int) -> dict:
     t0 = time.time()
-    con = duckdb.connect()
-    try:
-        df = load_bucket_inputs(con, parquet_base, domain, bucket)
-    finally:
-        con.close()
-    outputs = {ds: [] for ds in BUCKET_DATASETS}
-    n_pages = 0
-    if not df.empty:
-        sizes = df.groupby("page_id").size().sort_values(ascending=False)
-        for page_id in sizes.index:
-            page_df = df[df["page_id"] == page_id]
-            res = match_one_page(page_df, int(page_id))
-            for ds in BUCKET_DATASETS:
-                if not res[ds].empty:
-                    outputs[ds].append(res[ds])
-            n_pages += 1
-    frames = {ds: (pd.concat(v, ignore_index=True) if v else pd.DataFrame()) for ds, v in outputs.items()}
-    write_bucket(frames, parquet_base, domain, bucket)
-    return {"bucket": bucket, "pages": n_pages, "parts": int(len(df)),
-            "merged_sources": int(len(frames["merged_sources"])), "seconds": round(time.time() - t0, 1)}
+    clear_bucket(parquet_base, domain, bucket)
+    n_pages = n_parts = n_merged = 0
+    for s in range(PAGE_SLICES):
+        con = duckdb_connect()
+        try:
+            df = load_bucket_inputs(con, parquet_base, domain, bucket, s, PAGE_SLICES)
+        finally:
+            con.close()
+        n_parts += len(df)
+        outputs = {ds: [] for ds in BUCKET_DATASETS}
+        if not df.empty:
+            # one pass over the slice (each group keeps its rows in their original
+            # order); a boolean mask per page rescanned all of it for every page:
+            # ~37k pages × ~680k rows per enwiki bucket
+            pages = dict(iter(df.groupby("page_id", sort=False)))
+            sizes = df.groupby("page_id").size().sort_values(ascending=False)
+            del df
+            for page_id in sizes.index:
+                res = match_one_page(pages.pop(page_id), int(page_id))
+                for ds in BUCKET_DATASETS:
+                    if not res[ds].empty:
+                        outputs[ds].append(res[ds])
+                n_pages += 1
+        # each slice's output goes to disk before the next one is loaded
+        n_merged += write_slice(outputs, parquet_base, domain, bucket, s)
+    finish_bucket(parquet_base, domain, bucket)
+    return {"bucket": bucket, "pages": n_pages, "parts": n_parts,
+            "merged_sources": n_merged, "seconds": round(time.time() - t0, 1)}
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +285,7 @@ def run_bucket(parquet_base: str, domain: str, bucket: int) -> dict:
 
 def run_global(parquet_base: str, domain: str) -> dict:
     t0 = time.time()
-    con = duckdb.connect()
+    con = duckdb_connect()
     try:
         pattern = layout.partition_glob(parquet_base, MI + "merged_sources", domain)
         df = con.execute(f"SELECT * EXCLUDE (domain, page_bucket) FROM read_parquet('{pattern}', hive_partitioning=true) "
@@ -300,7 +332,7 @@ def gate(parquet_base: str, domain: str) -> list[str]:
     """all six intermediate datasets exist; merged_citation_source_map > 0; every
     merged_source_id in global_source_map exists in merged_sources."""
     failures = []
-    con = duckdb.connect()
+    con = duckdb_connect()
     for ds in BUCKET_DATASETS:
         if not layout.list_buckets(parquet_base, MI + ds, domain):
             failures.append(f"no {ds} partitions for {domain}")
@@ -335,6 +367,13 @@ def main(argv=None) -> int:
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2), help="buckets processed concurrently")
     ap.add_argument("--force", action="store_true", help="re-run buckets that already have a _SUCCESS marker")
     ap.add_argument("--skip-global", action="store_true", help="stop after 6c")
+    ap.add_argument("--global-engine", choices=("scaled", "vendored"), default="scaled",
+                    help="6d: scaled (integer union-find + DuckDB, global_match) or the vendored pandas match_global "
+                         "(same output; only for small domains)")
+    ap.add_argument("--reuse-unions", action="store_true",
+                    help="6d scaled: reuse the unions a previous 6d run saved (matching_intermediate/_global_unions) "
+                         "if they are for the same number of merged sources; for re-running 6d after a failure "
+                         "past the union-find, never after 6a-6c changed")
     ap.add_argument("--no-gate", action="store_true")
     args = ap.parse_args(argv)
     if not args.parquet_dir:
@@ -347,18 +386,36 @@ def main(argv=None) -> int:
     todo = [b for b in buckets if args.force or not bucket_done(args.parquet_dir, args.domain, b)]
     log(f"{len(buckets)} bucket(s), {len(todo)} to run, {args.jobs} job(s)")
     t0 = time.time()
+    # a bucket that fails is logged and left without its _SUCCESS marker (a re-run
+    # redoes it); the others go on, and the run exits non-zero naming the failures
+    failed = []
     if args.jobs > 1 and len(todo) > 1:
         with ProcessPoolExecutor(max_workers=args.jobs) as pool:
             futures = {pool.submit(run_bucket, args.parquet_dir, args.domain, b): b for b in todo}
             for f in as_completed(futures):
-                log(f"bucket {f.result()}")
+                try:
+                    log(f"bucket {f.result()}")
+                except Exception as e:  # noqa: BLE001 — reported, and the run fails at the end
+                    failed.append(futures[f])
+                    log(f"bucket {futures[f]} FAILED: {type(e).__name__}: {e}")
     else:
         for b in todo:
-            log(f"bucket {run_bucket(args.parquet_dir, args.domain, b)}")
+            try:
+                log(f"bucket {run_bucket(args.parquet_dir, args.domain, b)}")
+            except Exception as e:  # noqa: BLE001
+                failed.append(b)
+                log(f"bucket {b} FAILED: {type(e).__name__}: {e}")
     log(f"6a-6c done in {time.time() - t0:.1f}s")
+    if failed:
+        log(f"{len(failed)} bucket(s) failed: {sorted(failed)}; re-run to redo them")
+        return 1
     if args.skip_global:
         return 0
-    log(f"6d {run_global(args.parquet_dir, args.domain)}")
+    if args.global_engine == "scaled":
+        from .global_match import run_global_scaled
+        log(f"6d {run_global_scaled(args.parquet_dir, args.domain, reuse_unions=args.reuse_unions)}")
+    else:
+        log(f"6d {run_global(args.parquet_dir, args.domain)}")
     if not args.no_gate:
         failures = gate(args.parquet_dir, args.domain)
         if failures:

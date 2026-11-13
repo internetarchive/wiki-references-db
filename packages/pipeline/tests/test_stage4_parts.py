@@ -44,3 +44,53 @@ def test_parts_urls_shorthand_and_noise():
     noise = parts_of(7, "<ref>&nbsp;see above</ref>", "ref_tag")
     assert len(noise) == 1 and noise[0]["norm_subtype"] == "noise" and noise[0]["part_index"] == 0
     assert parts_of(8, "<ref></ref>", "ref_tag")[0]["norm_subtype"] == "noise"
+
+
+def test_long_letter_run_is_classified_quickly_and_whole():
+    """A vandalised ref of one 50,000-letter 'word' (enwiki has a 227,137-char one)
+    is classified in linear time (wcd_semantic NOTICE deviation 2), and a long
+    letters-only URL parameter reaches the normalizer uncut."""
+    import time
+
+    content = "[http://example.org/x Music Trust – More" + "a" * 50_000 + "]"
+    t = time.process_time()
+    part = parts_of(9, f"<ref>{content}</ref>", "ref_tag")[0]
+    assert time.process_time() - t < 5     # upstream regex: ~4 CPU-min (quadratic backtracking)
+    assert part["content"] == content and part["part_sha1"] == part_sha1(content)
+    assert part["extracted_url"] == "https://example.org/x"   # the normalizer upgrades the scheme
+    gs = "https://www.google.com/search?q=x&gs_lp=" + "Egxnd" * 60
+    assert parts_of(10, gs, "external_link")[0]["extracted_url"] == gs
+
+
+def test_ftp_url_citations_keep_their_url():
+    """The ref-tag normalizer extracts only http(s); a bare-URL or external-link
+    citation of an ftp:// URL still gets extracted_url (gate 4)."""
+    bare = parts_of(11, "<ref>[ftp://ftp.example.org/pub/a.pdf A manual]</ref>", "bare_url")[0]
+    assert bare["extracted_url"] == "ftp://ftp.example.org/pub/a.pdf"
+    plain = parts_of(12, "<ref>ftp://ftp.example.org/pub/b.txt</ref>", "bare_url")[0]
+    assert plain["extracted_url"] == "ftp://ftp.example.org/pub/b.txt"
+    # a prose ref_tag citation is not a URL citation: no fallback
+    assert parts_of(13, "<ref>Text, see ftp://ftp.example.org/c</ref>", "ref_tag")[0]["extracted_url"] is None
+
+
+def test_url_citation_keeps_its_url_when_only_a_template_part_is_split_out():
+    """`[http://… Title{{Citation needed}}]`: the splitter keeps only the template;
+    the URL becomes a part of its own (templates and wiki quotes removed)."""
+    parts = parts_of(14, "<ref>[http://ellen.warne{{Citation needed}}rbros.com/2010/a.html Title{{Citation needed}}]</ref>",
+                     "bare_url")
+    if parts[0]["part_type"] == "template":     # the vendored splitter's behaviour this guards against
+        assert [p["part_index"] for p in parts] == [0, 1]
+        url_part = parts[1]
+        assert url_part["content"] == "http://ellen.warnerbros.com/2010/a.html"
+        assert url_part["part_sha1"] == part_sha1(url_part["content"])
+    assert any(p["extracted_url"] and "ellen.warnerbros.com/2010/a.html" in p["extracted_url"] for p in parts)
+    ext = parts_of(15, "[https://2cm.es/1g4SC In 2015 he signed.{{Citation needed|date=October 2024}}]", "external_link")
+    assert any(p["extracted_url"] for p in ext)
+
+
+def test_fallback_url_drops_wiki_quotes_and_bare_schemes():
+    assert parts_of(16, "<ref>http://'''Www.usa.com/weather.htm'''</ref>", "bare_url")[0]["extracted_url"] \
+        == "http://Www.usa.com/weather.htm"
+    assert parts_of(17, "<ref>[http://''www.radiotimes.com/episode/x'']</ref>", "bare_url")[0]["extracted_url"] \
+        == "http://www.radiotimes.com/episode/x"
+    assert all(p["extracted_url"] is None for p in parts_of(18, "<ref>https://'</ref>", "bare_url"))

@@ -22,6 +22,7 @@ citation; the unique-content cache keeps repeated contents cheap.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import time
 from functools import lru_cache
@@ -89,12 +90,38 @@ def _template_part(parsed: dict) -> dict:
     }
 
 
-def _reftag_part(content: str, part_type: str, noise: bool = False) -> dict:
+_TEMPLATE_RE = re.compile(r"\{\{[^{}]*\}\}")
+_WIKI_QUOTES_RE = re.compile(r"'{2,}")
+_HOST_START_RE = re.compile(r"://[^\W_]")   # a host, not a bare scheme like https://'
+
+
+def _fallback_url(content: str) -> str | None:
+    """The first URL in ``content`` as written, for URL citations the
+    normalizer gives none: embedded templates removed (``http://a.b{{Citation
+    needed}}c/`` → ``http://a.bc/``), wiki italic/bold quote runs removed
+    (``http://''www.x.com/''``), and nothing without a host after ``://``
+    (``https://'``)."""
+    text = content
+    while True:
+        stripped = _TEMPLATE_RE.sub("", text)
+        if stripped == text:
+            break
+        text = stripped
+    m = _URL_RE.search(_WIKI_QUOTES_RE.sub("", text))
+    if not m or not _HOST_START_RE.search(m.group(0)):
+        return None
+    return m.group(0)
+
+
+def _reftag_part(content: str, part_type: str, noise: bool = False, url_citation: bool = False) -> dict:
+    """A ref-tag part. For a citation that is a URL (``bare_url`` /
+    ``external_link``) whose normalizer output has no URL, ``_fallback_url``
+    is taken: the normalizer only extracts http(s), and enwiki has ~2,400
+    ftp:// bare-URL citations (gate 4 requires their extracted_url)."""
     r = classify(content)
     url = r.get("extracted_url")
-    if url is None and part_type == "external_link":
-        m = _URL_RE.search(content)
-        url = m.group(0) if m else None
+    if url is None and (part_type == "external_link" or url_citation):
+        url = _fallback_url(content)
     return {
         "content": content, "part_type": part_type,
         "norm_subtype": "noise" if noise else r["norm_subtype"], "norm_content": r["norm_content"],
@@ -115,15 +142,23 @@ def _parts_for_content(content: str, citation_type: str) -> tuple:
     """The parts of one content string, as a tuple of dicts (cached: the same
     content recurs across pages)."""
     ref_part_type = "external_link" if citation_type == "external_link" else "ref_tag"
+    url_citation = citation_type in ("bare_url", "external_link")
     parts = []
     for parsed in iter_citations(None, content):
         if parsed["citation_type"] == "template":
             parts.append(_template_part(parsed))
         else:
-            parts.append(_reftag_part(parsed["content"], ref_part_type))
+            parts.append(_reftag_part(parsed["content"], ref_part_type, url_citation=url_citation))
     if not parts:
         # footnote filter rejected it (or empty content): keep it, typed as noise
-        parts.append(_reftag_part(content, ref_part_type, noise=True))
+        parts.append(_reftag_part(content, ref_part_type, noise=True, url_citation=url_citation))
+    if url_citation and not any(p.get("extracted_url") for p in parts):
+        # The splitter can keep only an embedded template and drop the URL text
+        # (`[http://… Title{{Citation needed}}]`, 127 citations on enwiki): the URL
+        # becomes a part of its own, normalized like a bare URL.
+        url = _fallback_url(content)
+        if url:
+            parts.append(_reftag_part(url, ref_part_type, url_citation=True))
     return tuple(parts)
 
 
@@ -156,7 +191,7 @@ def write_batch(cur, rows: list[dict], normalized_ids: list[int]) -> None:
         psycopg2.extras.execute_values(cur, _INSERT, rows, template=_TEMPLATE, page_size=1000)
 
 
-def _select(domain: str | None, resume: bool) -> tuple[str, dict]:
+def _select(domain: str | None, resume: bool, lo: int | None = None, hi: int | None = None) -> tuple[str, dict]:
     sql = "SELECT nc.id, nc.reference_normalized, nc.citation_type FROM normalized_citations nc"
     params: dict = {}
     where = []
@@ -164,6 +199,9 @@ def _select(domain: str | None, resume: bool) -> tuple[str, dict]:
         sql += " JOIN domains d ON d.id = nc.appears_on_domain_id"
         where.append("d.value = %(domain)s")
         params["domain"] = domain
+    if lo is not None:
+        where.append("nc.id >= %(lo)s AND nc.id < %(hi)s")
+        params.update(lo=lo, hi=hi)
     if resume:
         where.append("NOT EXISTS (SELECT 1 FROM normalized_citation_parts p WHERE p.normalized_id = nc.id)")
     if where:
@@ -171,14 +209,21 @@ def _select(domain: str | None, resume: bool) -> tuple[str, dict]:
     return sql + " ORDER BY nc.id", params
 
 
-def run(dsn: str, domain: str | None = None, resume: bool = False, batch: int = 2000) -> dict:
-    """Build parts for the selected normalized citations. Returns counts."""
+# normalized_citations ids per unit of work (ids are dense: the sequence)
+UNIT_IDS = int(os.getenv("PARTS_UNIT_IDS", "1000000"))
+PARTS_JOBS = int(os.getenv("PARTS_JOBS", "8"))
+
+
+def run_range(dsn: str, domain: str | None, resume: bool, batch: int,
+              lo: int | None = None, hi: int | None = None) -> tuple[int, int]:
+    """Build parts for the selected citations with ``lo <= id < hi`` (all if
+    ``lo`` is None), one DELETE + INSERT and commit per ``batch`` citations.
+    Returns (citations, parts)."""
     read = psycopg2.connect(dsn)
     write = psycopg2.connect(dsn)
     n_cit = n_parts = 0
-    t0 = time.time()
     try:
-        sql, params = _select(domain, resume)
+        sql, params = _select(domain, resume, lo, hi)
         with read.cursor(name="stage4_read") as rc, write.cursor() as wc:
             rc.itersize = batch
             rc.execute(sql, params)
@@ -194,14 +239,70 @@ def run(dsn: str, domain: str | None = None, resume: bool = False, batch: int = 
                 write.commit()
                 n_cit += len(ids)
                 n_parts += len(rows)
-                if n_cit % (batch * 25) == 0:
-                    log(f"{n_cit} citations → {n_parts} parts ({n_cit / (time.time() - t0):.0f}/s)")
     except Exception:
         write.rollback()
         raise
     finally:
         read.close()
         write.close()
+    return n_cit, n_parts
+
+
+def run(dsn: str, domain: str | None = None, resume: bool = False, batch: int = 2000,
+        jobs: int = 1, defer_fks: bool = True) -> dict:
+    """Build parts for the selected normalized citations, ``jobs`` processes
+    at a time over ``UNIT_IDS``-wide id ranges (each unit commits per batch, so
+    an interrupted run resumes with ``--resume`` or redoes its units). Returns
+    counts.
+
+    On enwiki the normalizers cost ~4,200 citations per CPU-second (≈19
+    core-hours for 285M citations), so one process would take about a day.
+    With ``defer_fks`` the parts table's foreign key is dropped while the table
+    is empty and validated afterwards (``fkeys``): each row's check would
+    otherwise lock a row of normalized_citations."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import multiprocessing
+
+    from sqlalchemy import text
+
+    from . import fkeys
+    from .gates import make_session
+
+    table = "normalized_citation_parts"
+    session = make_session()
+    t0 = time.time()
+    try:
+        if defer_fks:
+            fkeys.drop_if_empty(session, table, log)
+        lo, hi = session.execute(text("SELECT MIN(id), MAX(id) FROM normalized_citations")).one()
+        session.commit()
+        ranges = [] if lo is None else [(a, min(a + UNIT_IDS, hi + 1)) for a in range(lo, hi + 1, UNIT_IDS)]
+        n_cit = n_parts = 0
+        if jobs <= 1:
+            for i, (a, b) in enumerate(ranges, 1):
+                c, p = run_range(dsn, domain, resume, batch, a, b)
+                n_cit, n_parts = n_cit + c, n_parts + p
+                if i % 10 == 0:
+                    log(f"{i}/{len(ranges)} units: {n_cit} citations → {n_parts} parts "
+                        f"({n_cit / (time.time() - t0):.0f}/s)")
+        else:
+            # spawn, not fork: a forked worker would share (and on exit close) the parent's sockets
+            with ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context("spawn")) as pool:
+                futures = [pool.submit(run_range, dsn, domain, resume, batch, a, b) for a, b in ranges]
+                try:
+                    for i, f in enumerate(as_completed(futures), 1):
+                        c, p = f.result()
+                        n_cit, n_parts = n_cit + c, n_parts + p
+                        if i % 10 == 0 or i == len(ranges):
+                            log(f"{i}/{len(ranges)} units: {n_cit} citations → {n_parts} parts "
+                                f"({n_cit / (time.time() - t0):.0f}/s, {jobs} jobs)")
+                except BaseException:
+                    for f in futures:
+                        f.cancel()
+                    raise
+        fkeys.restore(session, table, log)
+    finally:
+        session.close()
     return {"citations": n_cit, "parts": n_parts, "seconds": round(time.time() - t0, 1)}
 
 
@@ -211,9 +312,17 @@ def main(argv=None) -> int:
     ap.add_argument("--resume", action="store_true", help="skip citations that already have parts")
     ap.add_argument("--batch", type=int, default=2000, help="citations per transaction (default: 2000)")
     ap.add_argument("--no-gate", action="store_true", help="skip the Stage-4 gate afterwards (gate needs --domain)")
+    ap.add_argument("--jobs", type=int, default=PARTS_JOBS,
+                    help=f"worker processes, one id range of {UNIT_IDS:,} citations per unit "
+                         f"(default: PARTS_JOBS or {PARTS_JOBS})")
+    ap.add_argument("--defer-fks", action=argparse.BooleanOptionalAction, default=True,
+                    help="drop the parts table's foreign key while it is empty, validate it after (default: on)")
     args = ap.parse_args(argv)
+    if args.jobs < 1:
+        ap.error("--jobs must be at least 1")
     dsn = psycopg_dsn()
-    counts = run(dsn, args.domain, args.resume, args.batch)
+    log(f"jobs {args.jobs}, defer foreign keys {args.defer_fks}")
+    counts = run(dsn, args.domain, args.resume, args.batch, args.jobs, args.defer_fks)
     log(f"done: {counts}")
     if not args.no_gate and args.domain:
         from .gates import make_session, report, stage4

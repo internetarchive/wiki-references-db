@@ -15,18 +15,22 @@ Stage 7d. ``wcd ref-name-links --domain D``.
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import shutil
 import time
 
 import duckdb
 import psycopg2
-import psycopg2.extras
+import pyarrow as pa
+import pyarrow.csv as pa_csv
 
 from wcd_schema import parquet as layout
 from wcd_schema.duckdb import bind_bucket_views
 
-from .config import load_dotenv, psycopg_dsn  # noqa: F401
+from . import fkeys
+from .config import duckdb_connect, load_dotenv, psycopg_dsn  # noqa: F401
+from .gates import make_session
 
 COLUMNS = ("page_id", "ref_name", "defining_instance_id", "first_revision_id", "last_revision_id")
 
@@ -66,7 +70,9 @@ def log(msg: str) -> None:
 
 
 def load_named_instances(con: duckdb.DuckDBPyConnection, pg, domain_id: int) -> int:
-    """Copy the domain's named instances (id, page_id, ref_name) into DuckDB."""
+    """Copy the domain's named instances (id, page_id, ref_name) into DuckDB,
+    100k rows at a time as Arrow batches (row-by-row ``executemany`` was the
+    slow part at enwiki scale)."""
     con.execute("CREATE OR REPLACE TABLE named_instances (id BIGINT, page_id INTEGER, ref_name VARCHAR, page_bucket INTEGER)")
     n = 0
     with pg.cursor(name="stage5_named") as cur:
@@ -77,34 +83,54 @@ def load_named_instances(con: duckdb.DuckDBPyConnection, pg, domain_id: int) -> 
             rows = cur.fetchmany(100_000)
             if not rows:
                 break
-            con.executemany("INSERT INTO named_instances VALUES (?, ?, ?, ? % " + str(layout.PAGE_BUCKETS) + ")",
-                            [(i, p, r, p) for i, p, r in rows])
+            ids, pages, names = zip(*rows)
+            batch = pa.table({"id": pa.array(ids, pa.int64()), "page_id": pa.array(pages, pa.int32()),
+                              "ref_name": pa.array(names, pa.string())})
+            con.register("named_batch", batch)
+            con.execute(f"INSERT INTO named_instances SELECT id, page_id, ref_name, page_id % {layout.PAGE_BUCKETS} "
+                        "FROM named_batch")
+            con.unregister("named_batch")
             n += len(rows)
     return n
 
 
-def build_bucket(con: duckdb.DuckDBPyConnection, parquet_base: str, domain: str, bucket: int) -> list[tuple]:
+def build_bucket(con: duckdb.DuckDBPyConnection, parquet_base: str, domain: str, bucket: int) -> int:
+    """The bucket's links into the DuckDB table ``out_rows``; returns their count."""
     bind_bucket_views(con, parquet_base, domain, bucket, ("citation_history", "revisions"))
-    return con.execute(_BUCKET_SQL.format(bucket=bucket)).fetchall()
+    con.execute(f"""CREATE OR REPLACE TEMP TABLE out_rows AS
+        SELECT CAST(page_id AS INTEGER) AS page_id, CAST(ref_name AS VARCHAR) AS ref_name,
+               CAST(defining_instance_id AS BIGINT) AS defining_instance_id,
+               CAST(first_revision_id AS BIGINT) AS first_revision_id,
+               CAST(last_revision_id AS BIGINT) AS last_revision_id
+        FROM ({_BUCKET_SQL.format(bucket=bucket)})""")
+    return con.execute("SELECT count(*) FROM out_rows").fetchone()[0]
 
 
-def write_bucket_parquet(con: duckdb.DuckDBPyConnection, rows: list[tuple], parquet_base: str, domain: str, bucket: int) -> None:
+def write_bucket_parquet(con: duckdb.DuckDBPyConnection, n_rows: int, parquet_base: str, domain: str, bucket: int) -> None:
     d = layout.partition_dir(parquet_base, "ref_name_links", domain, bucket)
     if d.exists():
         shutil.rmtree(d)
-    if not rows:
+    if not n_rows:
         return
     d.mkdir(parents=True)
-    con.execute("CREATE OR REPLACE TEMP TABLE out_rows (page_id INTEGER, ref_name VARCHAR, defining_instance_id BIGINT, "
-                "first_revision_id BIGINT, last_revision_id BIGINT)")
-    con.executemany("INSERT INTO out_rows VALUES (?, ?, ?, ?, ?)", rows)
     con.execute(f"COPY (SELECT * FROM out_rows ORDER BY page_id, ref_name, first_revision_id) TO '{d / 'data.parquet'}' "
                 "(FORMAT PARQUET, COMPRESSION ZSTD)")
 
 
-def run(dsn: str, domain: str, parquet_base: str) -> dict:
+def write_bucket_postgres(con: duckdb.DuckDBPyConnection, cur, domain_id: int) -> None:
+    """``COPY`` the bucket's ``out_rows`` into ``ref_name_links`` (NULLs as
+    unquoted empty fields, every other value quoted)."""
+    result = con.execute(f"SELECT CAST({int(domain_id)} AS INTEGER) AS domain_id, * FROM out_rows")
+    table = (getattr(result, "to_arrow_table", None) or result.fetch_arrow_table)()
+    buf = io.BytesIO()
+    pa_csv.write_csv(table, buf, pa_csv.WriteOptions(include_header=False, quoting_style="all_valid"))
+    buf.seek(0)
+    cur.copy_expert("COPY ref_name_links (domain_id, " + ", ".join(COLUMNS) + ") FROM STDIN WITH (FORMAT csv)", buf)
+
+
+def run(dsn: str, domain: str, parquet_base: str, defer_fks: bool = True) -> dict:
     pg = psycopg2.connect(dsn)
-    con = duckdb.connect()
+    con = duckdb_connect()
     t0 = time.time()
     try:
         with pg.cursor() as cur:
@@ -121,18 +147,25 @@ def run(dsn: str, domain: str, parquet_base: str) -> dict:
         with pg.cursor() as cur:
             cur.execute("DELETE FROM ref_name_links WHERE domain_id = %s", (domain_id,))
         pg.commit()
-        total = 0
-        for b in buckets:
-            rows = build_bucket(con, parquet_base, domain, b)
-            write_bucket_parquet(con, rows, parquet_base, domain, b)
-            if rows:
-                with pg.cursor() as cur:
-                    psycopg2.extras.execute_values(
-                        cur, "INSERT INTO ref_name_links (domain_id, page_id, ref_name, defining_instance_id, "
-                             "first_revision_id, last_revision_id) VALUES %s",
-                        [(domain_id, *r) for r in rows], page_size=5000)
-                pg.commit()
-            total += len(rows)
+        # each row's foreign-key check would lock a citation_instances row (338M on enwiki)
+        session = make_session()
+        try:
+            if defer_fks:
+                fkeys.drop_if_empty(session, "ref_name_links", log)
+            total = 0
+            for i, b in enumerate(buckets, 1):
+                n = build_bucket(con, parquet_base, domain, b)
+                write_bucket_parquet(con, n, parquet_base, domain, b)
+                if n:
+                    with pg.cursor() as cur:
+                        write_bucket_postgres(con, cur, domain_id)
+                    pg.commit()
+                total += n
+                if i % 32 == 0:
+                    log(f"{i}/{len(buckets)} buckets, {total} links ({time.time() - t0:.0f}s)")
+            fkeys.restore(session, "ref_name_links", log)
+        finally:
+            session.close()
         return {"buckets": len(buckets), "links": total, "seconds": round(time.time() - t0, 1)}
     except Exception:
         pg.rollback()
@@ -147,11 +180,13 @@ def main(argv=None) -> int:
     ap.add_argument("--domain", required=True)
     ap.add_argument("--parquet-dir", default=os.environ.get("PARQUET_DIR"), help="Parquet tier base directory (default: PARQUET_DIR)")
     ap.add_argument("--no-gate", action="store_true")
+    ap.add_argument("--defer-fks", action=argparse.BooleanOptionalAction, default=True,
+                    help="drop ref_name_links' foreign keys while it is empty, validate them after (default: on)")
     args = ap.parse_args(argv)
     if not args.parquet_dir:
         ap.error("--parquet-dir (or PARQUET_DIR) is required")
     dsn = psycopg_dsn()
-    counts = run(dsn, args.domain, args.parquet_dir)
+    counts = run(dsn, args.domain, args.parquet_dir, args.defer_fks)
     log(f"done: {counts}")
     if not args.no_gate:
         from .gates import make_session, report, stage5
