@@ -207,6 +207,37 @@ def test_delete_dumps_keeps_markers(site, tmp_path, stub):
     assert len(site.gets) == 3
 
 
+def test_bundles_cut_into_pieces(site, tmp_path, stub):
+    """--pieces 2: each bundle becomes two extract units on page boundaries; the pieces are
+    deleted once extracted, and the shard counts as extracted when both are done."""
+    path, _ = stub
+    assert setup_wiki.main(_args(site, tmp_path, path, "--shards-only", "--pieces", "2")) == 0
+    run = tmp_path / "work" / D / f"{DB}-{DATE}"
+    for name in SHARDS:
+        shard = setup_wiki.bundle_name(name)[: -len(".mwrev.zst")]
+        assert (run / "state" / f"{shard}.pieces").read_text().strip() == "2"
+        assert all((run / "staging" / f"{shard}-{i}" / "DONE.txt").exists() for i in (0, 1))
+        assert not (run / "staging" / shard).exists()
+    assert not list((run / "pieces").iterdir())
+    # tier files carry the piece stems
+    assert list((tmp_path / "parquet" / "citation_history").rglob("*p1p150-*.parquet"))
+
+
+def test_pieces_are_automatic_only_with_few_files(site, tmp_path, stub, monkeypatch):
+    path, _ = stub
+    monkeypatch.setattr(setup_wiki, "MIN_PIECE_BYTES", 1)      # the synthetic bundles are tiny
+    # 3 files, --jobs 2: enough files, no pieces
+    assert setup_wiki.main(_args(site, tmp_path, path, "--shards-only")) == 0
+    run = tmp_path / "work" / D / f"{DB}-{DATE}"
+    assert {p.read_text().strip() for p in (run / "state").glob("*.pieces")} == {"1"}
+    # 3 files, --jobs 7: ceil(7 / 3) = 3 pieces each
+    args = _args(site, tmp_path, path, "--shards-only", "--work-dir", str(tmp_path / "work7"))
+    args[args.index("--jobs") + 1] = "7"
+    assert setup_wiki.main(args) == 0
+    run7 = tmp_path / "work7" / D / f"{DB}-{DATE}"
+    assert {p.read_text().strip() for p in (run7 / "state").glob("*.pieces")} == {"3"}
+
+
 def test_dry_run_lists_shards(site, tmp_path, stub, capsys):
     path, _ = stub
     assert setup_wiki.main(_args(site, tmp_path, path, "--dry-run")) == 0
@@ -231,7 +262,8 @@ def test_setup_builds_the_whole_wiki(site, tmp_path, stub, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", DSN)
     path, _ = stub
     try:
-        assert setup_wiki.main(_args(site, tmp_path, path)) == 0
+        # with pieces: the whole-wiki steps see piece staging dirs, the metadata the original bundles
+        assert setup_wiki.main(_args(site, tmp_path, path, "--pieces", "2")) == 0
         run = tmp_path / "work" / D / f"{DB}-{DATE}"
         steps = [n for n, _ in setup_wiki.whole_wiki_steps(D, run, 2)]
         assert all((run / "state" / "steps" / f"{n}.done").exists() for n in steps)
@@ -241,6 +273,6 @@ def test_setup_builds_the_whole_wiki(site, tmp_path, stub, monkeypatch):
             gids = [r[0] for r in con.execute(text("SELECT global_source_id FROM global_sources"))]
             assert gids and all(g.startswith(f"{DB}-{DATE}.") for g in gids)   # the run id qualifies them
         # a second run finds everything done
-        assert setup_wiki.main(_args(site, tmp_path, path)) == 0
+        assert setup_wiki.main(_args(site, tmp_path, path, "--pieces", "2")) == 0
     finally:
         engine.dispose()
