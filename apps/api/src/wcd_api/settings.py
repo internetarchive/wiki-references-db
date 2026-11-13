@@ -41,6 +41,10 @@ class Settings:
     #: the run that bare (unprefixed) global source ids belong to, reported as ``run_id``
     #: (builds made with WCD_RUN_ID prefix their ids ``<run id>.``)
     base_run_id: str | None = None
+    #: per-request DuckDB limits (API_DUCKDB_*; not the pipeline's DUCKDB_*, which are sized
+    #: for batch jobs): memory per connection, and threads
+    duckdb_memory_limit: str = "1GB"
+    duckdb_threads: int = 2
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -58,4 +62,6 @@ class Settings:
             pool_size=int(os.getenv("API_POOL_SIZE", "5")),
             legacy_template_ids=os.getenv("API_LEGACY_TEMPLATE_IDS") or None,
             base_run_id=os.getenv("API_BASE_RUN_ID") or None,
+            duckdb_memory_limit=os.getenv("API_DUCKDB_MEMORY_LIMIT", "1GB"),
+            duckdb_threads=int(os.getenv("API_DUCKDB_THREADS", "2")),
         )

@@ -44,7 +44,13 @@ class Database:
     # -- Parquet ----------------------------------------------------------
 
     def duck(self) -> duckdb.DuckDBPyConnection:
-        return duckdb.connect()
+        """A per-request connection, limited: DuckDB's defaults (80 % of RAM and every
+        core, per connection) let a few concurrent requests run the host out of
+        memory beside Postgres. A request reads one bucket partition (tens of MB)."""
+        con = duckdb.connect()
+        con.execute(f"SET memory_limit = '{self.settings.duckdb_memory_limit}'")
+        con.execute(f"SET threads = {int(self.settings.duckdb_threads)}")
+        return con
 
     def bind(self, con: duckdb.DuckDBPyConnection, domain: str, page_id: int, names) -> None:
         """Bind ``names`` (Parquet datasets) to the partition holding ``page_id``."""
