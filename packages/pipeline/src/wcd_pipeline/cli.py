@@ -11,6 +11,7 @@ import sys
 
 COMMANDS = {
     # name           (module,                       summary)
+    "setup":       ("wcd_pipeline.setup_wiki",  "Build a wiki from its dumps: stream shards (download, Stage 0 build, Stage 1), then Stages 0 load-8"),
     "extract":     ("wcd_pipeline.extract",     "Stage 1: stage one .mwrev.zst bundle as Parquet"),
     "extract-all": ("wcd_pipeline.extract_all", "Stage 1: run extract for every bundle in a directory"),
     "dedup":       ("wcd_pipeline.dedup",       "Stage 3: consolidate and deduplicate staged Parquet"),
