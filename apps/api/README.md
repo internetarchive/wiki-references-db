@@ -59,7 +59,8 @@ Errors are `{"error", "code"}` with 400 (bad URL / parameters), 404
 dataset not built yet, or the site API unreachable for a title lookup).
 
 Settings (environment / `.env`): `DATABASE_URL` or `DB_*`; `PARQUET_DIR`;
-`API_DEFAULT_DOMAIN` (en.wikipedia.org); `API_BASE_RUN_ID` (the run bare global source
+`API_DEFAULT_DOMAIN` (en.wikipedia.org); `API_DUCKDB_MEMORY_LIMIT` / `API_DUCKDB_THREADS`
+(per-request DuckDB connection, 1GB / 2; unlimited DuckDB would take 80 % of RAM per request); `API_BASE_RUN_ID` (the run bare global source
 ids belong to, e.g. `enwiki-20261001`); `API_CORS_ORIGINS` (comma-separated,
 default `*`); `API_POOL_SIZE` (Postgres connections, 5);
 `WIKIPEDIA_API_USER_AGENT` / `WIKIPEDIA_API_CONTACT_EMAIL` for title lookups;

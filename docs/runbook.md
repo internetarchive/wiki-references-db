@@ -25,7 +25,7 @@ repository root with `.env` filled in (`example.env`).
 | `MATERIALIZE_CHUNK_ROWS`, `STAGE7_WORK_MEM` | Stage 7 | rows per COPY chunk (500k); Postgres `work_mem` of 7e/7f's whole-table UPDATEs (1GB; one backend, no parallel workers) |
 | `REVISION_BUNDLES_DIR` | Stage 1 | the `.mwrev.zst` bundles, one directory per domain |
 | `WCD_RUN_ID` | Stage 6d | this build run's id (`[a-z0-9][a-z0-9_-]{0,39}`, e.g. `enwiki-20261101`); global source ids are written `<run id>.<hash>`. Unset: bare hashes, as the 2026-11 enwiki build. Set it for every new build so its ids cannot be confused with an earlier build's |
-| `API_*`, `WIKIPEDIA_API_*` | the API | CORS, default domain, pool size, User-Agent for title lookups; `API_LEGACY_TEMPLATE_IDS` (v1 template id table), `API_BASE_RUN_ID` (the run bare global source ids belong to) |
+| `API_*`, `WIKIPEDIA_API_*` | the API | CORS, default domain, pool size, User-Agent for title lookups; `API_LEGACY_TEMPLATE_IDS` (v1 template id table), `API_BASE_RUN_ID` (the run bare global source ids belong to), `API_DUCKDB_MEMORY_LIMIT` / `API_DUCKDB_THREADS` (per request: 1GB, 2) |
 
 Postgres 16 and Python ≥ 3.10 with `uv sync`; Rust ≥ 1.85 only to build
 RevisionChest (`cargo build --release` in `rust/revisionchest`; CI also

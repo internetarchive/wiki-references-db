@@ -377,3 +377,14 @@ def test_frontend_is_served(synthetic):
             r = c.get(path)
             assert r.status_code == 200 and "/static/reports.js" in r.text, path
         assert c.get("/static/reports.js").status_code == 200
+
+
+def test_request_duckdb_connections_are_limited(client):
+    """Per-request DuckDB connections carry the API's limits, not DuckDB's 80 % of RAM."""
+    con = client.app.state.db.duck()
+    try:
+        assert con.execute("SELECT current_setting('threads')").fetchone()[0] == 2
+        limit = con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+        assert limit.endswith("MiB") and float(limit.split()[0]) < 1024, limit   # 1GB = 953.6 MiB
+    finally:
+        con.close()
