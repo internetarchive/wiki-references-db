@@ -265,6 +265,57 @@ Rules of thumb:
   per-domain outputs are independent except `global_sources` (upserted) — see
   the cross-domain note in the plan (§10).
 
+## Operating a large build
+
+What the enwiki build (plan §§17–24) taught about running these steps on one
+machine beside Postgres.
+
+**Building bundles while the dump downloads.** A 7z dump file can only be
+read once it is complete. `scripts/revisionchest_dump_pipeline.sh` runs
+`RevisionChest build` on each file as soon as its `<file>.ok` checksum marker
+appears, several at once, and records per-file timings; it is re-runnable and
+stops when free disk runs low.
+
+**Run heavy steps in a memory-capped scope.** Start each DuckDB-heavy step with
+`sudo systemd-run --scope --uid=$USER --gid=$(id -g) -p MemoryMax=<cap> …` and
+set `DUCKDB_MEMORY_LIMIT` several GB below the cap: a worker's resident memory
+runs 5–7 GB above DuckDB's own limit with its Python state. Without a cap,
+each DuckDB connection takes 80 % of RAM, and next to Postgres' shared buffers
+that runs the host out of memory. For several workers, the limit is per
+worker (`match`, `revision-stats`).
+
+**Look at the plan before a whole-table statement.** On tables of 100M+ rows,
+run `EXPLAIN` before any `UPDATE … FROM`, `INSERT … SELECT` or large
+aggregate. Postgres often estimates far fewer groups than there are (7e saw
+16M estimated against 121M real), then hash-aggregates and hash-joins in
+`work_mem` and spills for hours without writing a row. Prefer a sort and a
+merge join through the primary key, or put the inputs in temp tables and
+`ANALYZE` them first. One random index lookup per row into a table larger
+than `shared_buffers` runs at about 2k rows/s: join set-wise instead.
+`work_mem` applies per sort or hash node and per parallel worker, so 1 GB with
+8 workers has run the host out of memory. A server-side cursor never gets a
+parallel plan; export with `COPY (query) TO STDOUT`.
+
+**Stopping a long query.** Killing the client does not stop the Postgres
+backend: a long statement runs to completion. Find its pid in
+`pg_stat_activity` and call `pg_cancel_backend(pid)`. Select the pid by its
+query text only with a pattern your own lookup does not also match.
+
+**Redoing a Stage 3 load.** Return the database to its post-Stage-0 state:
+
+```
+TRUNCATE normalized_citations RESTART IDENTITY CASCADE;  -- cascades to instances, ncwr, parts, ref_name_links, …
+SET session_replication_role = replica;                  -- as a superuser: skips the unindexed is_archive_of self-reference,
+DELETE FROM web_resources WHERE numeric_page_id IS NULL; -- without which this delete never finishes
+SET session_replication_role = DEFAULT;
+VACUUM web_resources;                                    -- 12–18 min on enwiki
+```
+
+**Checking a change to Stage 0.** `scripts/benchmarks/stage0_fingerprint.sh`
+prints order-independent fingerprints of the Stage-0 tables and the
+`revisions` Parquet. Two loads of the same dump must print the same lines,
+whatever their job count or file layout (all but the file count).
+
 ## Incremental updates (RevisionChest `sync`)
 
 `RevisionChest sync` appends recent changes to daily bundles and writes a

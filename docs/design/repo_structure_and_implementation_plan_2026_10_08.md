@@ -729,3 +729,37 @@ Continues §23 on the same VM and scopes. Every change keeps the output identica
 **Decisions taken without asking:** stopping and rewriting 7d, 7e, 7f and Stage 8 mid-run rather than letting them finish; 6d's saved unions and `--reuse-unions`; 7d's scratch files under `$PARQUET_DIR/_scratch/`; `STAGE7_WORK_MEM` 1GB; running Stage 8 beside the Stage 7 index build.
 
 **Open:** gate 7's orphan anti-joins re-check foreign keys Postgres already validated (each a full scan of a 100M+-row table); 7e and 7f still rewrite all of `global_sources` twice (~55 GB of heap before VACUUM), which a single rewrite of the table could avoid; Stage 6a–6c's per-page pandas cost (§23); the API against the enwiki database is not yet exercised.
+
+## 25. When was this link added? WCD against InternetArchiveBot's search (2026-11-13)
+
+InternetArchiveBot needs the date a link was added to an article, to pick the archive snapshot closest to when it was cited. It finds the date by binary-searching the article's history through the Wikipedia API. This section times the same lookup from the enwiki build (§24) on 50 articles and runs IABot's own algorithm on the same links (SCA-349). Scripts: `scripts/benchmarks/link_added/` (README there). Report for the client: https://claude.ai/artifact/4jAKdP7PjMxmFW97An2G4r.
+
+**The lookup.** For one page: the URLs of all its citation instances (`citation_instances` → `normalized_citation_web_resources` → `web_resources`), then each instance's revisions from `citation_history`, joined to the page's revisions in (timestamp, id) order. Each instance's revisions become runs of consecutive revisions; the runs are mapped to URLs and merged per URL. For each link in the latest revision this gives its **first addition**, the **start of its current run** (the revision that last put it back), and its number of runs. Two choices made it fast. The interval form gives the same rows as a per-(URL, revision) DISTINCT, 2–6× faster. The instance→URL map goes into DuckDB as an Arrow table; `executemany` took 4 s on India.
+
+**Sample.** Pages with at least one reference, ten per band of revision count (1–9 up to 10,000+), spread over each band by reference count, fixed seed (`pick_sample.sql`): 1 to 30,569 revisions, 5,684 current links. 7 pages have references with no URL.
+
+**WCD timings** (one process on the build machine, no HTTP layer or network):
+
+| | median | 90th percentile | max |
+|---|---|---|---|
+| cold (OS page cache dropped; Postgres buffers kept) | 0.19 s | 0.95 s | 6.5 s (Syrian civil war, 750 links) |
+| warm | 0.08 s | 0.22 s | 1.2 s |
+| whole-bucket `citation_history` read, as the API does today | 0.70 s | 0.96 s | 4.1 s |
+
+46 of 50 pages answer in under a second cold. A bucket's `citation_history` is 1,203 files, one per dump shard. Their names carry the page range, so the lookup opens only the page's file; the whole-bucket read gave the same links on all 50 pages.
+
+**IABot's algorithm.** `APII::getTimesAdded()` and `getPageHistory()` were ported line by line (`iabot_get_times_added_port.py`, AGPL-3.0 like IABot) and run against live Wikipedia, with all of a page's links in one call, as on its first visit to a page. Without a bot account, revisions come 50 at a time; the port follows continuation up to what one bot response holds (500 revisions or 8 MiB) and counts the bot's requests. The history was cut at the dump's last revision. Articles with more than 150 links (9) were left out to limit the load on Wikipedia. On the other 34 articles (1,076 links):
+
+* IABot took 308 s in total (median 2.1 s, worst 65 s on Federer–Nadal rivalry), with 480 bot requests and 314 MB of wikitext. These times include all network traffic, from the build machine rather than from Wikimedia Cloud.
+* WCD answered the same articles in 8.4 s cold, a median of 13× faster per article, with no requests to Wikipedia.
+
+**Agreement.** 969 links get the same revision from both. 70 more agree once `http` and `https` count as one link, IABot's definition (`any_scheme.py`). 12 IABot dates to the start of the current run. That makes 1,051 of 1,076 (97.7 %). The other 25 are IABot artefacts:
+
+* 20 dated earlier. IABot's pattern is a substring match, so it also fires inside a longer URL that contains the link: `http://www.ctv.ca` inside `…/servlet/…`, or the original inside its own `web.archive.org/web/…/` URL (`explain_disagreements.py` shows each match).
+* 5 dated later. These links were removed and re-added 3 to 18 times, and a binary search can land on any re-addition.
+
+**WCD checked against Wikipedia.** For 45 links (the 5 above and 40 at random), every URL is in the revision WCD names. 42 are absent from the revision before it (2 had no earlier revision); the other 3 had the same link with `http://` there. Of the 5,786 URLs in the 50 articles' current wikitext, WCD returns 5,681; the other 104 are all inside HTML comments. 2,503 of the 5,684 links (44 %) have been removed and re-added at least once, mostly vandalism and its revert, so both dates matter.
+
+**Decisions taken without asking:** emulating the bot account's request limits in the IABot port (the port itself was the user's call); leaving out the 9 largest articles; counting a link as "current" when it is in the dump's latest revision.
+
+**Open:** an API endpoint for the lookup (SCA-388), which should also read only the page's `citation_history` file (the citations endpoint takes 10 s on Albert Einstein for the same reason); keeping WCD current, since links added after the dump are unknown to it (SCA-389); throughput under concurrent lookups.
