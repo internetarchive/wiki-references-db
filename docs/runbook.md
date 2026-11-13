@@ -83,6 +83,15 @@ dump's files** instead of waiting for all of them:
   `dedup` and the rest. From there the steps of "Full build, one domain" below
   run in order, each ending with its gate; `--shards-only` stops at the barrier.
 
+**Wikis with few dump files.** Small and mid-sized wikis publish their whole
+history as one file, which would extract on one core. When a dump has fewer
+files than `--jobs`, each bundle is cut on page boundaries into about
+`jobs / files` pieces (at least 8 MiB each; `wcd_pipeline.split_bundle`) that
+all workers share; the pieces are deleted once extracted, and the metadata
+still refers to the bundle. A wiki with many shards (enwiki: 980) is not cut,
+since more extract units mean more small Parquet files per bucket. `--pieces N`
+overrides the choice.
+
 **Resuming.** Re-run the same command. A verified download, a built shard
 (`state/<shard>.built`), an extracted shard (`staging/<shard>/DONE.txt`) and a
 finished whole-wiki step (`state/steps/<step>.done`) are skipped; an interrupted
