@@ -1,9 +1,14 @@
 -- A read-only role for the API service (wcd-api).
 --
---   sudo -u postgres psql -d wiki_references -v pw="$(openssl rand -base64 24)" -f deploy/create_api_role.sql
+-- From the serving checkout; the password goes straight into serve.env (mode 600), never
+-- onto the screen (hex: no characters that need escaping in DATABASE_URL):
 --
--- then put DATABASE_URL=postgresql://wcd_api:<that password>@127.0.0.1:5432/wiki_references
--- in the service's environment file (deploy/serve.env.example).
+--   umask 077 && PW=$(openssl rand -hex 24) \
+--     && sudo -u postgres psql -d wiki_references -v pw="$PW" -f deploy/create_api_role.sql \
+--     && sed "s|CHANGE_ME|$PW|" deploy/serve.env.example > serve.env && unset PW
+--
+-- To change the password later: the same, with  -c "ALTER ROLE wcd_api PASSWORD '$PW'"
+-- in place of  -v pw=... -f deploy/create_api_role.sql.
 --
 -- SELECT only, on every table the pipeline role (wcd) owns now and creates later
 -- (init-db recreates tables on some re-runs). The timeouts stop one runaway request
