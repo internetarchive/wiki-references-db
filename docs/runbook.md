@@ -24,6 +24,7 @@ repository root with `.env` filled in (`example.env`).
 | `MATCH_GLOBAL_CHUNK_ROWS`, `MATCH_GLOBAL_BLOCK_ROWS` | Stage 6d | merged sources per output file of the component build (8M; memory follows it); rows of a fuzzy author+year group per rapidfuzz call (2048) |
 | `MATERIALIZE_CHUNK_ROWS`, `STAGE7_WORK_MEM` | Stage 7 | rows per COPY chunk (500k); Postgres `work_mem` of 7e/7f's whole-table UPDATEs (1GB; one backend, no parallel workers) |
 | `REVISION_BUNDLES_DIR` | Stage 1 | the `.mwrev.zst` bundles, one directory per domain |
+| `WCD_WORK_DIR`, `DUMPS_MIRROR`, `REVISIONCHEST` | `wcd setup` | root of its run directories (`./wcd-work`); dump URL prefix (a mirror laid out like dumps.wikimedia.org); the RevisionChest binary (default: the repo's release build, else `PATH`) |
 | `WCD_RUN_ID` | Stage 6d | this build run's id (`[a-z0-9][a-z0-9_-]{0,39}`, e.g. `enwiki-20261101`); global source ids are written `<run id>.<hash>`. Unset: bare hashes, as the 2026-11 enwiki build. Set it for every new build so its ids cannot be confused with an earlier build's |
 | `API_*`, `WIKIPEDIA_API_*` | the API | CORS, default domain, pool size, User-Agent for title lookups; `API_LEGACY_TEMPLATE_IDS` (v1 template id table), `API_BASE_RUN_ID` (the run bare global source ids belong to) |
 
@@ -56,6 +57,54 @@ since 7z decoding runs on its own thread. On enwiki-20261001 the 7z set
 window (201.7 GB before it) and 49.6 GB of metadata in one Parquet file, in
 2 h 08 min with `build -d -j 18` on 28 cores (45 core-hours, 3.8 GB peak
 RSS); see the plan, §17.
+
+## Setting up a wiki from its dumps: `wcd setup`
+
+```
+uv run wcd setup --domain de.wikipedia.org --jobs 24 \
+    [--mirror https://dumps.wikimedia.your.org] [--date 20261101] [--shards-only]
+```
+
+One command from a domain to a built database. It finds the dumps (the site's
+`wikiid` from siteinfo, then the newest run whose page-history dump is done, or
+`--date`; listing and `dumpstatus.json` from `--mirror`, falling back to the
+primary site's status file if a mirror lacks it) and **streams the history
+dump's files** instead of waiting for all of them:
+
+* `--download-jobs` (4) files download at once, largest first, resuming
+  (`.part`, HTTP Range) and verified against the listed size and sha1
+  (`<file>.ok`; the same marker `tools/fetch_one.sh` wrote, so `--dumps-dir`
+  can point at an existing download).
+* As each file is verified, one of `--jobs` shard workers runs `RevisionChest
+  build` on it (bundle + that shard's metadata Parquet) and then Stage 1
+  `extract` on the bundle. Downloading, the Stage 0 build and Stage 1 overlap.
+* **The barrier** is the first step that needs every shard: `stage0-load` (it
+  rebuilds the domain's `revisions` dataset from all the metadata), then
+  `dedup` and the rest. From there the steps of "Full build, one domain" below
+  run in order, each ending with its gate; `--shards-only` stops at the barrier.
+
+**Resuming.** Re-run the same command. A verified download, a built shard
+(`state/<shard>.built`), an extracted shard (`staging/<shard>/DONE.txt`) and a
+finished whole-wiki step (`state/steps/<step>.done`) are skipped; an interrupted
+shard is redone from its last finished step. A failed shard fails the run once
+the others finish, and the whole-wiki steps do not start. `--from-step NAME`
+redoes the whole-wiki steps from one of them.
+
+**Layout:** `<work-dir>/<domain>/<dbname>-<date>/` holds `dumps/` (or
+`--dumps-dir`), `bundles/`, `meta/`, `staging/`, `state/`, `logs/` (one log per
+shard step and per whole-wiki step) and `run.json`. The Parquet tier goes to
+`PARQUET_DIR`, Postgres to `DATABASE_URL`. The run id `<dbname>-<date>` becomes
+`WCD_RUN_ID` (unless set), so the build's global source ids are qualified.
+
+**Tuning.** Shard workers are CPU-bound by Stage 1 (enwiki: ~1,200 core-hours,
+~2 GB peak per worker), so `--jobs` ≈ cores. `--namespace` defaults to `0`
+(articles; `''` for all). `--delete-dumps` removes each dump file once its
+bundle is built (the `.ok` marker stays) and then caps downloaded-but-unbuilt
+files at 2 × `--jobs` (`--max-ahead`). The whole-wiki steps take their memory
+settings from the environment as described below (`DUCKDB_MEMORY_LIMIT`, …):
+set them, or run `wcd setup` in a memory-capped scope, before a large wiki.
+On enwiki-20261001 the download (5 h 13 min at ~13 MB/s per connection) and the
+bundle build came before Stage 1's 45 h; streamed, they overlap it.
 
 ## Full build, one domain
 
