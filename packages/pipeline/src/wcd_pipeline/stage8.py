@@ -23,47 +23,62 @@ from wcd_schema.duckdb import bind_bucket_views
 
 from .config import duckdb_connect, load_dotenv  # noqa: F401
 
+# Per instance first (its type, whether unresolved; its (source, high-confidence) pairs),
+# then plain counts per revision: the per-row count(DISTINCT …) FILTER aggregates over the
+# history ⋈ denorm join held ten hash sets per revision group and spilled (~11 min per
+# enwiki bucket at 3 GB); identical output on enwiki buckets 0, 30, 257, 5-6x faster.
 STATS_SQL = """
-WITH resolved AS (
-    SELECT dn.page_id, ch.revision_id AS rev_id, dn.citation_instance_id,
-           dn.citation_type, dn.part_index, dn.global_source_id, dn.confidence
-    FROM citation_history ch
-    JOIN citation_instances_denorm dn ON dn.citation_instance_id = ch.citation_instance_id
+WITH inst AS (
+    -- one row per instance: its type (an instance attribute, the same on each part row) and
+    -- whether any of its parts is unresolved
+    SELECT citation_instance_id, any_value(citation_type) AS citation_type,
+           bool_or(global_source_id IS NULL) AS unresolved
+    FROM citation_instances_denorm GROUP BY citation_instance_id
+),
+inst_src AS (
+    SELECT citation_instance_id, global_source_id, bool_or(confidence >= 0.85) AS high
+    FROM citation_instances_denorm WHERE global_source_id IS NOT NULL
+    GROUP BY citation_instance_id, global_source_id
 ),
 rev_agg AS (
-    SELECT page_id, rev_id,
-        count(DISTINCT citation_instance_id)                                        AS n_total_citations,
-        count(DISTINCT global_source_id)                                            AS n_unique_sources,
-        count(DISTINCT citation_instance_id) FILTER (WHERE global_source_id IS NULL) AS n_unresolved,
-        count(DISTINCT global_source_id) FILTER (WHERE confidence >= 0.85)          AS n_high_confidence,
-        count(DISTINCT citation_instance_id) FILTER (WHERE citation_type = 'ref_tag')       AS n_ref_tag,
-        count(DISTINCT citation_instance_id) FILTER (WHERE citation_type = 'template')      AS n_template,
-        count(DISTINCT citation_instance_id) FILTER (WHERE citation_type = 'bare_url')      AS n_bare_url,
-        count(DISTINCT citation_instance_id) FILTER (WHERE citation_type = 'endnote')       AS n_endnote,
-        count(DISTINCT citation_instance_id) FILTER (WHERE citation_type = 'shorthand')     AS n_shorthand,
-        count(DISTINCT citation_instance_id) FILTER (WHERE citation_type = 'external_link') AS n_external_link
-    FROM resolved GROUP BY page_id, rev_id
+    -- citation_history has one row per (instance, revision)
+    SELECT ch.page_id, ch.revision_id AS rev_id,
+        count(*)                                                AS n_total_citations,
+        count(*) FILTER (WHERE i.unresolved)                    AS n_unresolved,
+        count(*) FILTER (WHERE i.citation_type = 'ref_tag')       AS n_ref_tag,
+        count(*) FILTER (WHERE i.citation_type = 'template')      AS n_template,
+        count(*) FILTER (WHERE i.citation_type = 'bare_url')      AS n_bare_url,
+        count(*) FILTER (WHERE i.citation_type = 'endnote')       AS n_endnote,
+        count(*) FILTER (WHERE i.citation_type = 'shorthand')     AS n_shorthand,
+        count(*) FILTER (WHERE i.citation_type = 'external_link') AS n_external_link
+    FROM citation_history ch JOIN inst i USING (citation_instance_id)
+    GROUP BY ch.page_id, ch.revision_id
+),
+rev_src AS MATERIALIZED (
+    SELECT ch.page_id, ch.revision_id AS rev_id, s.global_source_id, bool_or(s.high) AS high
+    FROM citation_history ch JOIN inst_src s USING (citation_instance_id)
+    GROUP BY ch.page_id, ch.revision_id, s.global_source_id
+),
+src_agg AS (
+    SELECT page_id, rev_id, count(*) AS n_unique_sources, count(*) FILTER (WHERE high) AS n_high_confidence
+    FROM rev_src GROUP BY page_id, rev_id
 ),
 self_closing AS (
     SELECT page_id, revision_id AS rev_id, count(*) AS n_self_closing
     FROM named_ref_uses GROUP BY page_id, revision_id
 ),
-source_first AS (
-    SELECT page_id, global_source_id, min(rev_id) AS first_rev_id
-    FROM resolved WHERE global_source_id IS NOT NULL
-    GROUP BY page_id, global_source_id
-),
 new_per_rev AS (
     SELECT page_id, first_rev_id AS rev_id, count(*) AS n_new_sources
-    FROM source_first GROUP BY page_id, first_rev_id
+    FROM (SELECT page_id, global_source_id, min(rev_id) AS first_rev_id FROM rev_src GROUP BY page_id, global_source_id)
+    GROUP BY page_id, first_rev_id
 )
 SELECT
     r.page_id, r.revision_id AS rev_id, r.revision_timestamp AS timestamp,
     CAST(coalesce(a.n_total_citations, 0) AS INTEGER) AS n_total_citations,
     CAST(coalesce(sc.n_self_closing, 0)   AS INTEGER) AS n_self_closing,
-    CAST(coalesce(a.n_unique_sources, 0)  AS INTEGER) AS n_unique_sources,
+    CAST(coalesce(s.n_unique_sources, 0)  AS INTEGER) AS n_unique_sources,
     CAST(coalesce(a.n_unresolved, 0)      AS INTEGER) AS n_unresolved,
-    CAST(coalesce(a.n_high_confidence, 0) AS INTEGER) AS n_high_confidence,
+    CAST(coalesce(s.n_high_confidence, 0) AS INTEGER) AS n_high_confidence,
     CAST(coalesce(n.n_new_sources, 0)     AS INTEGER) AS n_new_sources,
     round((coalesce(a.n_total_citations, 0) - coalesce(a.n_unresolved, 0))
           / greatest(coalesce(a.n_total_citations, 0), 1.0), 4) AS pct_resolved,
@@ -75,6 +90,7 @@ SELECT
     CAST(coalesce(a.n_external_link, 0) AS INTEGER) AS n_external_link
 FROM revisions r
 LEFT JOIN rev_agg a       ON a.page_id = r.page_id AND a.rev_id = r.revision_id
+LEFT JOIN src_agg s       ON s.page_id = r.page_id AND s.rev_id = r.revision_id
 LEFT JOIN self_closing sc ON sc.page_id = r.page_id AND sc.rev_id = r.revision_id
 LEFT JOIN new_per_rev n   ON n.page_id = r.page_id AND n.rev_id = r.revision_id
 ORDER BY r.page_id, r.revision_id
