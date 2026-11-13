@@ -1023,3 +1023,215 @@ button:disabled {
     height: 320px;
   }
 }
+
+/* ------------------------------------------------------------------------
+   Citations list (dashboard) and report pages (reports.html)
+   ------------------------------------------------------------------------ */
+
+.section-heading-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.citation-list {
+  list-style: none;
+  margin: 20px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.citation-item {
+  min-width: 0;
+  padding: 14px 16px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--border-soft);
+  border-left: 4px solid var(--border-soft);
+}
+
+.citation-item.is-removed {
+  border-left-color: #d73333;
+}
+
+.source-badge-visible {
+  color: var(--success);
+  border-color: #a3d3c5;
+  background: #eaf6f2;
+}
+
+.source-badge-removed {
+  color: #b32424;
+  border-color: #f0b8b8;
+  background: #fdeeee;
+}
+
+.citation-ref-name {
+  align-self: center;
+  font-size: 0.82rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.citation-text {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  max-height: 9em;
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.citation-text-compact {
+  margin: 0;
+  max-height: 6em;
+}
+
+.citation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin-top: 10px;
+}
+
+.inline-action {
+  font-size: 0.9rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.inline-action:hover {
+  text-decoration: underline;
+}
+
+.citation-details {
+  margin-top: 10px;
+  font-size: 0.92rem;
+}
+
+.citation-details summary {
+  cursor: pointer;
+  color: var(--accent-deep);
+  font-weight: 600;
+}
+
+.citation-template {
+  margin-top: 10px;
+}
+
+.citation-template-name {
+  margin: 0 0 6px;
+  font-weight: 700;
+}
+
+.citation-link-list {
+  margin: 10px 0 0;
+  padding-left: 20px;
+  overflow-wrap: anywhere;
+}
+
+.report-table-wrap {
+  margin-top: 14px;
+  overflow-x: auto;
+}
+
+.report-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+.report-table th,
+.report-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  text-align: left;
+  vertical-align: top;
+}
+
+.report-table th {
+  background: var(--surface-strong);
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.report-table td {
+  overflow-wrap: anywhere;
+}
+
+.report-table tr.is-current td {
+  background: var(--accent-soft);
+}
+
+.citation-param-table {
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+}
+
+.citation-param-action {
+  width: 1%;
+  white-space: nowrap;
+}
+
+.hero-compact h1 {
+  margin-bottom: 4px;
+}
+
+.report {
+  display: grid;
+  gap: 20px;
+}
+
+.report-card {
+  padding: 20px;
+  min-width: 0;
+}
+
+.report-sha {
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+
+.report-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 16px;
+  margin: 0 0 8px;
+}
+
+.report-facts dt {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.report-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.status-message.is-error,
+.muted.is-error {
+  color: #8a2f17;
+}
+
+@media (max-width: 640px) {
+  .report-card,
+  .citation-item {
+    padding: 14px;
+  }
+
+  .report-table th,
+  .report-table td {
+    padding: 6px 8px;
+  }
+}

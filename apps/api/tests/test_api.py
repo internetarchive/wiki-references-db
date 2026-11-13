@@ -136,6 +136,9 @@ def test_citations_at_revision(client):
     assert visits["extracted_links"][0]["url"] == "https://example.org/visits"
     block = next(c for c in j["citations"] if len(c["parts"]) == 2)
     assert [p["part_index"] for p in block["parts"]] == [0, 1]
+    # 64-bit instance ids are strings (JavaScript numbers lose digits past 2**53)
+    assert all(isinstance(c["citation_instance_id"], str) and c["citation_instance_id"].lstrip("-").isdigit()
+               for c in j["citations"])
 
     # latest revision by default; raw mode is per-instance without the normalized detail
     s, j = get(client, f"/api/v2/pages/{D}/{PAGE_A}/citations")
@@ -151,7 +154,8 @@ def test_citation_detail_and_history(client):
     sha = next(c["normalized_sha1"] for c in j["citations"] if c["parts"][0]["extracted_isbn"] == ISBN)
     s, j = get(client, f"/api/v2/citations/{sha}")
     assert s == 200 and j["citation_type"] == "template"
-    assert j["appears_on_articles"] == [{"domain": D, "page_id": PAGE_B}]
+    assert j["appears_on_articles"] == [{"domain": D, "page_id": PAGE_B, "page_title": "Second Page"}]
+    assert isinstance(j["instances"][0]["citation_instance_id"], str)
     assert len(j["instances"]) == 1 and j["instances"][0]["page_id"] == PAGE_B and j["instances"][0]["reference_type"] == "inline"
     assert j["parts"][0]["extracted_isbn"] == ISBN and j["parts"][0]["global_source_id"] is None
     res = j["parts"][0]["resolutions"]
@@ -167,10 +171,46 @@ def test_citation_detail_and_history(client):
     assert j["parts"][0]["resolutions"][0]["match_type"] == "isbn"
 
     s, j = get(client, f"/api/v2/citations/{sha}/history", domain=D, page_id=PAGE_B)
-    assert s == 200 and [h["revision_id"] for h in j["revisions"]] == [2201, 2202]
+    assert s == 200 and [h["revision_id"] for h in j["revisions"]] == [2201, 2202] and j["total"] == 2
     assert j["revisions"][0]["revision_timestamp"].startswith("2006-02-02")
+    assert j["revisions"][0]["page_title"] == "Second Page"
+    s, j = get(client, f"/api/v2/citations/{sha}/history", limit=1, offset=1)
+    assert s == 200 and j["total"] == 2 and [h["revision_id"] for h in j["revisions"]] == [2202]
+
+
+def test_unscoped_history_is_limited_by_page_count(client, monkeypatch):
+    from wcd_api.queries import citations as q
+
+    s, j = get(client, f"/api/v2/pages/{D}/{PAGE_B}/citations")
+    sha = j["citations"][0]["normalized_sha1"]
+    monkeypatch.setattr(q, "HISTORY_MAX_PAGES", 0)
+    s, j = get(client, f"/api/v2/citations/{sha}/history")
+    assert s == 400 and "page_id" in j["error"]
+    # one page's history is always served
+    assert get(client, f"/api/v2/citations/{sha}/history", domain=D, page_id=PAGE_B)[0] == 200
+    assert get(client, f"/api/v1/citation/{sha}/history", page_id=PAGE_B)[0] == 200
     assert get(client, "/api/v2/citations/" + "0" * 40)[0] == 404
     assert get(client, "/api/v2/citations/short")[0] == 422
+
+
+def test_citation_pages(client):
+    # prefer a citation shared between the two pages; any citation of page A checks the single-page case
+    cites = [c for rev in (1001, 1002, 1003)
+             for c in get(client, f"/api/v2/pages/{D}/{PAGE_A}/citations", revision_id=rev)[1]["citations"]]
+    shared = next((c for c in cites if c["other_articles"]), cites[0])
+    s, p = get(client, f"/api/v2/citations/{shared['normalized_sha1']}/pages")
+    assert s == 200 and p["reference_normalized"] == shared["reference_normalized"]
+    pages = {(x["domain"], x["page_id"]) for x in p["pages"]}
+    assert p["total"] == len(p["pages"]) == 1 + len(shared["other_articles"])
+    assert (D, PAGE_A) in pages and {(o["domain"], o["page_id"]) for o in shared["other_articles"]} <= pages
+    a = next(x for x in p["pages"] if x["page_id"] == PAGE_A)
+    assert a["page_title"] == "Example Island" and a["n_instances"] >= 1 and a["url"].endswith(f"curid={PAGE_A}")
+    if shared["reference_name"]:
+        assert shared["reference_name"] in a["reference_names"]
+    # limit=0: the header only (the report pages use it for the citation text and the page count)
+    s, h = get(client, f"/api/v2/citations/{shared['normalized_sha1']}/pages", limit=0)
+    assert s == 200 and h["pages"] == [] and h["total"] == p["total"]
+    assert get(client, "/api/v2/citations/" + "0" * 40 + "/pages")[0] == 404
 
 
 # Group 4 -------------------------------------------------------------------
@@ -182,6 +222,10 @@ def test_template_report_and_web_resources(client):
     s, j = get(client, f"/api/v2/templates/{tpl['wiki_template_id']}/report", parameter_key="last", parameter_value="Diamond")
     assert s == 200 and j["template_name"] == "Cite book" and j["domain"] == D and j["total"] == 3
     assert all(c["appears_on_domain"] == D and c["appears_on_article"] == c["appears_on_page_id"] for c in j["citations"])
+    assert {c["appears_on_page_title"] for c in j["citations"]} <= {"Example Island", "Second Page"}
+    # the value is compared trimmed, as the v1 explorer did (links carry the untrimmed v1 values)
+    s, k = get(client, f"/api/v2/templates/{tpl['wiki_template_id']}/report", parameter_key=" last", parameter_value=" Diamond ")
+    assert s == 200 and k["total"] == 3 and k["parameter_value"] == "Diamond"
     assert get(client, "/api/v2/templates/999999/report", parameter_key="x", parameter_value="y")[0] == 404
 
     s, j = get(client, "/api/v2/web-resources", url="https://example.org/page")
@@ -246,6 +290,38 @@ def test_article_title_resolution_failure_is_503(synthetic):
         assert c.get("/api/v2/article", params={"url": f"https://{D}/?curid={PAGE_A}"}).status_code == 200
 
 
+def test_legacy_redirects(synthetic, tmp_path):
+    sha = "e9377a9bf457a0586445507d958c19d15e1bc60e"
+    settings = Settings(database_url="postgresql+psycopg2://" + DSN.split("://", 1)[1], parquet_dir=synthetic["parquet_dir"])
+    with TestClient(create_app(settings, title_resolver=lambda *a: None, frontend_dir=None), follow_redirects=False) as c:
+        def loc(path, **params):
+            r = c.get(path, params=params)
+            assert r.status_code == 302, path
+            return r.headers["location"]
+
+        assert loc("/explorer/") == "/" and loc("/explorer") == "/"
+        assert loc("/explorer/article", url=f"https://{D}/wiki/Example_Island") == "/?url=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FExample_Island"
+        assert loc(f"/explorer/citation/{sha}/report", page_id=736) == f"/citations/{sha}?domain={D}&page_id=736"
+        assert loc(f"/explorer/citation/{sha}/report") == f"/citations/{sha}"
+        assert loc(f"/explorer/citation/{sha}/other-articles", page_id=736) == f"/citations/{sha}/pages?domain={D}&page_id=736"
+        assert loc("/api/v1/docs") == "/docs" and loc("/api/v1/openapi.json") == "/openapi.json"
+        # no id table configured: the landing page explains the link cannot be followed
+        assert loc("/explorer/template/1374/report", parameter_key="journal", parameter_value=" MNRAS ") == \
+            "/templates/report?legacy_id=1374&parameter_key=journal&parameter_value=MNRAS"
+
+    # with the v1 id → name table, the old id is translated by name
+    table = tmp_path / "legacy_template_ids.tsv"
+    table.write_text("1374\tCite book\n77\tNo Such Template\n", encoding="utf-8")
+    settings.legacy_template_ids = str(table)
+    with TestClient(create_app(settings, title_resolver=lambda *a: None, frontend_dir=None), follow_redirects=False) as c:
+        cites = c.get(f"/api/v2/pages/{D}/{PAGE_B}/citations").json()["citations"]
+        new_id = next(t["wiki_template_id"] for x in cites for t in x["templates"] if t["template_name"] == "Cite book")
+        r = c.get("/explorer/template/1374/report", params={"parameter_key": "last", "parameter_value": "Diamond "})
+        assert r.headers["location"] == f"/templates/{new_id}/report?parameter_key=last&parameter_value=Diamond"
+        r = c.get("/explorer/template/77/report", params={"parameter_key": "a", "parameter_value": "b"})
+        assert r.headers["location"].startswith("/templates/report?legacy_id=77&template_name=No+Such+Template")
+
+
 def test_frontend_is_served(synthetic):
     from wcd_api.main import FRONTEND_DIR
 
@@ -256,3 +332,7 @@ def test_frontend_is_served(synthetic):
         assert index.status_code == 200 and "Wikipedia Citations Database" in index.text and "UVA" not in index.text
         assert c.get("/static/app.js").status_code == 200 and c.get("/static/styles.css").status_code == 200
         assert 'API_BASE = "/api/v2"' in c.get("/static/app.js").text
+        for path in ("/citations/" + "a" * 40, "/citations/" + "a" * 40 + "/pages", "/templates/5/report", "/templates/report"):
+            r = c.get(path)
+            assert r.status_code == 200 and "/static/reports.js" in r.text, path
+        assert c.get("/static/reports.js").status_code == 200

@@ -12,6 +12,7 @@ from ..models import (
     TemplateReportCitation, TemplateReportResponse, WebResourceReference, WebResourceResponse,
 )
 from . import NotFound
+from .common import page_titles
 
 
 def get_template_report(db: Database, wiki_template_id: int, parameter_key: str, parameter_value: str,
@@ -23,6 +24,8 @@ def get_template_report(db: Database, wiki_template_id: int, parameter_key: str,
     counted there. Citations are listed in ``normalized_sha1`` order."""
     import glob
 
+    # template values are stored trimmed (as the v1 explorer compared them: btrim on both sides)
+    parameter_key, parameter_value = parameter_key.strip(), parameter_value.strip()
     with db.connect() as con:
         tmpl = con.execute(text("SELECT w.name, d.value FROM wiki_templates w LEFT JOIN domains d ON d.id = w.domain WHERE w.id = :i"),
                            {"i": wiki_template_id}).first()
@@ -41,7 +44,7 @@ def get_template_report(db: Database, wiki_template_id: int, parameter_key: str,
             try:
                 total = con.execute(text(
                     "SELECT n_citations FROM template_value_counts WHERE wiki_template_id = :w AND parameter_key = :k "
-                    "AND parameter_value_md5 = md5(:v)"), {"w": wiki_template_id, "k": parameter_key, "v": parameter_value}).scalar()
+                    "AND parameter_value_md5 = CAST(md5(:v) AS bpchar)"), {"w": wiki_template_id, "k": parameter_key, "v": parameter_value}).scalar()
                 if total is None:
                     total = duck.execute(f"SELECT count(*) FROM {src} WHERE {where}", args).fetchone()[0]
                 shas = [r[0] for r in duck.execute(
@@ -51,13 +54,18 @@ def get_template_report(db: Database, wiki_template_id: int, parameter_key: str,
                 duck.close()
         rows = con.execute(text(
             "SELECT nc.normalized_sha1, nc.reference_normalized, d.value, nc.appears_on_page_id FROM normalized_citations nc "
-            "JOIN domains d ON d.id = nc.appears_on_domain_id WHERE nc.normalized_sha1 = ANY(:s) ORDER BY nc.normalized_sha1"),
+            "JOIN domains d ON d.id = nc.appears_on_domain_id "
+            # normalized_sha1 is CHAR(40): a text[] parameter would cast the column and skip its index
+            # (a parallel scan of the whole table, ~1 minute on enwiki)
+            "WHERE nc.normalized_sha1 = ANY(CAST(:s AS bpchar[])) ORDER BY nc.normalized_sha1"),
             {"s": shas}).all() if shas else []
+        titles = page_titles(con, {(r[2], r[3]) for r in rows if r[3] is not None})
     return TemplateReportResponse(
         wiki_template_id=wiki_template_id, template_name=name, domain=domain,
         parameter_key=parameter_key, parameter_value=parameter_value, total=int(total),
         citations=[TemplateReportCitation(normalized_sha1=r[0], reference_normalized=r[1], appears_on_domain=r[2],
-                                          appears_on_page_id=r[3], appears_on_article=r[3]) for r in rows])
+                                          appears_on_page_id=r[3], appears_on_article=r[3],
+                                          appears_on_page_title=titles.get((r[2], r[3]))) for r in rows])
 
 
 def get_web_resource(db: Database, url: str) -> WebResourceResponse:

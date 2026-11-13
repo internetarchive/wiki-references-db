@@ -64,6 +64,12 @@ const timelineInspectorActions = document.getElementById("timeline-inspector-act
 const timelineChangeList = document.getElementById("timeline-change-list");
 const topSourcesSummary = document.getElementById("top-sources-summary");
 const topSourcesList = document.getElementById("top-sources-list");
+const citationsSection = document.getElementById("citations-section");
+const citationsHeading = document.getElementById("citations-heading");
+const citationsSummary = document.getElementById("citations-summary");
+const citationsList = document.getElementById("citations-list");
+const citationsMoreButton = document.getElementById("citations-more");
+const citationsLatestButton = document.getElementById("citations-latest");
 const sourceUsageCache = new Map();
 let currentPageId = null;
 let timelineChartInstance = null;
@@ -241,6 +247,10 @@ function renderTimelineInspector(pointDetail, options = {}) {
       )
     );
   }
+
+  actions.push(
+    createTimelineActionButton("Citations at this revision", () => showCitationsAtRevision(pointDetail.rev_id))
+  );
 
   if (isPinned && typeof onClearPin === "function") {
     actions.push(createTimelineActionButton("Return to latest", onClearPin));
@@ -581,6 +591,258 @@ function renderTopSources(topSources) {
     topSourcesList.appendChild(item);
   });
 }
+
+// ---------------------------------------------------------------------------
+// Citations at a revision, with links to the report pages
+// (/citations/{sha1}, /citations/{sha1}/pages, /templates/{id}/report)
+// ---------------------------------------------------------------------------
+
+const CITATIONS_PAGE_SIZE = 25;
+let citationsState = null;
+let citationsRequestToken = 0;
+
+function reportQuery(domain, pageId) {
+  if (!domain || !pageId) {
+    return "";
+  }
+  return `?${new URLSearchParams({ domain, page_id: String(pageId) })}`;
+}
+
+function citationReportUrl(sha1, domain, pageId) {
+  return `/citations/${encodeURIComponent(sha1)}${reportQuery(domain, pageId)}`;
+}
+
+function citationPagesUrl(sha1, domain, pageId) {
+  return `/citations/${encodeURIComponent(sha1)}/pages${reportQuery(domain, pageId)}`;
+}
+
+function templateReportUrl(templateId, key, value) {
+  const params = new URLSearchParams({
+    parameter_key: String(key),
+    parameter_value: String(value ?? "").trim(),
+  });
+  return `/templates/${encodeURIComponent(templateId)}/report?${params}`;
+}
+
+function makeElement(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) {
+    node.className = className;
+  }
+  if (text !== undefined && text !== null) {
+    node.textContent = text;
+  }
+  return node;
+}
+
+function makeLink(text, href, { external = false, className = "" } = {}) {
+  const link = makeElement("a", className, text);
+  link.href = href;
+  if (external) {
+    link.target = "_blank";
+    link.rel = "noreferrer";
+  }
+  return link;
+}
+
+function renderTemplateParameters(template) {
+  const block = makeElement("div", "citation-template");
+  block.appendChild(makeElement("p", "citation-template-name", template.template_name));
+
+  const entries = Object.entries(template.parameters || {});
+  if (!entries.length) {
+    block.appendChild(makeElement("p", "muted", "No parameters."));
+    return block;
+  }
+
+  const table = makeElement("table", "report-table citation-param-table");
+  const head = makeElement("thead");
+  const headRow = makeElement("tr");
+  ["Parameter", "Value", ""].forEach((label) => headRow.appendChild(makeElement("th", "", label)));
+  head.appendChild(headRow);
+  const body = makeElement("tbody");
+
+  entries.forEach(([key, value]) => {
+    const row = makeElement("tr");
+    const keyCell = makeElement("td");
+    keyCell.appendChild(makeElement("code", "", key));
+    row.appendChild(keyCell);
+    row.appendChild(makeElement("td", "citation-param-value", String(value ?? "")));
+    const action = makeElement("td", "citation-param-action");
+    if (String(value ?? "").trim()) {
+      const link = makeLink("Find matches", templateReportUrl(template.wiki_template_id, key, value), {
+        className: "inline-action",
+      });
+      link.title = `Other citations whose ${template.template_name} has ${key} = this value`;
+      action.appendChild(link);
+    }
+    row.appendChild(action);
+    body.appendChild(row);
+  });
+
+  table.append(head, body);
+  block.appendChild(table);
+  return block;
+}
+
+function renderCitationItem(citation, domain, pageId) {
+  const item = makeElement("li", "citation-item");
+  if (citation.removed_at) {
+    item.classList.add("is-removed");
+  }
+
+  const badges = makeElement("div", "source-badges");
+  if (citation.citation_type) {
+    badges.appendChild(makeElement("span", "source-badge", formatCitationTypeLabel(citation.citation_type)));
+  }
+  badges.appendChild(makeElement("span", "source-badge", `${citation.reference_type} ref`));
+  if (citation.currently_visible) {
+    badges.appendChild(makeElement("span", "source-badge source-badge-visible", "In latest revision"));
+  }
+  if (citation.removed_at) {
+    badges.appendChild(makeElement("span", "source-badge source-badge-removed", "Removed next revision"));
+  }
+  if (citation.reference_name) {
+    badges.appendChild(makeElement("code", "citation-ref-name", `name="${citation.reference_name}"`));
+  }
+  item.appendChild(badges);
+
+  item.appendChild(makeElement("pre", "citation-text", citation.reference_normalized || "(citation text not loaded)"));
+
+  const meta = [
+    `Added ${formatCompactDate(citation.first_seen?.revision_timestamp)}`,
+    `last seen ${formatCompactDate(citation.last_seen?.revision_timestamp)}`,
+  ];
+  if (citation.removed_at) {
+    meta.push(`removed ${formatCompactDate(citation.removed_at.revision_timestamp)}`);
+  }
+  item.appendChild(makeElement("p", "source-detail-line", meta.join(" · ")));
+
+  if (citation.normalized_sha1) {
+    const actions = makeElement("div", "citation-actions");
+    const count = citation.appearance_count || 0;
+    actions.appendChild(
+      makeLink(
+        `In ${formatInteger(count)} revision${count === 1 ? "" : "s"} of this page`,
+        citationReportUrl(citation.normalized_sha1, domain, pageId),
+        { className: "inline-action" }
+      )
+    );
+    const others = (citation.other_articles || []).length;
+    if (others > 0) {
+      actions.appendChild(
+        makeLink(
+          `On ${formatInteger(others)} other page${others === 1 ? "" : "s"}`,
+          citationPagesUrl(citation.normalized_sha1, domain, pageId),
+          { className: "inline-action" }
+        )
+      );
+    }
+    item.appendChild(actions);
+  }
+
+  const links = citation.extracted_links || [];
+  const templates = citation.templates || [];
+  if (links.length || templates.length) {
+    const details = makeElement("details", "citation-details");
+    const parts = [];
+    if (templates.length) {
+      parts.push(`${templates.length} template${templates.length === 1 ? "" : "s"}`);
+    }
+    if (links.length) {
+      parts.push(`${links.length} link${links.length === 1 ? "" : "s"}`);
+    }
+    details.appendChild(makeElement("summary", "", `Details: ${parts.join(", ")}`));
+    templates.forEach((template) => details.appendChild(renderTemplateParameters(template)));
+    if (links.length) {
+      const list = makeElement("ul", "citation-link-list");
+      links.forEach((link) => {
+        const li = makeElement("li");
+        li.appendChild(makeLink(link.url, link.url, { external: true }));
+        list.appendChild(li);
+      });
+      details.appendChild(list);
+    }
+    item.appendChild(details);
+  }
+
+  return item;
+}
+
+async function loadCitations(revisionId = null, { append = false } = {}) {
+  if (!currentPageId) {
+    return;
+  }
+  const domain = currentDomain;
+  const pageId = currentPageId;
+  const offset = append && citationsState ? citationsState.offset : 0;
+  const token = ++citationsRequestToken;
+
+  citationsMoreButton.disabled = true;
+  if (!append) {
+    citationsList.replaceChildren();
+    citationsSummary.textContent = "Loading citations…";
+    citationsMoreButton.classList.add("hidden");
+  }
+
+  const params = new URLSearchParams({ limit: String(CITATIONS_PAGE_SIZE), offset: String(offset) });
+  if (revisionId) {
+    params.set("revision_id", String(revisionId));
+  }
+
+  try {
+    const result = await fetchJson(`${pagePath(domain, pageId, "citations")}?${params}`);
+    if (token !== citationsRequestToken) {
+      return;
+    }
+    const isLatest = !revisionId;
+    citationsState = {
+      revisionId,
+      offset: offset + result.citations.length,
+      total: result.citation_count,
+    };
+
+    citationsHeading.textContent = isLatest
+      ? "Citations In The Latest Revision"
+      : `Citations In Revision ${result.revision_id}`;
+    citationsLatestButton.classList.toggle("hidden", isLatest);
+
+    result.citations.forEach((citation) => {
+      citationsList.appendChild(renderCitationItem(citation, domain, pageId));
+    });
+    if (!result.citation_count) {
+      citationsList.appendChild(makeElement("li", "empty-state", "No citations were extracted at this revision."));
+    }
+
+    citationsSummary.textContent = `Showing ${formatInteger(citationsState.offset)} of ${formatInteger(
+      result.citation_count
+    )} citations at revision ${result.revision_id} (${formatTimestamp(
+      result.revision_timestamp
+    )}), most recently seen first.`;
+    citationsMoreButton.classList.toggle("hidden", citationsState.offset >= result.citation_count);
+  } catch (error) {
+    if (token === citationsRequestToken) {
+      citationsSummary.textContent = error.message || "Unable to load citations.";
+    }
+  } finally {
+    if (token === citationsRequestToken) {
+      citationsMoreButton.disabled = false;
+    }
+  }
+}
+
+function showCitationsAtRevision(revisionId) {
+  loadCitations(revisionId);
+  citationsSection.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+citationsMoreButton.addEventListener("click", () => {
+  if (citationsState) {
+    loadCitations(citationsState.revisionId, { append: true });
+  }
+});
+
+citationsLatestButton.addEventListener("click", () => loadCitations(null));
 
 function renderSourceKindChart(items) {
   sourceKindChart.replaceChildren();
@@ -1051,6 +1313,7 @@ function renderPage(summary, timeline, topSources) {
   renderSourceKindChart(summary.source_profile.source_kind_breakdown);
   renderTimeline(timeline);
   renderTopSources(topSources);
+  loadCitations(null);
 }
 
 async function fetchJson(endpoint) {
@@ -1185,6 +1448,13 @@ window.addEventListener("DOMContentLoaded", () => {
   }
   if (domain) {
     domainInput.value = domain;
+  }
+  // ?url=… (old explorer links, /explorer/article?url=…, redirect here)
+  const articleUrl = params.get("url");
+  if (!pageId && articleUrl) {
+    pageIdInput.value = articleUrl;
+    loadPageByUrl(articleUrl);
+    return;
   }
   if (pageId) {
     pageIdInput.value = pageId;

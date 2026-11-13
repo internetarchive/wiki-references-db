@@ -14,12 +14,18 @@ from wcd_schema.ids import page_bucket
 
 from ..db import Database
 from ..models import (
-    CitationAtRevision, CitationDetailResponse, CitationHistoryResponse, ExtractedLink, GlobalPart, HistoryEntry,
+    CitationAtRevision, CitationDetailResponse, CitationHistoryResponse, CitationPage, CitationPagesResponse, ExtractedLink,
+    GlobalPart, HistoryEntry,
     InstanceRef, PageCitationsResponse, PageRef, PageRevisionsResponse, Part, PartResolution, RevisionItem,
     RevisionRef, TemplateUse,
 )
-from . import NotFound
-from .common import TYPE_LABELS, require_domain_id
+from . import BadRequest, NotFound
+from .common import TYPE_LABELS, page_titles, page_url, require_domain_id
+
+#: an unscoped history reads one citation_history bucket per page the citation is on (~0.35 s
+#: each on enwiki; a citation on 120k pages took 3 minutes), so past this many pages it needs
+#: a page_id
+HISTORY_MAX_PAGES = 25
 
 PART_COLS = ("part_index", "part_type", "norm_subtype", "template_name", "template_subtype", "author_key", "title",
              "year", "extracted_doi", "extracted_isbn", "extracted_pmid", "extracted_pmc", "extracted_arxiv",
@@ -214,7 +220,7 @@ def get_citations(db: Database, domain: str, page_id: int, revision_id: int | No
         if next_rev is not None and not in_next:
             removed = RevisionRef(revision_id=next_rev, revision_timestamp=ts.get(next_rev))
         item = CitationAtRevision(
-            citation_instance_id=cid, raw_sha1=i["raw_sha1"],
+            citation_instance_id=str(cid), raw_sha1=i["raw_sha1"],
             reference_type=TYPE_LABELS.get(i["reference_type"], str(i["reference_type"])), reference_name=i["reference_name"],
             first_seen=RevisionRef(revision_id=first_id, revision_timestamp=ts.get(first_id)),
             last_seen=RevisionRef(revision_id=last_id, revision_timestamp=ts.get(last_id)),
@@ -287,10 +293,12 @@ def get_citation(db: Database, normalized_sha1: str) -> CitationDetailResponse:
         parts, resolutions = _parts(con, [nc["id"]], None, None), _resolutions(con, [nc["id"]])
         history = _history(db, con, instances, None)
     pages = sorted({(i["domain"], i["page_id"]) for i in instances})
+    with db.connect() as con:
+        titles = page_titles(con, pages)
     return CitationDetailResponse(
         normalized_sha1=nc["normalized_sha1"], reference_normalized=nc["reference_normalized"], citation_type=nc["citation_type"],
-        appears_on_articles=[PageRef(domain=d, page_id=p) for d, p in pages],
-        instances=[InstanceRef(domain=i["domain"], page_id=i["page_id"], citation_instance_id=i["id"], reference_name=i["reference_name"],
+        appears_on_articles=[PageRef(domain=d, page_id=p, page_title=titles.get((d, p))) for d, p in pages],
+        instances=[InstanceRef(domain=i["domain"], page_id=i["page_id"], citation_instance_id=str(i["id"]), reference_name=i["reference_name"],
                                reference_type=TYPE_LABELS.get(i["reference_type"], str(i["reference_type"]))) for i in instances],
         extracted_links=links.get(nc["id"], []), templates=templates.get(nc["id"], []),
         parts=[GlobalPart(**{k: v for k, v in p.items() if k != "normalized_id"},
@@ -299,7 +307,10 @@ def get_citation(db: Database, normalized_sha1: str) -> CitationDetailResponse:
     )
 
 
-def get_citation_history(db: Database, normalized_sha1: str, domain: str | None, page_id: int | None) -> CitationHistoryResponse:
+def get_citation_history(db: Database, normalized_sha1: str, domain: str | None, page_id: int | None,
+                         limit: int | None = None, offset: int = 0) -> CitationHistoryResponse:
+    """Every revision (on every page, or on one page) that contains the citation, oldest
+    first; ``total`` counts them all, ``limit``/``offset`` page through them."""
     with db.connect() as con:
         nc_id = con.execute(text("SELECT id FROM normalized_citations WHERE normalized_sha1 = :s"), {"s": normalized_sha1}).scalar()
         if nc_id is None:
@@ -308,5 +319,41 @@ def get_citation_history(db: Database, normalized_sha1: str, domain: str | None,
         page_filter = (domain, page_id) if (domain and page_id is not None) else None
         if page_id is not None and not domain:
             instances = [i for i in instances if i["page_id"] == page_id]
+        n_pages = len({(i["domain"], i["page_id"]) for i in instances})
+        if page_filter is None and n_pages > HISTORY_MAX_PAGES:
+            raise BadRequest(f"This citation is on {n_pages:,} pages; its history across all of them is too large to "
+                             f"serve. Pass page_id (and domain) for one page's history (limit: {HISTORY_MAX_PAGES} pages).")
         history = _history(db, con, instances, page_filter)
-    return CitationHistoryResponse(normalized_sha1=normalized_sha1, revisions=history)
+        window = history[offset:] if limit is None else history[offset:offset + limit]
+        titles = page_titles(con, {(h.domain, h.page_id) for h in window})
+    for h in window:
+        h.page_title = titles.get((h.domain, h.page_id))
+    return CitationHistoryResponse(normalized_sha1=normalized_sha1, total=len(history), revisions=window)
+
+
+def get_citation_pages(db: Database, normalized_sha1: str, limit: int = 100, offset: int = 0) -> CitationPagesResponse:
+    """The pages whose citations normalize to this text (any revision), title order,
+    with how many distinct instances each page has and the ref names they use.
+    Postgres only: no revision scan, so it stays fast for widely shared citations."""
+    with db.connect() as con:
+        nc = con.execute(text("SELECT id, normalized_sha1, reference_normalized, citation_type FROM normalized_citations "
+                              "WHERE normalized_sha1 = :s"), {"s": normalized_sha1}).mappings().first()
+        if nc is None:
+            raise NotFound("Citation not found")
+        total = con.execute(text("SELECT count(*) FROM (SELECT DISTINCT domain_id, page_id FROM citation_instances "
+                                 "WHERE normalized_id = :n) t"), {"n": nc["id"]}).scalar() or 0
+        rows = con.execute(text("""
+            SELECT d.value AS domain, p.page_id, m.page_title, p.n_instances, p.names
+            FROM (SELECT domain_id, page_id, count(*) AS n_instances,
+                         array_remove(array_agg(DISTINCT reference_name), NULL) AS names
+                  FROM citation_instances WHERE normalized_id = :n GROUP BY 1, 2) p
+            JOIN domains d ON d.id = p.domain_id
+            LEFT JOIN page_metadata m ON m.domain_id = p.domain_id AND m.page_id = p.page_id
+            ORDER BY m.page_title NULLS LAST, d.value, p.page_id LIMIT :l OFFSET :o"""),
+            {"n": nc["id"], "l": limit, "o": offset}).mappings().all()
+    return CitationPagesResponse(
+        normalized_sha1=nc["normalized_sha1"], reference_normalized=nc["reference_normalized"], citation_type=nc["citation_type"],
+        total=int(total),
+        pages=[CitationPage(domain=r["domain"], page_id=r["page_id"], page_title=r["page_title"], url=page_url(r["domain"], r["page_id"]),
+                            n_instances=int(r["n_instances"]), reference_names=[n for n in (r["names"] or []) if n])
+               for r in rows])

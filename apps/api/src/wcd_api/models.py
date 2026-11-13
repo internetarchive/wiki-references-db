@@ -5,7 +5,7 @@ Group-3/4 shapes are v1's plus ``citation_type`` / ``parts`` (proposed_api.md).
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field
 
@@ -241,10 +241,17 @@ class TemplateUse(BaseModel):
 class PageRef(BaseModel):
     domain: str
     page_id: int
+    page_title: str | None = None
+
+
+#: citation_instances.id is a 64-bit hash: past 2**53, so JSON numbers lose digits in
+#: JavaScript. It is served as a decimal string.
+InstanceId = Annotated[str, Field(description="citation_instances.id as a decimal string (64-bit; exceeds JavaScript's safe integers)",
+                                  examples=["9172276549252580379"])]
 
 
 class CitationAtRevision(BaseModel):
-    citation_instance_id: int
+    citation_instance_id: InstanceId
     normalized_sha1: str | None = None
     reference_normalized: str | None = None
     raw_sha1: str | None = None
@@ -274,7 +281,7 @@ class PageCitationsResponse(BaseModel):
 class InstanceRef(BaseModel):
     domain: str
     page_id: int
-    citation_instance_id: int
+    citation_instance_id: InstanceId
     reference_name: str | None = None
     reference_type: str
 
@@ -282,6 +289,7 @@ class InstanceRef(BaseModel):
 class HistoryEntry(RevisionRef):
     domain: str
     page_id: int
+    page_title: str | None = None
 
 
 class CitationDetailResponse(BaseModel):
@@ -298,7 +306,25 @@ class CitationDetailResponse(BaseModel):
 
 class CitationHistoryResponse(BaseModel):
     normalized_sha1: str
+    total: int = Field(0, description="revisions in the whole history (before limit/offset)")
     revisions: list[HistoryEntry]
+
+
+class CitationPage(BaseModel):
+    domain: str
+    page_id: int
+    page_title: str | None = None
+    url: str
+    n_instances: int
+    reference_names: list[str] = []
+
+
+class CitationPagesResponse(BaseModel):
+    normalized_sha1: str
+    reference_normalized: str
+    citation_type: str | None = None
+    total: int
+    pages: list[CitationPage]
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +337,7 @@ class TemplateReportCitation(BaseModel):
     appears_on_domain: str | None = None
     appears_on_page_id: int | None = None
     appears_on_article: int | None = None   # v1 name for appears_on_page_id
+    appears_on_page_title: str | None = None
 
 
 class TemplateReportResponse(BaseModel):

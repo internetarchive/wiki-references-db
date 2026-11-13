@@ -77,8 +77,15 @@ def citation(request: Request, normalized_sha1: str = Path(..., min_length=40, m
 
 @router.get("/citations/{normalized_sha1}/history", response_model=models.CitationHistoryResponse, tags=["citations"])
 def citation_history(request: Request, normalized_sha1: str = Path(..., min_length=40, max_length=40),
-                     domain: str | None = Query(None), page_id: int | None = Query(None)):
-    return citations.get_citation_history(_db(request), normalized_sha1, domain, page_id)
+                     domain: str | None = Query(None), page_id: int | None = Query(None),
+                     limit: int = Query(1000, ge=1, le=10000), offset: int = Query(0, ge=0)):
+    return citations.get_citation_history(_db(request), normalized_sha1, domain, page_id, limit, offset)
+
+
+@router.get("/citations/{normalized_sha1}/pages", response_model=models.CitationPagesResponse, tags=["citations"])
+def citation_pages(request: Request, normalized_sha1: str = Path(..., min_length=40, max_length=40),
+                   limit: int = Query(100, ge=0, le=1000), offset: int = Query(0, ge=0)):
+    return citations.get_citation_pages(_db(request), normalized_sha1, limit, offset)
 
 
 # Group 4 -------------------------------------------------------------------

@@ -25,6 +25,18 @@ def source_label(row) -> str:
     return f"Source {row['global_source_id']}"
 
 
+def page_titles(con: Connection, pages) -> dict[tuple[str, int], str]:
+    """Titles from ``page_metadata`` for ``(domain, page_id)`` pairs, in one query."""
+    pairs = sorted({(d, int(p)) for d, p in pages})
+    if not pairs:
+        return {}
+    rows = con.execute(text(
+        "SELECT q.dom, q.pid, m.page_title FROM unnest(CAST(:doms AS text[]), CAST(:pids AS integer[])) AS q(dom, pid) "
+        "JOIN domains d ON d.value = q.dom JOIN page_metadata m ON m.domain_id = d.id AND m.page_id = q.pid"),
+        {"doms": [d for d, _ in pairs], "pids": [p for _, p in pairs]}).all()
+    return {(r[0], r[1]): r[2] for r in rows if r[2] is not None}
+
+
 def require_domain_id(db, con: Connection, domain: str) -> int:
     did = db.domain_id(con, domain)
     if did is None:

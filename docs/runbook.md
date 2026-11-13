@@ -337,6 +337,24 @@ bucket partition per request; it needs read access to `$PARQUET_DIR` and no
 DuckDB extension. `/healthz` is the liveness check; `/openapi.json` the
 contract.
 
+**Before serving a new build.** Run `ANALYZE` on the serving tables: bulk loads leave
+most of them without planner statistics (on the 2026-11 enwiki build `normalized_citations`,
+`citation_instances`, `revisions`, `page_metadata`, `domains`, `web_resources` and the parts
+and link tables had never been analysed). It takes seconds:
+`psql "$DATABASE_URL" -c ANALYZE`.
+
+**Cutting over from the v1 site.** `wcd-api` answers the old URLs itself: `/explorer/…`
+redirects (302) to the dashboard and report pages, `/api/v1/…` are aliases, and
+`/api/v1/docs` redirects to `/docs`. A reverse proxy only has to send everything to
+`wcd-api` (bind it to an address the proxy can reach, e.g. `--host 0.0.0.0` behind a
+firewall, and run several `--workers`). Template ids changed between the databases; to keep
+old template-report links working, export the v1 id → name table on the old server and
+point `API_LEGACY_TEMPLATE_IDS` at it:
+
+```
+psql "<v1 database URL>" -c "\copy (SELECT id, name FROM wiki_templates ORDER BY id) TO 'legacy_template_ids.tsv'"
+```
+
 **Refreshing under a running service.** Postgres steps are transactional per
 batch, so the API sees each table's new rows as they commit (a page can be
 briefly inconsistent between 7d and 7h; the summary cache is written last).

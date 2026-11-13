@@ -41,8 +41,11 @@ def v1_citation(request: Request, normalized_sha1: str):
 
 
 @router.get("/citation/{normalized_sha1}/history", response_model=models.CitationHistoryResponse)
-def v1_citation_history(request: Request, normalized_sha1: str, page_id: int | None = Query(None)):
-    return citations.get_citation_history(_db(request), normalized_sha1, _domain(request) if page_id is not None else None, page_id)
+def v1_citation_history(request: Request, normalized_sha1: str, page_id: int | None = Query(None),
+                        limit: int = Query(10000, ge=1, le=10000), offset: int = Query(0, ge=0)):
+    # v1 returned every row; with full revision history that can be millions, so it is capped (and pageable)
+    return citations.get_citation_history(_db(request), normalized_sha1, _domain(request) if page_id is not None else None, page_id,
+                                          limit, offset)
 
 
 @router.get("/template/{wiki_template_id}/report", response_model=models.TemplateReportResponse)
