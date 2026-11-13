@@ -21,6 +21,8 @@ repository root with `.env` filled in (`example.env`).
 | `DUCKDB_MEMORY_LIMIT`, `DUCKDB_THREADS`, `DUCKDB_TEMP_DIRECTORY` | Stages 4.6–8, gates | per DuckDB connection, so per worker in `match` / `revision-stats`; unset, DuckDB takes 80 % of RAM and every core per connection |
 | `DENORM_WORK_MEM`, `DENORM_MAX_LINE_SIZE`, `DENORM_GROUPS` | Stage 4.6 / 7c | Postgres `work_mem` for the parallel export (256MB: 1GB took enwiki past RAM); longest CSV row DuckDB accepts (64 MB); bucket groups of the repartition (16) |
 | `MATCH_PAGE_SLICES` | Stage 6 | page slices a bucket is matched in (8; memory follows the slice) |
+| `MATCH_GLOBAL_CHUNK_ROWS`, `MATCH_GLOBAL_BLOCK_ROWS` | Stage 6d | merged sources per output file of the component build (8M; memory follows it); rows of a fuzzy author+year group per rapidfuzz call (2048) |
+| `MATERIALIZE_CHUNK_ROWS`, `STAGE7_WORK_MEM` | Stage 7 | rows per COPY chunk (500k); Postgres `work_mem` of 7e/7f's whole-table UPDATEs (1GB; one backend, no parallel workers) |
 | `REVISION_BUNDLES_DIR` | Stage 1 | the `.mwrev.zst` bundles, one directory per domain |
 | `API_*`, `WIKIPEDIA_API_*` | the API | CORS, default domain, pool size, User-Agent for title lookups |
 
@@ -87,12 +89,17 @@ uv run wcd denorm-export --domain en.wikipedia.org
 uv run wcd ref-name-links --domain en.wikipedia.org
 uv run wcd init-db --add-indexes --table ref_name_links
 
-# 6  matching per bucket + cross-page (gate 6); per worker: DuckDB 3 GB, 2 threads
-DUCKDB_MEMORY_LIMIT=3GB DUCKDB_THREADS=2 uv run wcd match --domain en.wikipedia.org --jobs 9
+# 6  matching per bucket, then cross-page 6d (gate 6). 6a–6c per worker: DuckDB 3 GB, 2 threads;
+#    6d is one process (enwiki: ~32 GB peak with DuckDB 28 GB; --reuse-unions after a failure past
+#    its union-find)
+DUCKDB_MEMORY_LIMIT=3GB DUCKDB_THREADS=2 uv run wcd match --domain en.wikipedia.org --jobs 9 --skip-global
+DUCKDB_MEMORY_LIMIT=28GB DUCKDB_THREADS=8 uv run wcd match --domain en.wikipedia.org --jobs 1
 
-# 7  materialization 7a–7h (gate 7);  8  revision stats (gate 8)
-uv run wcd materialize --domain en.wikipedia.org
-uv run wcd revision-stats --domain en.wikipedia.org --jobs 8
+# 7  materialization 7a–7h (gate 7), then its tables' indexes and gate 7 again with them
+DUCKDB_MEMORY_LIMIT=20GB DUCKDB_THREADS=8 uv run wcd materialize --domain en.wikipedia.org
+uv run wcd init-db --add-indexes --table global_sources citation_source_resolution page_source_summary
+# 8  revision stats (gate 8); per worker: DuckDB 4 GB, 3 threads
+DUCKDB_MEMORY_LIMIT=4GB DUCKDB_THREADS=3 uv run wcd revision-stats --domain en.wikipedia.org --jobs 6
 ```
 
 `scripts/run_pipeline.sh <bundles> <metadata> [domain] [jobs]` runs exactly
@@ -237,8 +244,8 @@ runbook's `max_wal_size` or more, and watch `pg_stat_bgwriter.checkpoints_req`.
 | `parts` | `normalized_citation_parts` | DELETE + INSERT per batch; `--resume` skips citations that already have parts | domain (or all) |
 | `denorm-export` | `citation_instances_denorm/` | the domain's partitions | domain |
 | `ref-name-links` | `ref_name_links` table and Parquet | the domain | domain |
-| `match` | `matching_intermediate/*` | bucket directories with a `_SUCCESS` marker are skipped unless `--force`; `--buckets 3,17` selects | bucket (6a–6c), domain (6d) |
-| `materialize` | `global_sources`, `citation_source_resolution`, resolved `citation_instances_denorm/`, `page_source_summary`, counts, scores, `global_source_scores/`, `page_summary_cache` | the domain, step by step; 7d/7h checkpoint per bucket under `$PARQUET_DIR/_checkpoints/` and resume; `--steps a,b` selects; `--force` ignores checkpoints | domain |
+| `match` | `matching_intermediate/*` (6d: `global_source_map/`, `global_sources_stage/` as several `data-NNNN.parquet`, and its saved unions in `_global_unions/`) | bucket directories with a `_SUCCESS` marker are skipped unless `--force`; `--buckets 3,17` selects; 6d always reruns, from the saved unions with `--reuse-unions` (only when 6a–6c are unchanged) | bucket (6a–6c), domain (6d) |
+| `materialize` | `global_sources`, `citation_source_resolution`, resolved `citation_instances_denorm/`, `page_source_summary`, counts, scores, `global_source_scores/`, `page_summary_cache` | the domain, step by step; 7d keeps each bucket's summary rows in `$PARQUET_DIR/_scratch/7d/` (a bucket with its file is skipped; the load into Postgres reruns whole; the scratch is removed when 7d is done), 7h checkpoints per bucket under `$PARQUET_DIR/_checkpoints/`; `--steps a,b` selects; `--force` ignores both | domain |
 | `revision-stats` | `page_revision_stats/` | bucket directories | bucket |
 
 Rules of thumb:
