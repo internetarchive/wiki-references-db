@@ -17,3 +17,6 @@ data/
 
 # legacy flask app
 credentials.py
+
+# the API service environment (deploy/serve.env.example): holds the database password
+serve.env

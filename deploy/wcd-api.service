@@ -1,0 +1,30 @@
+# systemd unit for the API and dashboard (wcd-api: /api/v2, /api/v1 aliases, the dashboard
+# at /, the v1 explorer redirects). Install:
+#
+#   sudo cp deploy/wcd-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wcd-api
+#   curl -s 10.0.2.28:8000/healthz
+#
+# Paths assume the serving checkout at /home/jh/wcd-serve with its venv (uv sync --frozen
+# --all-packages) and serve.env (deploy/serve.env.example). --host is the address the reverse
+# proxy reaches: this VM's private 10.0.2.28, where the Caddy on the old site's host connects
+# (port 8000; the host has no firewall, so that subnet can reach it).
+[Unit]
+Description=Wikipedia Citations Database API (wcd-api)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jh
+WorkingDirectory=/home/jh/wcd-serve
+EnvironmentFile=/home/jh/wcd-serve/serve.env
+ExecStart=/home/jh/wcd-serve/.venv/bin/wcd-api --host 10.0.2.28 --port 8000 --workers 4
+Restart=always
+RestartSec=5
+# the build host also runs Postgres (16 GB shared_buffers) and pipeline jobs
+MemoryMax=16G
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
