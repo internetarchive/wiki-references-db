@@ -1,0 +1,332 @@
+"""The Parquet tier: dataset names, schemas and the on-disk layout.
+
+Every page-partitioned dataset lives under ``<parquet_base>/<name>/`` with hive
+partitions ``domain=<domain>/page_bucket=<n>/`` where ``page_bucket =
+page_id % 512``; the bucket is the unit of batching, checkpointing and
+re-run in Stages 6–8. The partition columns are not stored inside the files.
+"""
+from __future__ import annotations
+
+import glob
+import os
+from pathlib import Path
+
+import pyarrow as pa
+
+from .ids import PAGE_BUCKETS, page_bucket
+
+__all__ = ["PAGE_BUCKETS", "page_bucket", "SCHEMAS", "PAGE_PARTITIONED", "DOMAIN_PARTITIONED",
+           "SEARCH_PARTITIONED", "GLOBAL", "dataset_dir", "partition_dir", "search_partition_dir",
+           "dataset_glob", "partition_glob", "list_buckets"]
+
+# ---------------------------------------------------------------------------
+# Schemas (the stored columns; partition columns are added by the reader)
+# ---------------------------------------------------------------------------
+
+SCHEMAS: dict[str, pa.Schema] = {
+    # Stage 1 (written directly by the extractor in final layout)
+    "citation_history": pa.schema([
+        ("citation_instance_id", pa.int64()),
+        ("revision_id", pa.int64()),
+        ("page_id", pa.int32()),
+    ]),
+    "named_ref_uses": pa.schema([
+        ("page_id", pa.int32()),
+        ("revision_id", pa.int64()),
+        ("ref_name", pa.string()),
+        ("offset_start", pa.int32()),
+    ]),
+    "revision_signals": pa.schema([
+        ("revision_id", pa.int64()),
+        ("page_id", pa.int32()),
+        ("has_ref_tag", pa.bool_()),
+        ("has_named_ref", pa.bool_()),
+        ("has_self_closing_ref", pa.bool_()),
+        ("has_references_tag", pa.bool_()),
+        ("has_cite_template", pa.bool_()),
+        ("has_citation_template", pa.bool_()),
+        ("has_shorthand_template", pa.bool_()),
+    ]),
+    # Stage 3 (re-partitioned from RevisionChest metadata)
+    "revisions": pa.schema([
+        ("revision_id", pa.int64()),
+        ("page_id", pa.int32()),
+        ("parent_revision_id", pa.int64()),
+        ("revision_timestamp", pa.timestamp("s")),
+    ]),
+    # Stage 3 (wcd load): template parameters, kept out of Postgres (2.5 billion rows
+    # for enwiki). template_params serves a page's citations (page-partitioned);
+    # template_param_index serves the template report, one row per distinct
+    # (template, key, value, citation), partitioned by template_search_bucket.
+    "template_params": pa.schema([
+        ("page_id", pa.int32()),
+        ("normalized_sha1", pa.string()),
+        ("template_name", pa.string()),
+        ("offset_start", pa.int32()),
+        ("parameter_key", pa.string()),
+        ("parameter_value", pa.string()),
+    ]),
+    "template_param_index": pa.schema([
+        ("template_name", pa.string()),
+        ("parameter_key", pa.string()),
+        ("parameter_value", pa.string()),
+        ("normalized_sha1", pa.string()),
+    ]),
+    # Stage 5
+    "ref_name_links": pa.schema([
+        ("page_id", pa.int32()),
+        ("ref_name", pa.string()),
+        ("defining_instance_id", pa.int64()),
+        ("first_revision_id", pa.int64()),
+        ("last_revision_id", pa.int64()),
+    ]),
+    # Stage 4.6 / 7c
+    "citation_instances_denorm": pa.schema([
+        ("citation_instance_id", pa.int64()),
+        ("page_id", pa.int32()),
+        ("raw_sha1", pa.string()),
+        ("normalized_id", pa.int32()),
+        ("normalized_sha1", pa.string()),
+        ("reference_type", pa.int8()),
+        ("reference_name", pa.string()),
+        ("citation_type", pa.string()),
+        ("part_index", pa.int16()),
+        ("part_sha1", pa.string()),
+        ("content", pa.string()),
+        ("part_type", pa.string()),
+        ("norm_subtype", pa.string()),
+        ("norm_content", pa.string()),
+        ("template_name", pa.string()),
+        ("template_subtype", pa.string()),
+        ("author_last", pa.string()),     # template parts: the matcher's canonical-row field
+        ("journal", pa.string()),
+        ("pages", pa.string()),
+        ("anchor_key", pa.string()),
+        ("page_ref", pa.string()),
+        ("extracted_doi", pa.string()),
+        ("extracted_isbn", pa.string()),
+        ("extracted_pmid", pa.string()),
+        ("extracted_pmc", pa.string()),
+        ("extracted_arxiv", pa.string()),
+        ("extracted_wikidata_qid", pa.string()),
+        ("extracted_librarybase_id", pa.string()),
+        ("extracted_url", pa.string()),
+        ("is_archive_url", pa.bool_()),
+        ("author_key", pa.string()),
+        ("title", pa.string()),
+        ("year", pa.string()),
+        ("year_reliable", pa.bool_()),
+        ("id_tier", pa.int8()),
+        ("id_tier_label", pa.string()),
+        ("global_source_id", pa.string()),
+        ("source_type", pa.string()),
+        ("match_type", pa.string()),
+        ("confidence", pa.float64()),
+    ]),
+    # Stage 6 intermediates (matching_intermediate/<name>); column names are UVA's
+    # with content_sha1 → part_sha1 and canonical_sha1 → canonical_part_sha1
+    "matching_intermediate/sources": pa.schema([
+        ("source_id", pa.string()),
+        ("page_id", pa.int32()),
+        ("canonical_part_sha1", pa.string()),
+        ("norm_subtype", pa.string()),
+        ("id_tier", pa.int8()),
+        ("extracted_doi", pa.string()),
+        ("extracted_isbn", pa.string()),
+        ("extracted_pmid", pa.string()),
+        ("extracted_pmc", pa.string()),
+        ("extracted_arxiv", pa.string()),
+        ("extracted_wikidata_qid", pa.string()),
+        ("extracted_url", pa.string()),
+        ("anchor_key", pa.string()),
+        ("author_key", pa.string()),
+        ("year", pa.string()),
+        ("title", pa.string()),
+        ("n_citations", pa.int32()),
+        ("match_type", pa.string()),
+        ("confidence", pa.float64()),
+    ]),
+    "matching_intermediate/citation_source_map": pa.schema([
+        ("part_sha1", pa.string()),
+        ("source_id", pa.string()),
+        ("page_id", pa.int32()),
+        ("match_type", pa.string()),
+        ("confidence", pa.float64()),
+        ("is_canonical", pa.bool_()),
+    ]),
+    "matching_intermediate/template_sources": pa.schema([
+        ("source_id", pa.string()),
+        ("page_id", pa.int32()),
+        ("canonical_part_sha1", pa.string()),
+        ("template_subtype", pa.string()),
+        ("template_name", pa.string()),
+        ("author_last", pa.string()),
+        ("title", pa.string()),
+        ("year", pa.string()),
+        ("extracted_doi", pa.string()),
+        ("extracted_isbn", pa.string()),
+        ("extracted_pmid", pa.string()),
+        ("extracted_pmc", pa.string()),
+        ("extracted_arxiv", pa.string()),
+        ("extracted_wikidata_qid", pa.string()),
+        ("extracted_url", pa.string()),
+        ("id_tier", pa.int8()),
+        ("n_citations", pa.int32()),
+        ("match_type", pa.string()),
+        ("confidence", pa.float64()),
+    ]),
+    "matching_intermediate/template_citation_source_map": pa.schema([
+        ("part_sha1", pa.string()),
+        ("source_id", pa.string()),
+        ("page_id", pa.int32()),
+        ("match_type", pa.string()),
+        ("confidence", pa.float64()),
+        ("is_canonical", pa.bool_()),
+    ]),
+    "matching_intermediate/merged_sources": pa.schema([
+        ("merged_source_id", pa.string()),
+        ("page_id", pa.int32()),
+        ("source_type", pa.string()),
+        ("ref_source_id", pa.string()),
+        ("tmpl_source_id", pa.string()),
+        ("canonical_part_sha1", pa.string()),
+        ("author_key", pa.string()),
+        ("year", pa.string()),
+        ("title", pa.string()),
+        ("extracted_doi", pa.string()),
+        ("extracted_isbn", pa.string()),
+        ("extracted_pmid", pa.string()),
+        ("extracted_pmc", pa.string()),
+        ("extracted_arxiv", pa.string()),
+        ("extracted_wikidata_qid", pa.string()),
+        ("extracted_url", pa.string()),
+        ("n_ref_citations", pa.int32()),
+        ("n_tmpl_citations", pa.int32()),
+        ("n_total_citations", pa.int32()),
+        ("match_type", pa.string()),
+        ("confidence", pa.float64()),
+        # the canonical member's fields the cross-page matcher and the scorer read
+        ("id_tier", pa.int8()),
+        ("year_reliable", pa.bool_()),
+        ("norm_subtype", pa.string()),
+    ]),
+    "matching_intermediate/merged_citation_source_map": pa.schema([
+        ("part_sha1", pa.string()),
+        ("page_id", pa.int32()),
+        ("merged_source_id", pa.string()),
+        ("source_type", pa.string()),
+        ("match_type", pa.string()),
+        ("confidence", pa.float64()),
+        ("is_canonical", pa.bool_()),
+    ]),
+    # Stage 6d (per domain)
+    "matching_intermediate/global_source_map": pa.schema([
+        ("merged_source_id", pa.string()),
+        ("global_source_id", pa.string()),
+        ("page_id", pa.int32()),
+        ("match_type", pa.string()),
+        ("confidence", pa.float64()),
+    ]),
+    "matching_intermediate/global_sources_stage": pa.schema([
+        ("global_source_id", pa.string()),
+        ("match_type", pa.string()),
+        ("confidence", pa.float64()),
+        ("n_pages", pa.int32()),
+        ("page_ids", pa.string()),
+        ("canonical_part_sha1", pa.string()),
+        ("source_type", pa.string()),
+        ("author_key", pa.string()),
+        ("year", pa.string()),
+        ("title", pa.string()),
+        ("extracted_doi", pa.string()),
+        ("extracted_isbn", pa.string()),
+        ("extracted_pmid", pa.string()),
+        ("extracted_pmc", pa.string()),
+        ("extracted_arxiv", pa.string()),
+        ("extracted_wikidata_qid", pa.string()),
+        ("extracted_url", pa.string()),
+        ("n_total_citations", pa.int32()),
+    ]),
+    # Stage 7g
+    "global_source_scores": pa.schema([
+        ("global_source_id", pa.string()),
+        ("n_pages", pa.int32()),
+        ("n_total_citations", pa.int32()),
+        ("reliability_score", pa.float64()),
+        ("verdict", pa.string()),
+    ]),
+    # Stage 8
+    "page_revision_stats": pa.schema([
+        ("page_id", pa.int32()),
+        ("rev_id", pa.int64()),
+        ("timestamp", pa.timestamp("s")),
+        ("n_total_citations", pa.int32()),
+        ("n_self_closing", pa.int32()),
+        ("n_unique_sources", pa.int32()),
+        ("n_unresolved", pa.int32()),
+        ("n_high_confidence", pa.int32()),
+        ("n_new_sources", pa.int32()),
+        ("pct_resolved", pa.float64()),
+        ("n_ref_tag", pa.int32()),
+        ("n_template", pa.int32()),
+        ("n_bare_url", pa.int32()),
+        ("n_endnote", pa.int32()),
+        ("n_shorthand", pa.int32()),
+        ("n_external_link", pa.int32()),
+    ]),
+}
+
+#: datasets partitioned by domain= and page_bucket=
+PAGE_PARTITIONED = (
+    "citation_history", "named_ref_uses", "revisions", "ref_name_links", "template_params",
+    "citation_instances_denorm", "page_revision_stats",
+    "matching_intermediate/sources", "matching_intermediate/citation_source_map",
+    "matching_intermediate/template_sources", "matching_intermediate/template_citation_source_map",
+    "matching_intermediate/merged_sources", "matching_intermediate/merged_citation_source_map",
+)
+#: datasets partitioned by domain= only (the cross-page match runs per domain for now)
+DOMAIN_PARTITIONED = ("revision_signals", "matching_intermediate/global_source_map",
+                      "matching_intermediate/global_sources_stage")
+#: datasets partitioned by domain= and search_bucket= (``ids.template_search_bucket``)
+SEARCH_PARTITIONED = ("template_param_index",)
+#: unpartitioned datasets
+GLOBAL = ("global_source_scores",)
+
+FILE_GLOB = "*.parquet*"   # .parquet or .parquet.zst
+
+
+def dataset_dir(base: str | os.PathLike, name: str) -> Path:
+    return Path(base) / name
+
+
+def partition_dir(base: str | os.PathLike, name: str, domain: str, bucket: int | None = None) -> Path:
+    """``<base>/<name>/domain=<domain>[/page_bucket=<bucket>]``."""
+    d = dataset_dir(base, name) / f"domain={domain}"
+    return d if bucket is None else d / f"page_bucket={int(bucket)}"
+
+
+def search_partition_dir(base: str | os.PathLike, name: str, domain: str, bucket: int) -> Path:
+    """``<base>/<name>/domain=<domain>/search_bucket=<bucket>`` (``SEARCH_PARTITIONED``)."""
+    return dataset_dir(base, name) / f"domain={domain}" / f"search_bucket={int(bucket)}"
+
+
+def dataset_glob(base: str | os.PathLike, name: str) -> str:
+    """Glob for every file of a dataset (use with ``hive_partitioning=true``)."""
+    return str(dataset_dir(base, name) / "**" / FILE_GLOB)
+
+
+def partition_glob(base: str | os.PathLike, name: str, domain: str, bucket: int | None = None) -> str:
+    """Glob for one domain (or one bucket) of a dataset."""
+    return str(partition_dir(base, name, domain, bucket) / ("**" if bucket is None else "") / FILE_GLOB).replace("//", "/")
+
+
+def list_buckets(base: str | os.PathLike, name: str, domain: str) -> list[int]:
+    """The page buckets present for a domain, ascending."""
+    d = partition_dir(base, name, domain)
+    out = []
+    for p in glob.glob(str(d / "page_bucket=*")):
+        try:
+            out.append(int(os.path.basename(p).split("=", 1)[1]))
+        except ValueError:
+            continue
+    return sorted(out)

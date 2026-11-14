@@ -1,0 +1,51 @@
+# Wikipedia Citations Database — monorepo workspace root.
+#
+# This file is the uv workspace definition and shared tool config. It is not
+# itself an installable package; the packages live under packages/ and apps/.
+#
+#   uv sync                      install every workspace member (editable) + dev deps
+#   uv run wcd --help            the pipeline CLI
+#   uv run pytest                tests across the workspace
+[project]
+name = "wcd-workspace"
+version = "0.0.0"
+requires-python = ">=3.10"
+dependencies = [
+    "wcd-api",
+    "wcd-pipeline",
+    "wcd-schema",
+    "wcd-semantic",
+    "wiki-references-extractor",
+    "wiki-citation-normalizer",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*", "apps/*"]
+exclude = ["apps/frontend"]   # static files, not a Python package
+
+[tool.uv.sources]
+wcd-api = { workspace = true }
+wcd-pipeline = { workspace = true }
+wcd-schema = { workspace = true }
+wcd-semantic = { workspace = true }
+wiki-references-extractor = { workspace = true }
+wiki-citation-normalizer = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = [
+    "packages/normalizer/tests",
+    "packages/extractor/tests",
+    "packages/schema/tests",
+    "packages/semantic/tests",
+    "packages/pipeline/tests",
+    "apps/api/tests",
+    "scripts/tests",
+]

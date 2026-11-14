@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
+
+from ..models import PageHeader
+from . import NotFound
+
+TYPE_LABELS = {0: "other", 1: "inline", 2: "endnote"}
+
+
+def page_url(domain: str, page_id: int) -> str:
+    return f"https://{domain}/w/index.php?curid={page_id}"
+
+
+def source_label(row) -> str:
+    """UVA ``_build_source_label``: title, else DOI, ISBN, URL, else the id."""
+    title = row.get("title")
+    if title and title.strip():
+        return title.strip()
+    for key, prefix in (("extracted_doi", "DOI "), ("extracted_isbn", "ISBN "), ("extracted_url", "")):
+        v = row.get(key)
+        if v and v.strip():
+            return prefix + v.strip()
+    return f"Source {row['global_source_id']}"
+
+
+#: standardized identifiers in source-key order: intrinsic ids of the work first, then the
+#: knowledge-base items (created later, LibraryBase as the assigner of last resort), then the
+#: URL — so a key only ever moves toward a more standard identifier. (scheme, column)
+SOURCE_KEY_ORDER = (
+    ("doi", "extracted_doi"), ("isbn", "extracted_isbn"), ("pmid", "extracted_pmid"), ("pmc", "extracted_pmc"),
+    ("arxiv", "extracted_arxiv"), ("wikidata", "extracted_wikidata_qid"), ("librarybase", "extracted_librarybase_id"),
+    ("url", "extracted_url"),
+)
+#: the fallback key: a content hash of the source's canonical part
+SOURCE_KEY_FALLBACK = ("part", "canonical_part_sha1")
+
+
+def source_key(row) -> str | None:
+    """``scheme:value`` of the first standardized identifier the source has, else
+    ``part:<canonical_part_sha1>``; None if the row carries neither."""
+    for scheme, col in SOURCE_KEY_ORDER + (SOURCE_KEY_FALLBACK,):
+        v = row.get(col)
+        if v is not None and str(v).strip():
+            return f"{scheme}:{str(v).strip()}"
+    return None
+
+
+def page_titles(con: Connection, pages) -> dict[tuple[str, int], str]:
+    """Titles from ``page_metadata`` for ``(domain, page_id)`` pairs, in one query."""
+    pairs = sorted({(d, int(p)) for d, p in pages})
+    if not pairs:
+        return {}
+    rows = con.execute(text(
+        "SELECT q.dom, q.pid, m.page_title FROM unnest(CAST(:doms AS text[]), CAST(:pids AS integer[])) AS q(dom, pid) "
+        "JOIN domains d ON d.value = q.dom JOIN page_metadata m ON m.domain_id = d.id AND m.page_id = q.pid"),
+        {"doms": [d for d, _ in pairs], "pids": [p for _, p in pairs]}).all()
+    return {(r[0], r[1]): r[2] for r in rows if r[2] is not None}
+
+
+def require_domain_id(db, con: Connection, domain: str) -> int:
+    did = db.domain_id(con, domain)
+    if did is None:
+        raise NotFound(f"Unknown domain {domain!r}")
+    return did
+
+
+def page_header(con: Connection, domain: str, domain_id: int, page_id: int) -> PageHeader:
+    """page_metadata + the revisions aggregate (count, first/latest timestamp).
+    A page the database does not know is a 404."""
+    meta = con.execute(text(
+        "SELECT page_title, page_namespace FROM page_metadata WHERE domain_id = :d AND page_id = :p"),
+        {"d": domain_id, "p": page_id}).first()
+    agg = con.execute(text(
+        "SELECT count(*), min(revision_timestamp), max(revision_timestamp) FROM revisions "
+        "WHERE domain_id = :d AND page_id = :p"), {"d": domain_id, "p": page_id}).first()
+    if meta is None and (agg is None or agg[0] == 0):
+        raise NotFound(f"Page {page_id} on {domain} not found")
+    return PageHeader(
+        domain=domain, page_id=page_id, url=page_url(domain, page_id),
+        page_title=meta[0] if meta else None, page_namespace=meta[1] if meta else None,
+        revision_count=int(agg[0] or 0), first_revision_timestamp=agg[1], latest_revision_timestamp=agg[2],
+    )
+
+
+def latest_revision(con: Connection, domain_id: int, page_id: int):
+    """(revision_id, timestamp) of the page's latest revision by timestamp, or None."""
+    return con.execute(text(
+        "SELECT revision_id, revision_timestamp FROM revisions WHERE domain_id = :d AND page_id = :p "
+        "ORDER BY revision_timestamp DESC, revision_id DESC LIMIT 1"), {"d": domain_id, "p": page_id}).first()

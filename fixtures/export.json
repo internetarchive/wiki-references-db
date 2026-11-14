@@ -1,0 +1,27 @@
+{
+  "script_version": "1",
+  "created": "2026-10-20T05:03:04+00:00",
+  "pages_file": "fixtures/pages.tsv",
+  "wiki": "en",
+  "cutoff": "2026-10-01T00:00:00Z",
+  "outputs": {
+    "fixture.xml.bz2": {
+      "pages": 308,
+      "revisions": 379720,
+      "texthidden": 433,
+      "skipped": {},
+      "left_out": {},
+      "sha256": "b54ee138a0a5a720e8797d629d0329367595b608d90282ea1cc3fe63a1d17d40",
+      "bytes": 2640272157
+    },
+    "fixture-ci.xml.bz2": {
+      "pages": 51,
+      "revisions": 17432,
+      "texthidden": 17,
+      "skipped": {},
+      "left_out": {},
+      "sha256": "59b5fc2f2ec1816ce7e3858ac2949edb6d81b73996d40c4cb586769204cbbb7e",
+      "bytes": 13740321
+    }
+  }
+}
