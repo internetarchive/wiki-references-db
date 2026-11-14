@@ -353,6 +353,52 @@ async function templateReport() {
 }
 
 // ---------------------------------------------------------------------------
+// /sources/{global_source_id}/pages[?domain=&page_id=]: pages citing a source
+// ---------------------------------------------------------------------------
+
+async function sourcePagesReport(gid) {
+  const fromDomain = params.get("domain");
+  const fromPageId = params.get("page_id");
+  setHeader("Pages Citing This Source", "Every article whose citations resolve to this source, most citations first.");
+  const source = await fetchJson(`${API_BASE}/sources/${encodeURIComponent(gid)}`);
+  setHeader("Pages Citing This Source", source.source_label);
+  const facts = el("dl", { className: "report-facts" }, [
+    el("dt", { text: "Source" }), el("dd", { text: source.source_label }),
+    el("dt", { text: "Key" }), el("dd", {}, [el("code", { text: source.source_key })]),
+    source.author_key ? el("dt", { text: "Author" }) : null, source.author_key ? el("dd", { text: `${source.author_key}${source.year ? ` (${source.year})` : ""}` }) : null,
+    el("dt", { text: "Pages" }), el("dd", { text: formatInteger(source.n_pages) }),
+  ]);
+  const sections = pagedSection({
+    headings: ["Page", "Citations", "Revisions cited", "Still cited", "First seen", "Last seen"],
+    emptyText: "No other pages cite this source.",
+    summarize: (shown, total) => `Showing ${formatInteger(shown)} of ${plural(total, "page")}` +
+      (fromPageId ? " (the page you came from is left out)." : "."),
+    fetchPage: async (offset) => {
+      const query = new URLSearchParams({ limit: "50", offset: String(offset) });
+      if (fromDomain && fromPageId) {
+        query.set("exclude_domain", fromDomain);
+        query.set("exclude_page_id", fromPageId);
+      }
+      const result = await fetchJson(`${API_BASE}/sources/${encodeURIComponent(gid)}/pages?${query}`);
+      const total = fromPageId ? Math.max(0, result.total_pages - 1) : result.total_pages;
+      return {
+        total,
+        count: result.pages.length,
+        rows: result.pages.map((p) => el("tr", {}, [
+          cell(pageLink(p.domain, p.page_id, p.page_title)),
+          cell(formatInteger(p.citation_count)),
+          cell(formatInteger(p.n_revisions_cited)),
+          cell(p.is_current ? "yes" : "no"),
+          cell(formatTimestamp(p.first_seen)),
+          cell(formatTimestamp(p.last_seen)),
+        ])),
+      };
+    },
+  });
+  reportRoot.replaceChildren(card(facts, ...sections));
+}
+
+// ---------------------------------------------------------------------------
 // /templates/report?legacy_id=…: unmapped link from the old explorer
 // ---------------------------------------------------------------------------
 
@@ -379,6 +425,8 @@ async function route() {
       await pagesReport(match[1]);
     } else if ((match = path.match(/^\/citations\/([0-9a-f]{40})$/))) {
       await historyReport(match[1]);
+    } else if ((match = path.match(/^\/sources\/([^/]+)\/pages$/))) {
+      await sourcePagesReport(decodeURIComponent(match[1]));
     } else if (path === "/templates/report") {
       if (params.get("template")) {
         await templateReport();
