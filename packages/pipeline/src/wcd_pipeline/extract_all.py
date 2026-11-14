@@ -12,6 +12,57 @@ from .config import load_dotenv  # noqa: F401  (loads .env on import)
 max_jobs = 8
 
 
+# ---------------------------------------------------------------------------
+# One shard's extraction: shared with `wcd setup`, which extracts each bundle as
+# soon as it is built. A shard's staging lives in <staging>/<shard>; it is done
+# when DONE.txt is there. Anything else (a crash, an OOM kill, FAILED.txt) is
+# cleared and redone; `extract` itself replaces the shard's Parquet tier files.
+# ---------------------------------------------------------------------------
+
+def shard_name(bundle_path: str) -> str:
+    """``…-p1p812.mwrev.zst`` → ``…-p1p812`` (the staging directory and tier-file stem)."""
+    base = os.path.basename(bundle_path)
+    return base[:-len('.mwrev.zst')] if base.endswith('.mwrev.zst') else os.path.splitext(base)[0]
+
+
+def shard_done(job_staging_dir: str) -> bool:
+    return os.path.exists(os.path.join(job_staging_dir, 'DONE.txt'))
+
+
+def prepare_shard(job_staging_dir: str) -> None:
+    """Clear an unfinished shard's staging (a crashed or killed run's partial
+    files) and write STARTED.txt."""
+    os.makedirs(job_staging_dir, exist_ok=True)
+    for fname in os.listdir(job_staging_dir):
+        if fname.endswith(('.jsonl.zst', '.parquet')) or fname in ('FAILED.txt', 'STARTED.txt'):
+            os.remove(os.path.join(job_staging_dir, fname))
+    with open(os.path.join(job_staging_dir, 'STARTED.txt'), 'w') as f:
+        f.write(datetime.now(timezone.utc).isoformat() + '\n')
+
+
+def extract_command(bundle: str, job_staging_dir: str, domain: str, parquet_dir: str) -> list[str]:
+    return [
+        sys.executable, "-m", "wcd_pipeline.extract", bundle,
+        "-o", job_staging_dir,
+        "--domain", domain,
+        "--parquet-dir", parquet_dir,
+        "--batch-size", os.environ.get("BATCH_SIZE", "1000"),
+        "--batch-bytes", os.environ.get("BATCH_BYTES", str(32 * 2**20)),
+    ]
+
+
+def mark_shard(job_staging_dir: str, returncode: int) -> None:
+    """DONE.txt on success; FAILED.txt (and no DONE.txt) otherwise, so a re-run redoes it."""
+    os.makedirs(job_staging_dir, exist_ok=True)
+    stamp = datetime.now(timezone.utc).isoformat()
+    if returncode == 0:
+        with open(os.path.join(job_staging_dir, 'DONE.txt'), 'w') as f:
+            f.write(stamp + '\n')
+    else:
+        with open(os.path.join(job_staging_dir, 'FAILED.txt'), 'w') as f:
+            f.write(f"{stamp} exit code {returncode}\n")
+
+
 def sort_key(filepath):
     """Largest bundle first: the longest shards start early instead of setting
     the tail of the run. File size is a rough proxy for extraction work (rank
@@ -81,21 +132,7 @@ def main(argv=None):
     ]
     files.sort(key=sort_key)
 
-    # Clean up incomplete shards (STARTED but not DONE)
-    if os.path.isdir(args.staging_dir):
-        for subdir in os.listdir(args.staging_dir):
-            subdir_path = os.path.join(args.staging_dir, subdir)
-            if not os.path.isdir(subdir_path):
-                continue
-            started = os.path.exists(os.path.join(subdir_path, 'STARTED.txt'))
-            done = os.path.exists(os.path.join(subdir_path, 'DONE.txt'))
-            if started and not done:
-                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [build_all] Clearing incomplete shard: {subdir}", flush=True)
-                for fname in os.listdir(subdir_path):
-                    if fname.endswith('.jsonl.zst') or fname.endswith('.parquet') or fname == 'FAILED.txt':
-                        os.remove(os.path.join(subdir_path, fname))
-                # Also remove stale STARTED.txt so it gets a fresh timestamp
-                os.remove(os.path.join(subdir_path, 'STARTED.txt'))
+    # an unfinished shard (no DONE.txt) is cleared by prepare_shard just before it is redone
 
     all_slots = []
     finished_count = 0
@@ -116,29 +153,17 @@ def main(argv=None):
 
         log_prefix = f"[{counter+1}/{len(files)}]"
         # Each job gets a subdirectory under the staging dir named after the input file
-        basename = os.path.basename(file)
-        for suffix in ('.mwrev.zst',):
-            if basename.endswith(suffix):
-                basename = basename[:-len(suffix)]
-                break
-        else:
-            basename = os.path.splitext(basename)[0]
-        job_staging_dir = os.path.join(args.staging_dir, basename)
+        job_staging_dir = os.path.join(args.staging_dir, shard_name(file))
 
         # Skip already-completed shards
-        if os.path.exists(os.path.join(job_staging_dir, 'DONE.txt')):
+        if shard_done(job_staging_dir):
             print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {log_prefix} [skip] {file} (already done)", flush=True)
             finished_count += 1
             continue
 
-        process = subprocess.Popen([
-            sys.executable, "-m", "wcd_pipeline.extract", file,
-            "-o", job_staging_dir,
-            "--domain", args.domain,
-            "--parquet-dir", args.parquet_dir,
-            "--batch-size", os.environ.get("BATCH_SIZE", "1000"),
-            "--batch-bytes", os.environ.get("BATCH_BYTES", str(32 * 2**20)),
-        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        prepare_shard(job_staging_dir)
+        process = subprocess.Popen(extract_command(file, job_staging_dir, args.domain, args.parquet_dir),
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
         slot = ProcessSlot(process, log_prefix, file, job_staging_dir)
         all_slots.append(slot)
@@ -185,17 +210,11 @@ def cleanup_finished_processes(process_queue, all_slots):
         else:
             slot.finished = True
             newly_done += 1
-            os.makedirs(slot.job_staging_dir, exist_ok=True)
             code = slot.process.returncode
-            if code == 0:
-                # Write DONE.txt with current timestamp
-                with open(os.path.join(slot.job_staging_dir, 'DONE.txt'), 'w') as f:
-                    f.write(datetime.now(timezone.utc).isoformat() + '\n')
-            else:
-                # a crashed or killed worker (an OOM kill is -9) leaves STARTED.txt without DONE.txt,
-                # so the next run clears and redoes the shard; the run as a whole fails
-                with open(os.path.join(slot.job_staging_dir, 'FAILED.txt'), 'w') as f:
-                    f.write(f"{datetime.now(timezone.utc).isoformat()} exit code {code}\n")
+            # a crashed or killed worker (an OOM kill is -9) gets FAILED.txt and no DONE.txt,
+            # so the next run clears and redoes the shard; the run as a whole fails
+            mark_shard(slot.job_staging_dir, code)
+            if code != 0:
                 FAILED_SHARDS.append((slot.filepath, code))
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {slot.log_prefix} [FAILED] {slot.filepath} (exit code {code})", flush=True)
             # Release subprocess resources
