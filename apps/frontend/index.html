@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Wikipedia Citations Database</title>
-    <link rel="stylesheet" href="/static/article.css?v=v4-20261114" />
+    <link rel="stylesheet" href="/static/article.css?v=v4-20261114b" />
   </head>
   <body>
     <div class="page">
@@ -18,8 +18,10 @@
         <form id="url-form" class="lookup-form">
           <div class="field field-grow">
             <label for="article-url">Article URL</label>
-            <input id="article-url" type="url" placeholder="https://en.wikipedia.org/wiki/Hubble_Space_Telescope"
-                   autocomplete="off" spellcheck="false" required />
+            <!-- type="text": a browser's url validation would refuse "en.wikipedia.org/wiki/X" (no scheme),
+                 which /api/v2/article accepts; an empty field looks up the example (the placeholder) -->
+            <input id="article-url" type="text" inputmode="url" placeholder="https://en.wikipedia.org/wiki/Hubble_Space_Telescope"
+                   autocomplete="off" spellcheck="false" />
           </div>
           <button type="submit" class="btn btn-primary">Look up</button>
           <button id="random-button" type="button" class="btn">Random article</button>
@@ -147,6 +149,6 @@
       </main>
     </div>
 
-    <script src="/static/app.js?v=v4-20261114" defer></script>
+    <script src="/static/app.js?v=v4-20261114b" defer></script>
   </body>
 </html>

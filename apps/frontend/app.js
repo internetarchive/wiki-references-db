@@ -604,8 +604,10 @@ function renderChanges(points) {
 
 $("url-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  const value = $("article-url").value.trim();
-  if (value) lookUpUrl(value);
+  const input = $("article-url");
+  // an empty field looks up the example shown in it, which is what "Look up" suggests
+  if (!input.value.trim()) input.value = input.placeholder;
+  lookUpUrl(input.value.trim());
 });
 
 $("random-button").addEventListener("click", loadRandom);
