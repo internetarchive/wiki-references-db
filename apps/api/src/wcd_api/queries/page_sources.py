@@ -39,7 +39,7 @@ ABSENCE_MERGE_DAYS = 7
 STATUSES = ("all", "current", "removed")
 #: sort → ORDER BY on page_source_summary (the gap-free span stands in for time on page)
 SORTS = {
-    "longest": "(p.last_seen - p.first_seen) DESC NULLS LAST",
+    "longest": "(p.last_seen - p.first_seen) DESC NULLS LAST",   # first to last seen; "lasted" (below) is exact
     "uses": "p.n_citations DESC NULLS LAST",
     "recent": "p.first_seen DESC NULLS LAST",
 }
@@ -86,9 +86,10 @@ def _form_label(citation_type: str | None, reference_type: int | None, current: 
     return "Full citation"
 
 
-def _duck_facts(db: Database, domain: str, page_id: int, gids: list[str]):
+def _duck_facts(db: Database, domain: str, page_id: int, gids: list[str], details: bool = True):
     """(revisions [(id, ts)], runs {gid: [(lo, hi)]}, forms rows, reuse rows) for ``gids`` on the page.
-    Positions are 0-based indexes into the revisions list."""
+    Positions are 0-based indexes into the revisions list. ``details=False``: runs only (forms and
+    reuses empty), for ranking every source of a page by how long it lasted."""
     duck = db.duck()
     try:
         db.bind(duck, domain, page_id, ("revisions", "citation_history", "citation_instances_denorm", "named_ref_uses"))
@@ -107,12 +108,18 @@ def _duck_facts(db: Database, domain: str, page_id: int, gids: list[str]):
             SELECT h.citation_instance_id, r.pos FROM citation_history h JOIN r USING (revision_id)
             WHERE h.page_id = ? AND h.citation_instance_id IN (SELECT citation_instance_id FROM i)""", [page_id])
         latest = len(revs) - 1
-        runs: dict[str, list[tuple[int, int]]] = {}
-        for g, lo, hi in duck.execute("""
-                WITH p AS (SELECT DISTINCT i.g, pr.pos FROM pr JOIN i USING (citation_instance_id))
-                SELECT g, min(pos), max(pos) FROM (SELECT g, pos, pos - row_number() OVER (PARTITION BY g ORDER BY pos) AS k FROM p)
-                GROUP BY g, k ORDER BY g, 2""").fetchall():
-            runs.setdefault(g, []).append((int(lo), int(hi)))
+        # runs per instance (a window over each instance's positions), merged per source in Python:
+        # half the time of a DISTINCT (source, position) over the join on a big page (United States:
+        # 2.3 s against 4.9 s for 3,487 sources), same runs. dense_rank tolerates duplicate rows.
+        inst_runs = duck.execute("""
+            SELECT citation_instance_id, min(pos), max(pos)
+            FROM (SELECT citation_instance_id, pos,
+                         pos - dense_rank() OVER (PARTITION BY citation_instance_id ORDER BY pos) AS k FROM pr)
+            GROUP BY citation_instance_id, k""").fetchall()
+        inst_sources = duck.execute("SELECT DISTINCT citation_instance_id, g FROM i").fetchall()
+        runs = _merge_runs(inst_runs, inst_sources)
+        if not details:
+            return revs, runs, [], []
         forms = duck.execute("""
             SELECT i.g, i.normalized_sha1, any_value(i.normalized_id), any_value(i.citation_type),
                    min(i.reference_type), any_value(i.reference_name), min(pr.pos), max(pr.pos),
@@ -160,6 +167,64 @@ def _intervals(runs: list[tuple[int, int]], revs, current: bool):
     return intervals, events, days
 
 
+def _merge_runs(inst_runs, inst_sources) -> dict[str, list[tuple[int, int]]]:
+    """Per-instance runs of revision positions → per-source runs: the union of its instances'
+    ranges, overlapping or adjacent ones joined (an instance replaced by another in the next
+    revision keeps the source present)."""
+    sources_of: dict[int, list[str]] = {}
+    for c, g in inst_sources:
+        sources_of.setdefault(c, []).append(g)
+    ranges: dict[str, list[tuple[int, int]]] = {}
+    for c, lo, hi in inst_runs:
+        for g in sources_of.get(c, ()):
+            ranges.setdefault(g, []).append((int(lo), int(hi)))
+    runs: dict[str, list[tuple[int, int]]] = {}
+    for g, rs in ranges.items():
+        rs.sort()
+        out: list[list[int]] = []
+        for lo, hi in rs:
+            if out and lo <= out[-1][1] + 1:
+                out[-1][1] = max(out[-1][1], hi)
+            else:
+                out.append([lo, hi])
+        runs[g] = [(lo, hi) for lo, hi in out]
+    return runs
+
+
+def _revisions_present(runs: list[tuple[int, int]]) -> int:
+    return sum(hi - lo + 1 for lo, hi in runs)
+
+
+#: (domain, page_id, status) → global source ids ranked by how long they lasted. The build does not
+#: change under a running service (a refresh restarts it), so a page's ranking is computed once per
+#: worker and "Show more" pages through it without recomputing (United States: ~3 s the first time).
+_LASTED_CACHE: dict[tuple[str, int, str], list[str]] = {}
+_LASTED_CACHE_MAX = 256
+
+
+def _rank_by_lasted(db: Database, domain: str, page_id: int, status: str, rows):
+    """``rows`` ordered by how long each source lasted on the page: time on the page (intervals,
+    short absences merged) descending, except that a source present in a single revision comes
+    after every source that lasted longer — one revision before a long lull can span weeks, and
+    is most likely an edit that was reverted, not a source the article relied on."""
+    key = (domain, page_id, status)
+    order = _LASTED_CACHE.get(key)
+    if order is None or len(order) != len(rows):
+        revs, runs, _, _ = _duck_facts(db, domain, page_id, [r["global_source_id"] for r in rows], details=False)
+
+        def rank(r):
+            g = r["global_source_id"]
+            days = _intervals(runs.get(g, []), revs, bool(r["is_current"]))[2] if revs else 0.0
+            return (_revisions_present(runs.get(g, [])) > 1, days, g)
+
+        order = [r["global_source_id"] for r in sorted(rows, key=rank, reverse=True)]
+        if len(_LASTED_CACHE) >= _LASTED_CACHE_MAX:
+            _LASTED_CACHE.pop(next(iter(_LASTED_CACHE)))      # oldest first
+        _LASTED_CACHE[key] = order
+    by_id = {r["global_source_id"]: r for r in rows}
+    return [by_id[g] for g in order if g in by_id]
+
+
 def _canonical_parts(con, shas: list[str]) -> dict[str, dict]:
     if not shas:
         return {}
@@ -175,22 +240,32 @@ def get_page_sources(db: Database, domain: str, page_id: int, status: str = "all
                      limit: int = 10, offset: int = 0) -> PageSourcesResponse:
     if status not in STATUSES:
         raise BadRequest(f"status must be one of {', '.join(STATUSES)}")
-    if sort not in SORTS:
-        raise BadRequest(f"sort must be one of {', '.join(SORTS)}")
+    if sort not in SORTS and sort != "lasted":
+        raise BadRequest(f"sort must be one of {', '.join([*SORTS, 'lasted'])}")
     where = {"all": "", "current": "AND p.is_current", "removed": "AND NOT p.is_current"}[status]
+    columns = """p.global_source_id, p.author_key, p.year, p.title, p.extracted_doi, p.extracted_isbn, p.extracted_pmid,
+                 p.extracted_pmc, p.extracted_arxiv, p.extracted_wikidata_qid, p.extracted_librarybase_id, p.extracted_url,
+                 p.source_type, p.match_type, p.first_seen, p.last_seen, p.is_current, gs.n_pages, gs.canonical_part_sha1"""
     with db.connect() as con:
         domain_id = require_domain_id(db, con, domain)
         n_all, n_cur = con.execute(text(
             "SELECT count(*), count(*) FILTER (WHERE is_current) FROM page_source_summary WHERE domain_id = :d AND page_id = :p"),
             {"d": domain_id, "p": page_id}).one()
-        rows = con.execute(text(f"""
-            SELECT p.global_source_id, p.author_key, p.year, p.title, p.extracted_doi, p.extracted_isbn, p.extracted_pmid,
-                   p.extracted_pmc, p.extracted_arxiv, p.extracted_wikidata_qid, p.extracted_librarybase_id, p.extracted_url,
-                   p.source_type, p.match_type, p.first_seen, p.last_seen, p.is_current, gs.n_pages, gs.canonical_part_sha1
-            FROM page_source_summary p JOIN global_sources gs USING (global_source_id)
-            WHERE p.domain_id = :d AND p.page_id = :p {where}
-            ORDER BY {SORTS[sort]}, p.global_source_id LIMIT :l OFFSET :o"""),
-            {"d": domain_id, "p": page_id, "l": limit, "o": offset}).mappings().all()
+        if sort == "lasted":
+            # every matching source, ranked below by how long it actually lasted on the page
+            rows = con.execute(text(f"""
+                SELECT {columns} FROM page_source_summary p JOIN global_sources gs USING (global_source_id)
+                WHERE p.domain_id = :d AND p.page_id = :p {where} ORDER BY p.global_source_id"""),
+                {"d": domain_id, "p": page_id}).mappings().all()
+        else:
+            rows = con.execute(text(f"""
+                SELECT {columns} FROM page_source_summary p JOIN global_sources gs USING (global_source_id)
+                WHERE p.domain_id = :d AND p.page_id = :p {where}
+                ORDER BY {SORTS[sort]}, p.global_source_id LIMIT :l OFFSET :o"""),
+                {"d": domain_id, "p": page_id, "l": limit, "o": offset}).mappings().all()
+    if sort == "lasted":
+        rows = _rank_by_lasted(db, domain, page_id, status, rows)[offset:offset + limit]
+    with db.connect() as con:
         canon = _canonical_parts(con, sorted({r["canonical_part_sha1"] for r in rows if r["canonical_part_sha1"]}))
 
     gids = [r["global_source_id"] for r in rows]
@@ -265,7 +340,8 @@ def get_page_sources(db: Database, domain: str, page_id: int, status: str = "all
                                  "extracted_url", "source_type", "match_type", "first_seen", "last_seen")},
             source_key=source_key(r), author=author.title() if author and author.islower() else author,
             publication=(c.get("journal") or c.get("publisher") or None), kind=kind, is_current=bool(r["is_current"]),
-            days_on_page=round(days, 1), uses_latest=sum(f.uses_latest for f in forms if f.current),
+            days_on_page=round(days, 1), revisions_on_page=_revisions_present(runs.get(g, [])),
+            uses_latest=sum(f.uses_latest for f in forms if f.current),
             other_pages=max(0, int(r["n_pages"] or 1) - 1), intervals=intervals, events=deduped, forms=forms))
 
     return PageSourcesResponse(

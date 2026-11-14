@@ -237,7 +237,10 @@ function applyFilter() {
   document.querySelectorAll(".filter").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.status === state.status)));
   $("current-block").classList.toggle("hidden", state.status === "removed");
   $("removed-block").classList.toggle("hidden", state.status === "current");
+  // the sort menu orders current sources; removed ones are always by how long they lasted
   $("sort").value = state.sort;
+  $("sort").classList.toggle("hidden", state.status === "removed");
+  $("sort-label").classList.toggle("hidden", state.status === "removed");
 }
 
 async function loadSources(status, append) {
@@ -253,7 +256,10 @@ async function loadSources(status, append) {
     more.classList.add("hidden");
   }
   more.disabled = true;
-  const query = new URLSearchParams({ status, sort: state.sort, limit: String(PAGE_SIZE[status]), offset: String(list.offset) });
+  // removed sources: longest-lasting first, single-revision ones (probably reverted at once) last;
+  // the sort menu orders the current sources
+  const sort = status === "removed" ? "lasted" : state.sort;
+  const query = new URLSearchParams({ status, sort, limit: String(PAGE_SIZE[status]), offset: String(list.offset) });
   try {
     const result = await fetchJson(`${pagePath(state.domain, state.pageId, "sources")}?${query}`);
     if (token !== list.token) return;
@@ -280,7 +286,7 @@ function renderCounts(counts) {
   $("count-current").textContent = fmtInt(counts.current);
   $("count-removed").textContent = fmtInt(counts.removed);
   document.querySelectorAll("[data-count]").forEach((s) => (s.textContent = fmtInt(counts[s.dataset.count])));
-  $("removed-summary").textContent = `${plural(counts.removed, "source")} that ${counts.removed === 1 ? "was" : "were"} cited at some point and ${counts.removed === 1 ? "is" : "are"} not in the latest revision.`;
+  $("removed-summary").textContent = `${plural(counts.removed, "source")} that ${counts.removed === 1 ? "was" : "were"} cited at some point and ${counts.removed === 1 ? "is" : "are"} not in the latest revision. Longest-lasting first; those that lasted a single revision (most likely reverted at once) come last.`;
 }
 
 function sourceHref(source) {
@@ -402,8 +408,10 @@ function whenLine(source) {
     add("still cited");
     add(`${fmtDuration(source.days_on_page)} on the page`);
     add(plural(source.uses_latest, "use") + " in the latest revision");
+  } else if (source.revisions_on_page === 1) {
+    add("lasted a single revision");
   } else {
-    add(`on the page for ${fmtDuration(source.days_on_page)}`);
+    add(`on the page for ${fmtDuration(source.days_on_page)} (${plural(source.revisions_on_page, "revision")})`);
   }
   return parts;
 }
@@ -649,7 +657,6 @@ $("sort").addEventListener("change", () => {
   state.sort = $("sort").value;
   window.history.replaceState({}, "", reportUrl({ domain: state.domain, page_id: state.pageId, ...extraParams() }));
   loadSources("current", false);
-  loadSources("removed", false);
 });
 
 $("current-more").addEventListener("click", () => loadSources("current", true));

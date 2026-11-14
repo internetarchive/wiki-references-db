@@ -409,6 +409,7 @@ class PageSource(Identifiers):
     first_seen: datetime | None = None
     last_seen: datetime | None = None
     days_on_page: float = Field(..., description="time on the page, summed over its intervals")
+    revisions_on_page: int = Field(..., description="revisions of the page that cite it (1: probably reverted at once)")
     uses_latest: int = Field(..., description="citations of it in the latest revision, named reuses included")
     other_pages: int = Field(..., description="other pages whose citations resolve to this source")
     intervals: list[SourceInterval]

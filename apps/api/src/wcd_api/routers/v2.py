@@ -46,7 +46,9 @@ def page_top_sources(request: Request, domain: str, page_id: int = Path(..., ge=
 @router.get("/pages/{domain}/{page_id}/sources", response_model=models.PageSourcesResponse, tags=["pages"])
 def page_sources(request: Request, domain: str, page_id: int = Path(..., ge=1),
                  status: str = Query("all", description="all | current | removed"),
-                 sort: str = Query("longest", description="longest (time on page) | uses | recent (recently added)"),
+                 sort: str = Query("longest", description="longest (first to last seen) | lasted (actual time on the page; "
+                                                          "single-revision sources last; the article page's removed list) "
+                                                          "| uses | recent (recently added)"),
                  limit: int = Query(10, ge=1, le=50), offset: int = Query(0, ge=0)):
     """Every source cited on the page, with its time on the page (intervals and the added /
     removed / restored / form-change events) and each wikitext form it was cited in."""

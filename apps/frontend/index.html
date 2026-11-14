@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Wikipedia Citations Database</title>
-    <link rel="stylesheet" href="/static/article.css?v=v4-20261114b" />
+    <link rel="stylesheet" href="/static/article.css?v=v4-20261114c" />
   </head>
   <body>
     <div class="page">
@@ -81,7 +81,7 @@
                 <button type="button" class="filter" data-status="all" aria-pressed="true">All <span data-count="all"></span></button>
                 <button type="button" class="filter" data-status="current" aria-pressed="false">Current <span data-count="current"></span></button>
                 <button type="button" class="filter" data-status="removed" aria-pressed="false">Removed <span data-count="removed"></span></button>
-                <label for="sort">Sort</label>
+                <label id="sort-label" for="sort">Sort current</label>
                 <select id="sort">
                   <option value="longest">Longest on page</option>
                   <option value="uses">Most uses</option>
@@ -149,6 +149,6 @@
       </main>
     </div>
 
-    <script src="/static/app.js?v=v4-20261114b" defer></script>
+    <script src="/static/app.js?v=v4-20261114c" defer></script>
   </body>
 </html>

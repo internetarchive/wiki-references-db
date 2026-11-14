@@ -158,6 +158,15 @@ def test_page_sources(client):
     assert all(x["is_current"] for x in cur["sources"]) and not any(x["is_current"] for x in rem["sources"])
     s, page = get(client, f"/api/v2/pages/{D}/{PAGE_A}/sources", status="current", sort="uses", limit=1, offset=1)
     assert s == 200 and len(page["sources"]) == 1 and page["sources"][0]["global_source_id"] == cur["sources"][1]["global_source_id"]
+    # lasted: sources present in more than one revision first, longest time on the page first;
+    # single-revision ones (probably reverted at once) last
+    s, las = get(client, f"/api/v2/pages/{D}/{PAGE_A}/sources", status="removed", sort="lasted", limit=50)
+    assert s == 200 and las["total"] == c["removed"] and len(las["sources"]) == c["removed"]
+    keys = [(x["revisions_on_page"] > 1, x["days_on_page"]) for x in las["sources"]]
+    assert keys == sorted(keys, reverse=True)
+    assert all(x["revisions_on_page"] >= 1 for x in j["sources"])
+    s, one = get(client, f"/api/v2/pages/{D}/{PAGE_A}/sources", status="removed", sort="lasted", limit=1, offset=1)
+    assert [x["global_source_id"] for x in one["sources"]] == [las["sources"][1]["global_source_id"]]
     assert get(client, f"/api/v2/pages/{D}/{PAGE_A}/sources", status="gone")[0] == 400
     assert get(client, f"/api/v2/pages/{D}/{PAGE_A}/sources", sort="alphabetical")[0] == 400
     assert get(client, "/api/v2/pages/xx.wikipedia.org/101/sources")[0] == 404
