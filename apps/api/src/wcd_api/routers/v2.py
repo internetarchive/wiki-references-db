@@ -5,6 +5,7 @@ from fastapi import APIRouter, Path, Query, Request
 
 from .. import models
 from ..queries import article, citations, lookup, pages, sources
+from ..queries import page_sources as page_sources_q
 
 router = APIRouter(prefix="/api/v2")
 
@@ -40,6 +41,18 @@ def page_timeline(request: Request, domain: str, page_id: int = Path(..., ge=1))
 @router.get("/pages/{domain}/{page_id}/top-sources", response_model=models.PageTopSourcesResponse, tags=["pages"])
 def page_top_sources(request: Request, domain: str, page_id: int = Path(..., ge=1), limit: int = Query(10, ge=1, le=50)):
     return pages.get_top_sources(_db(request), domain, page_id, limit)
+
+
+@router.get("/pages/{domain}/{page_id}/sources", response_model=models.PageSourcesResponse, tags=["pages"])
+def page_sources(request: Request, domain: str, page_id: int = Path(..., ge=1),
+                 status: str = Query("all", description="all | current | removed"),
+                 sort: str = Query("longest", description="longest (first to last seen) | lasted (actual time on the page; "
+                                                          "single-revision sources last; the article page's removed list) "
+                                                          "| uses | recent (recently added)"),
+                 limit: int = Query(10, ge=1, le=50), offset: int = Query(0, ge=0)):
+    """Every source cited on the page, with its time on the page (intervals and the added /
+    removed / restored / form-change events) and each wikitext form it was cited in."""
+    return page_sources_q.get_page_sources(_db(request), domain, page_id, status, sort, limit, offset)
 
 
 @router.get("/sources", response_model=models.SourceLookupResponse, tags=["sources"])

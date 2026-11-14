@@ -1,53 +1,65 @@
-# apps/frontend — the dashboard
+# apps/frontend — the article page and the report pages
 
-The page-level citation analytics dashboard: the UVA analytics frontend
-(`UVAWikipediaCitationsDatabase/src/analytics_service/frontend`, commit
-`29f3ae3`) adapted to the `/api/v2` service per
-`docs/design/proposed_frontend.md`. Plain HTML, CSS and JavaScript — no build
-step. `wcd-api` serves this directory at `/` (`/static/…` for the assets)
-whenever it exists next to `apps/api`; any static file server works too, as
-long as `/api/v2` is reachable on the same origin.
+Plain HTML, CSS and JavaScript, no build step and no third-party scripts.
+`wcd-api` serves this directory at `/` (`/static/…` for the assets) whenever it
+exists next to `apps/api`; any static file server works too, as long as
+`/api/v2` is reachable on the same origin.
 
-Changes from the UVA original:
+## The article page (`index.html`, `app.js`, `article.css`)
 
-* `API_BASE = /api/v2`; every page call is domain-qualified
-  (`/pages/{domain}/{page_id}/…`); the form has a wiki-domain field and the
-  page field accepts a page ID **or an article URL** (resolved through
-  `/api/v2/article`). Links carry `?domain=…&page_id=…`; `#domain/page_id`
-  is accepted too.
-* Site links (page, revision, diff) are built from the loaded page's `domain`;
-  related-page links use each page's own domain (the source-pages endpoint is
-  cross-domain).
-* Branding: Wikipedia Citations Database; no engine names in the copy.
-* Identifier badges and links are data-driven over the canonical set (DOI,
-  ISBN, PMID, PMC, arXiv, Wikidata, LibraryBase, URL).
-* Timeline: "named refs" became "reuses" (`named_ref_count` now counts
-  self-closing `<ref name=…/>` reuse events), `high_confidence_count` is a
-  second (dashed) series, a tooltip line and a highlight stat; the six
-  citation types have display labels.
-* Errors follow the v2 `{"error", "code"}` shape (FastAPI's `detail` is still
-  understood).
+"Look up a Wikipedia article": paste an article URL (any tracked wiki), pick a
+random article, or look up by domain and page ID. The page then shows, top to
+bottom:
 
-Ported from the v1 Citation Explorer (`legacy/explorer.py`):
+* **The article**: title, wiki, links to the article and to this report, the
+  number of sources cited now and removed, and a strip of edits per year over
+  the article's tracked history (from `/timeline`).
+* **Sources on this article** (`/api/v2/pages/{d}/{id}/sources`), filtered by
+  All / Current / Removed and sorted by time on page, uses, or recently added.
+  Each source is a card:
+  * its title (linked to its URL or identifier), its durable `source_key`
+    (`doi:…`, `isbn:…`, …; a `part:` content hash when it has no standard
+    identifier), author, year and publication, and badges for its kind and
+    identifiers ("Not yet identified" when it has neither title nor
+    identifier: the wikitext leads the card instead);
+  * a bar of its time on the page, on the same timeline as the strip above:
+    one segment per stretch on the page (absences under a week are merged),
+    a mark where it was converted to short-form citations, a red mark where it
+    was removed. Every segment and mark links to that revision's diff;
+  * "Added … · removed … · restored … · still cited · N years on the page · N uses
+    in the latest revision", each date a diff link (long churn is summarised);
+  * every wikitext form it is cited in on the page: full citation,
+    bibliography entry, short form (`{{sfn}}`), named reuse
+    (`<ref name="…" />`), and earlier forms (struck through, the rest folded),
+    each with its dates and uses, links to the revisions and pages with that
+    wikitext, and its template parameters with **Find matches** links;
+  * other articles citing the source.
 
-* **Citations section** on the dashboard: the citations at the latest revision (or the
-  revision picked with "Citations at this revision" in the timeline inspector), 25 at a
-  time, with badges, the normalized text, first/last seen, extracted links and template
-  parameters. Each card links to the report pages.
-* **Report pages** (`reports.html` + `reports.js`, served by `wcd-api` at the paths
-  below; the script routes on the path):
-  * `/citations/{sha1}?domain=&page_id=` — every revision containing the citation, on
-    one page or (for citations on ≤ 25 pages) every page. Was `/explorer/citation/{sha1}/report`.
-  * `/citations/{sha1}/pages?domain=&page_id=` — the pages citing it, by title, the
-    current page highlighted. Was `/explorer/citation/{sha1}/other-articles`.
-  * `/templates/report?domain=&template=&parameter_key=&parameter_value=` — citations whose
-    template (by name) has that parameter value ("Find matches" on a parameter). Was
-    `/explorer/template/{id}/report`.
-  * `/templates/report?legacy_id=…` — landing page for an old template link whose id
-    could not be translated.
-* `?url=<article URL>` loads a page by URL (old `/explorer/article?url=` links redirect here).
+  Removed sources follow in their own section, dashed, with their last
+  wikitext.
+* **Article metrics**: references over time (an inline SVG from `/timeline`),
+  the largest changes (diff links), citation types and templates in the latest
+  revision, and source kinds (from `/summary`).
 
-The explorer's revision slider is not ported; the timeline plays that role.
+Links carry `?domain=…&page_id=…` (plus `status`/`sort` when not the defaults);
+`#domain/page_id` and `?url=<article URL>` (where old `/explorer/article?url=`
+links redirect) are accepted too.
 
-ECharts is loaded from jsDelivr as before; without it the page degrades to the
-textual timeline inspector and highlights.
+## Report pages (`reports.html`, `reports.js`)
+
+Served by `wcd-api` at these paths; the script routes on the path:
+
+* `/citations/{sha1}?domain=&page_id=`: every revision containing the citation,
+  on one page or (for citations on ≤ 25 pages) every page. Was
+  `/explorer/citation/{sha1}/report`.
+* `/citations/{sha1}/pages?domain=&page_id=`: the pages citing it, by title,
+  the current page highlighted. Was `/explorer/citation/{sha1}/other-articles`.
+* `/sources/{global_source_id}/pages?domain=&page_id=`: the pages citing a
+  source, most citations first (the page you came from is left out).
+* `/templates/report?domain=&template=&parameter_key=&parameter_value=`:
+  citations whose template (by name) has that parameter value. Was
+  `/explorer/template/{id}/report`.
+* `/templates/report?legacy_id=…`: landing page for an old template link whose
+  ID could not be translated.
+
+The report pages keep the earlier stylesheet (`styles.css`).

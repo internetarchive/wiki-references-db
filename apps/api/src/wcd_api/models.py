@@ -357,6 +357,86 @@ class CitationPagesResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# The article page: each source with its time on the page and wikitext forms
+# ---------------------------------------------------------------------------
+
+class SourceInterval(BaseModel):
+    """A stretch of revisions with the source on the page (absences shorter than
+    ``ABSENCE_MERGE_DAYS`` — vandalism and its revert — are merged into it)."""
+    start_revision_id: int
+    start: datetime | None
+    end_revision_id: int = Field(..., description="the last revision with the source in this stretch")
+    end: datetime | None
+    removed_revision_id: int | None = Field(None, description="the revision that removed it; null while still cited")
+    removed_at: datetime | None = None
+
+
+class SourceEvent(BaseModel):
+    kind: str = Field(..., description="added | removed | restored | form_changed")
+    revision_id: int
+    timestamp: datetime | None
+    label: str | None = None
+
+
+class SourceForm(BaseModel):
+    """One wikitext form the source is cited in on this page: a normalized citation,
+    or the named reuse ``<ref name="…" />`` of one."""
+    label: str = Field(..., description="Full citation | Named reuse | Bibliography | Short form | Earlier form")
+    wikitext: str
+    normalized_sha1: str | None = None
+    citation_type: str | None = None
+    reference_name: str | None = None
+    first_revision_id: int | None = None
+    first_seen: datetime | None = None
+    last_revision_id: int | None = None
+    last_seen: datetime | None = None
+    current: bool
+    uses_latest: int = Field(..., description="uses in the latest revision")
+    templates: list[TemplateUse] = []
+
+
+class PageSource(Identifiers):
+    global_source_id: str = Field(..., description=GLOBAL_SOURCE_ID_DESCRIPTION)
+    source_key: str | None = Field(None, description=SOURCE_KEY_DESCRIPTION)
+    title: str | None = None
+    author: str | None = None
+    year: str | None = None
+    publication: str | None = Field(None, description="journal, else publisher, of the source's canonical citation")
+    kind: str | None = Field(None, description="Book | Journal article | News | Web page; null when unknown")
+    source_type: str | None = None
+    match_type: str | None = None
+    is_current: bool
+    first_seen: datetime | None = None
+    last_seen: datetime | None = None
+    days_on_page: float = Field(..., description="time on the page, summed over its intervals")
+    revisions_on_page: int = Field(..., description="revisions of the page that cite it (1: probably reverted at once)")
+    uses_latest: int = Field(..., description="citations of it in the latest revision, named reuses included")
+    other_pages: int = Field(..., description="other pages whose citations resolve to this source")
+    intervals: list[SourceInterval]
+    events: list[SourceEvent]
+    forms: list[SourceForm]
+
+
+class SourceCounts(BaseModel):
+    all: int
+    current: int
+    removed: int
+
+
+class PageSourcesResponse(BaseModel):
+    domain: str
+    page_id: int
+    status: str
+    sort: str
+    first_revision_timestamp: datetime | None = None
+    latest_revision_id: int | None = None
+    latest_revision_timestamp: datetime | None = None
+    counts: SourceCounts
+    total: int = Field(..., description="sources matching status")
+    sources: list[PageSource]
+
+
+# ---------------------------------------------------------------------------
 # Group 4
 # ---------------------------------------------------------------------------
 

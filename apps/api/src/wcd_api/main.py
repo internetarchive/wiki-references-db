@@ -80,7 +80,8 @@ def create_app(settings: Settings | None = None, *, title_resolver=resolve_title
         def report_page():
             return FileResponse(frontend_dir / "reports.html")
 
-        for path in ("/citations/{normalized_sha1}", "/citations/{normalized_sha1}/pages", "/templates/report"):
+        for path in ("/citations/{normalized_sha1}", "/citations/{normalized_sha1}/pages", "/templates/report",
+                     "/sources/{global_source_id}/pages"):
             app.add_api_route(path, report_page, methods=["GET"], include_in_schema=False)
 
     return app

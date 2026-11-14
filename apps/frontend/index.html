@@ -4,265 +4,151 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Wikipedia Citations Database</title>
-    <link rel="stylesheet" href="/static/styles.css?v=v3-20261113" />
+    <link rel="stylesheet" href="/static/article.css?v=v4-20261114c" />
   </head>
   <body>
-    <div class="page-shell">
-      <header class="hero">
-        <nav class="site-nav" aria-label="Analytics navigation">
-          <a class="site-nav-link is-active" href="/">Page Analytics</a>
-        </nav>
-        <p class="eyebrow">Wikipedia Citations Database</p>
-        <h1>Page-Level Citation Analytics</h1>
-        <p class="hero-copy">
-          Explore the citation structure of individual Wikipedia pages across their revision history. Start with a page ID or article URL, or jump to a random page.
+    <div class="page">
+      <header class="lookup">
+        <p class="eyebrow"><a href="/">Wikipedia Citations Database</a></p>
+        <h1>Look Up a Wikipedia Article</h1>
+        <p class="lede">
+          Paste a link to an article to see every source it has cited, how each one is written in the wikitext,
+          and when it was added or removed.
         </p>
+        <form id="url-form" class="lookup-form">
+          <div class="field field-grow">
+            <label for="article-url">Article URL</label>
+            <!-- type="text": a browser's url validation would refuse "en.wikipedia.org/wiki/X" (no scheme),
+                 which /api/v2/article accepts; an empty field looks up the example (the placeholder) -->
+            <input id="article-url" type="text" inputmode="url" placeholder="https://en.wikipedia.org/wiki/Hubble_Space_Telescope"
+                   autocomplete="off" spellcheck="false" />
+          </div>
+          <button type="submit" class="btn btn-primary">Look up</button>
+          <button id="random-button" type="button" class="btn">Random article</button>
+        </form>
+        <p class="hint">
+          Any tracked wiki works. Have a page ID instead?
+          <button id="pageid-toggle" type="button" class="linkish" aria-expanded="false" aria-controls="pageid-form">Look up by page ID</button>
+        </p>
+        <form id="pageid-form" class="pageid-form hidden">
+          <div class="field">
+            <label for="domain-input">Wiki domain</label>
+            <input id="domain-input" type="text" value="en.wikipedia.org" autocomplete="off" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="page-id-input">Page ID</label>
+            <input id="page-id-input" type="text" inputmode="numeric" pattern="[0-9]+" autocomplete="off" />
+          </div>
+          <button type="submit" class="btn btn-primary">Look up</button>
+        </form>
+        <p id="status" class="status" aria-live="polite"></p>
       </header>
 
-      <main class="dashboard">
-        <section class="control-panel card">
-          <div class="panel-header">
-            <h2>Explore a Page</h2>
-            <p>Load a page by ID or article URL on any tracked wiki, or pull in a random page summary.</p>
-          </div>
-
-          <form id="page-form" class="page-form">
-            <div class="input-row input-row-domain">
-              <div>
-                <label for="domain-input">Wiki domain</label>
-                <input
-                  id="domain-input"
-                  name="domain"
-                  type="text"
-                  list="domain-options"
-                  value="en.wikipedia.org"
-                  placeholder="en.wikipedia.org"
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-                <datalist id="domain-options"></datalist>
+      <main id="article" class="hidden">
+        <div style="display: flex; flex-direction: column; gap: 32px">
+          <section class="article-head" aria-labelledby="article-title">
+            <div class="article-title-row">
+              <div class="article-title">
+                <h2 id="article-title">Article</h2>
+                <p class="article-meta">
+                  <span id="article-domain"></span> ·
+                  <a id="wiki-link" href="#" target="_blank" rel="noreferrer">Open on Wikipedia</a> ·
+                  <button id="copy-link" type="button" class="linkish">Copy link to this report</button>
+                </p>
               </div>
-              <div>
-                <label for="page-id-input">Page ID or article URL</label>
-                <input
-                  id="page-id-input"
-                  name="page-id"
-                  type="text"
-                  placeholder="307 or https://en.wikipedia.org/wiki/Example"
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-              </div>
-              <button type="submit" class="primary-button">Load Summary</button>
-            </div>
-          </form>
-
-          <div class="button-row">
-            <button id="random-button" type="button" class="secondary-button">
-              Random Page
-            </button>
-          </div>
-
-          <p id="status-message" class="status-message" aria-live="polite">
-            Enter a page ID or article URL, or try a random page.
-          </p>
-        </section>
-
-        <section id="summary-panel" class="summary-panel hidden">
-          <article class="headline-card card">
-            <div class="headline-row">
-              <div>
-                <p class="section-label">Current Page</p>
-                <h2 id="page-title">Untitled Page</h2>
-              </div>
-              <div class="headline-meta headline-meta-wide">
-                <div class="metric-chip">
-                  <span class="metric-label">Wiki</span>
-                  <span id="page-domain" class="metric-value">-</span>
-                </div>
-                <div class="metric-chip">
-                  <span class="metric-label">Page ID</span>
-                  <span id="page-id" class="metric-value">-</span>
-                </div>
-                <div class="metric-chip">
-                  <span class="metric-label">Namespace</span>
-                  <span id="page-namespace" class="metric-value">-</span>
-                </div>
+              <div class="counts">
+                <div class="count"><span id="count-current" class="count-value">–</span><span class="count-label">sources cited now</span></div>
+                <div class="count"><span id="count-removed" class="count-value is-faint">–</span><span class="count-label">sources removed</span></div>
               </div>
             </div>
-            <a
-              id="wikipedia-link"
-              class="wiki-link hidden"
-              href="#"
-              target="_blank"
-              rel="noreferrer"
-            >
-              Open on Wikipedia
-            </a>
-          </article>
-
-          <section class="metrics-grid">
-            <article class="metric-card card">
-              <p class="section-label">Latest Revision</p>
-              <p id="latest-reference-count" class="big-number">0</p>
-              <p class="metric-description">references extracted in latest revision</p>
-            </article>
-
-            <article class="metric-card card">
-              <p class="section-label">Revision Coverage</p>
-              <p id="revision-count" class="big-number">0</p>
-              <p class="metric-description">revisions tracked for this page</p>
-            </article>
-
-            <article class="metric-card card">
-              <p class="section-label">First Seen</p>
-              <p id="first-seen" class="timestamp-value">-</p>
-              <p class="metric-description">earliest revision timestamp for this page</p>
-            </article>
-
-            <article class="metric-card card">
-              <p class="section-label">Latest Seen</p>
-              <p id="latest-seen" class="timestamp-value">-</p>
-              <p class="metric-description">most recent revision timestamp for this page</p>
-            </article>
+            <div class="strip">
+              <div class="strip-head">
+                <span><strong id="revision-count">–</strong> tracked, edits per year</span>
+                <span>First seen <strong id="first-seen">–</strong> · Latest <strong id="latest-seen">–</strong></span>
+              </div>
+              <div id="year-bars" class="strip-bars" aria-hidden="true"></div>
+              <div id="year-axis" class="axis" aria-hidden="true"></div>
+            </div>
           </section>
 
-          <section class="detail-grid detail-grid-three">
-            <article class="card">
-              <div class="section-heading">
-                <h3>Latest Revision Snapshot</h3>
-                <p id="latest-revision-meta" class="muted"></p>
+          <section class="sources" aria-labelledby="sources-title">
+            <div class="section-head">
+              <div>
+                <h3 id="sources-title">Sources on this article</h3>
+                <p>Each source with the wikitext that cites it and its time on the page. Bars share the timeline above.</p>
               </div>
-              <div id="citation-type-chart" class="bar-chart"></div>
-            </article>
+              <div class="controls">
+                <button type="button" class="filter" data-status="all" aria-pressed="true">All <span data-count="all"></span></button>
+                <button type="button" class="filter" data-status="current" aria-pressed="false">Current <span data-count="current"></span></button>
+                <button type="button" class="filter" data-status="removed" aria-pressed="false">Removed <span data-count="removed"></span></button>
+                <label id="sort-label" for="sort">Sort current</label>
+                <select id="sort">
+                  <option value="longest">Longest on page</option>
+                  <option value="uses">Most uses</option>
+                  <option value="recent">Recently added</option>
+                </select>
+              </div>
+            </div>
+            <div class="legend">
+              <span><span class="swatch"></span>On the page</span>
+              <span><span class="tick"></span>Converted to short-form citations</span>
+              <span><span class="swatch is-removed"></span><span class="tick is-removed"></span>Removed</span>
+              <span>Click a bar or mark to open that diff.</span>
+            </div>
 
-            <article class="card">
-              <div class="section-heading">
-                <h3>Reference Breakdown</h3>
-                <p class="muted">Most common template names in the latest revision.</p>
-              </div>
-              <ul id="top-templates-list" class="template-list"></ul>
-            </article>
+            <div id="current-block" class="source-list">
+              <div id="current-list" class="source-list"></div>
+              <p id="current-status" class="list-status" aria-live="polite"></p>
+              <button id="current-more" type="button" class="btn btn-small more hidden"></button>
+            </div>
 
-            <article class="card">
-              <div class="section-heading">
-                <h3>Source Kinds</h3>
-                <p class="muted">
-                  Grouped reference types.
-                </p>
+            <div id="removed-block" class="source-list">
+              <div class="removed-head">
+                <h4>Removed from the article</h4>
+                <p id="removed-summary"></p>
               </div>
-              <div id="source-kind-chart" class="bar-chart"></div>
-            </article>
+              <div id="removed-list" class="source-list"></div>
+              <p id="removed-status" class="list-status" aria-live="polite"></p>
+              <button id="removed-more" type="button" class="btn btn-small more hidden"></button>
+            </div>
           </section>
 
-          <section class="timeline-section">
-            <article class="card">
-              <div class="section-heading">
-                <h3>Revision Timeline</h3>
-                <p class="muted">
-                  Reference count across every tracked revision; the dashed line counts high-confidence sources.
-                </p>
-              </div>
-              <div id="timeline-inspector" class="timeline-inspector" aria-live="polite">
-                <div class="timeline-inspector-copy">
-                  <p id="timeline-inspector-label" class="timeline-inspector-label">
-                    Selected revision
-                  </p>
-                  <p id="timeline-inspector-summary" class="timeline-inspector-summary">
-                    Hover the chart to inspect when tracked counts changed.
-                  </p>
-                  <p id="timeline-inspector-meta" class="timeline-inspector-meta muted"></p>
-                  <p id="timeline-inspector-types" class="timeline-inspector-types muted"></p>
-                </div>
-                <div
-                  id="timeline-inspector-actions"
-                  class="timeline-inspector-actions"
-                ></div>
-              </div>
-              <div id="timeline-chart" class="timeline-chart"></div>
-            </article>
+          <section class="metrics" aria-labelledby="metrics-title">
+            <div class="metrics-head">
+              <h3 id="metrics-title">Article metrics</h3>
+              <p>Reference counts and composition across the tracked history.</p>
+            </div>
+            <div class="metric-grid is-wide">
+              <article class="metric">
+                <h4>References over time</h4>
+                <p id="refs-summary"></p>
+                <svg id="refs-chart" class="chart" viewBox="0 0 600 160" preserveAspectRatio="none" role="img" aria-label="References over time"></svg>
+                <div id="refs-axis" class="chart-axis"></div>
+              </article>
+              <article class="metric">
+                <h4>Largest changes</h4>
+                <ul id="changes" class="changes"></ul>
+              </article>
+            </div>
+            <div class="metric-grid">
+              <article class="metric">
+                <h4>Citation types, latest revision</h4>
+                <div id="types" class="hbars"></div>
+              </article>
+              <article class="metric">
+                <h4>Source kinds</h4>
+                <div id="kinds" class="hbars"></div>
+              </article>
+              <article class="metric">
+                <h4>Templates used</h4>
+                <ul id="templates" class="plain-list"></ul>
+              </article>
+            </div>
           </section>
-
-          <section class="timeline-grid timeline-detail-grid">
-            <article class="card">
-              <div class="section-heading">
-                <h3>Timeline Highlights</h3>
-              </div>
-              <dl class="timeline-stats">
-                <div class="timeline-stat">
-                  <dt>Peak refs</dt>
-                  <dd id="timeline-peak-refs">-</dd>
-                </div>
-                <div class="timeline-stat">
-                  <dt>Templates at peak</dt>
-                  <dd id="timeline-peak-templates">-</dd>
-                </div>
-                <div class="timeline-stat">
-                  <dt>Reuses at peak</dt>
-                  <dd id="timeline-peak-reuses">-</dd>
-                </div>
-                <div class="timeline-stat">
-                  <dt>High-confidence at peak</dt>
-                  <dd id="timeline-peak-high-confidence">-</dd>
-                </div>
-                <div class="timeline-stat">
-                  <dt>Timeline points</dt>
-                  <dd id="timeline-point-count">-</dd>
-                </div>
-                <div class="timeline-stat">
-                  <dt>Biggest jump</dt>
-                  <dd id="timeline-biggest-increase">-</dd>
-                </div>
-                <div class="timeline-stat">
-                  <dt>Biggest drop</dt>
-                  <dd id="timeline-biggest-decrease">-</dd>
-                </div>
-              </dl>
-            </article>
-
-            <article class="card">
-              <div class="section-heading">
-                <h3>Largest Tracked Changes</h3>
-                <p class="muted">The biggest revision-to-revision swings in tracked reference count.</p>
-              </div>
-              <div class="timeline-change-section">
-                <ul id="timeline-change-list" class="timeline-change-list"></ul>
-              </div>
-            </article>
-          </section>
-
-          <section class="sources-section">
-            <article class="card">
-              <div class="section-heading">
-                <h3>Top Sources On This Page</h3>
-                <p id="top-sources-summary" class="muted">
-                  The sources that stayed with this article across the most revisions.
-                </p>
-              </div>
-              <ul id="top-sources-list" class="source-list"></ul>
-            </article>
-          </section>
-
-          <section id="citations-section" class="sources-section">
-            <article class="card">
-              <div class="section-heading section-heading-row">
-                <div>
-                  <h3 id="citations-heading">Citations In The Latest Revision</h3>
-                  <p id="citations-summary" class="muted">Loading citations…</p>
-                </div>
-                <button id="citations-latest" type="button" class="timeline-action-link hidden">Back to latest revision</button>
-              </div>
-              <ul id="citations-list" class="citation-list"></ul>
-              <div class="button-row">
-                <button id="citations-more" type="button" class="secondary-button hidden">Show more citations</button>
-              </div>
-            </article>
-          </section>
-        </section>
+        </div>
       </main>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/echarts@6.0.0/dist/echarts.min.js" defer></script>
-    <script src="/static/app.js?v=v3-20261113" defer></script>
+    <script src="/static/app.js?v=v4-20261114c" defer></script>
   </body>
 </html>

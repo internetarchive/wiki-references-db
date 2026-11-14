@@ -130,6 +130,57 @@ def test_source_lookup_by_identifier(client):
     assert get(client, "/api/v2/sources", key="qid:Q1")[0] == 400         # unknown scheme
 
 
+def test_page_sources(client):
+    """The article page's sources: counts, intervals over the page's revisions, events, forms."""
+    s, j = get(client, f"/api/v2/pages/{D}/{PAGE_A}/sources", limit=50)
+    assert s == 200 and j["status"] == "all" and j["sort"] == "longest"
+    c = j["counts"]
+    assert c["all"] == c["current"] + c["removed"] == j["total"] == len(j["sources"]) == 8   # as top-sources' total
+    assert j["latest_revision_id"] == 1003 and j["first_revision_timestamp"].startswith("2004-01-01")
+    for src in j["sources"]:
+        assert src["intervals"] and src["events"][0]["kind"] == "added" and src["forms"]
+        last = src["intervals"][-1]
+        if src["is_current"]:
+            assert last["removed_revision_id"] is None and last["end_revision_id"] == 1003 and src["uses_latest"] >= 1
+        else:
+            assert last["removed_revision_id"] in (1002, 1003) and src["uses_latest"] == 0
+            assert all(not f["current"] for f in src["forms"]) and src["events"][-1]["kind"] == "removed"
+        assert src["days_on_page"] >= 0
+    # the ISBN book cited on both pages: identified, current, one other page
+    book = next(s for s in j["sources"] if s["extracted_isbn"] == ISBN)
+    assert book["source_key"] == f"isbn:{ISBN}" and book["is_current"] and book["other_pages"] == 1 and book["kind"] == "Book"
+    assert any(f["normalized_sha1"] and f["wikitext"].startswith("<ref") for f in book["forms"])
+    assert any(f["templates"] and f["templates"][0]["template_name"] == "Cite book" for f in book["forms"])
+
+    s, cur = get(client, f"/api/v2/pages/{D}/{PAGE_A}/sources", status="current", sort="uses")
+    s2, rem = get(client, f"/api/v2/pages/{D}/{PAGE_A}/sources", status="removed", sort="recent")
+    assert s == s2 == 200 and cur["total"] == c["current"] and rem["total"] == c["removed"] and rem["total"] >= 1
+    assert all(x["is_current"] for x in cur["sources"]) and not any(x["is_current"] for x in rem["sources"])
+    s, page = get(client, f"/api/v2/pages/{D}/{PAGE_A}/sources", status="current", sort="uses", limit=1, offset=1)
+    assert s == 200 and len(page["sources"]) == 1 and page["sources"][0]["global_source_id"] == cur["sources"][1]["global_source_id"]
+    # lasted: sources present in more than one revision first, longest time on the page first;
+    # single-revision ones (probably reverted at once) last
+    s, las = get(client, f"/api/v2/pages/{D}/{PAGE_A}/sources", status="removed", sort="lasted", limit=50)
+    assert s == 200 and las["total"] == c["removed"] and len(las["sources"]) == c["removed"]
+    keys = [(x["revisions_on_page"] > 1, x["days_on_page"]) for x in las["sources"]]
+    assert keys == sorted(keys, reverse=True)
+    assert all(x["revisions_on_page"] >= 1 for x in j["sources"])
+    s, one = get(client, f"/api/v2/pages/{D}/{PAGE_A}/sources", status="removed", sort="lasted", limit=1, offset=1)
+    assert [x["global_source_id"] for x in one["sources"]] == [las["sources"][1]["global_source_id"]]
+    assert get(client, f"/api/v2/pages/{D}/{PAGE_A}/sources", status="gone")[0] == 400
+    assert get(client, f"/api/v2/pages/{D}/{PAGE_A}/sources", sort="alphabetical")[0] == 400
+    assert get(client, "/api/v2/pages/xx.wikipedia.org/101/sources")[0] == 404
+
+
+def test_display_wikitext_repairs_the_normalizer_artifact():
+    from wcd_api.queries.page_sources import display_wikitext
+
+    assert display_wikitext('ef name="x">{{cite web|url=u}}</ref>\n<') == '<ref name="x">{{cite web|url=u}}</ref>'
+    assert display_wikitext("ef>Smith (2001).</ref>  == See also") == "<ref>Smith (2001).</ref>"
+    assert display_wikitext("{{sfn|Smith|2001}}") == "{{sfn|Smith|2001}}"
+    assert display_wikitext(None) == ""
+
+
 # Group 3 -------------------------------------------------------------------
 
 def test_revisions(client):
@@ -373,7 +424,8 @@ def test_frontend_is_served(synthetic):
         assert index.status_code == 200 and "Wikipedia Citations Database" in index.text and "UVA" not in index.text
         assert c.get("/static/app.js").status_code == 200 and c.get("/static/styles.css").status_code == 200
         assert 'API_BASE = "/api/v2"' in c.get("/static/app.js").text
-        for path in ("/citations/" + "a" * 40, "/citations/" + "a" * 40 + "/pages", "/templates/report"):
+        assert c.get("/static/article.css").status_code == 200 and "/static/article.css" in index.text
+        for path in ("/citations/" + "a" * 40, "/citations/" + "a" * 40 + "/pages", "/templates/report", "/sources/abc/pages"):
             r = c.get(path)
             assert r.status_code == 200 and "/static/reports.js" in r.text, path
         assert c.get("/static/reports.js").status_code == 200

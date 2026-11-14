@@ -15,7 +15,7 @@ uv run wcd-api --host 0.0.0.0 --port 8000
 | Group | Endpoints | Engine |
 |---|---|---|
 | 1 Article resolution | `GET /api/v2/article?url=` (curid or `/wiki/Title`; titles resolved through the site's API) | Postgres |
-| 2 Page analytics | `/pages/random/summary`, `/pages/{domain}/{page_id}/summary`, `…/timeline`, `…/top-sources`, `/sources/{id}`, `/sources/{id}/pages`, `/sources?doi=…` (lookup by identifier) | Postgres; timeline reads `page_revision_stats` |
+| 2 Page analytics | `/pages/random/summary`, `/pages/{domain}/{page_id}/summary`, `…/timeline`, `…/top-sources`, `…/sources?status=&sort=` (the article page), `/sources/{id}`, `/sources/{id}/pages`, `/sources?doi=…` (lookup by identifier) | Postgres; timeline reads `page_revision_stats` |
 | 3 Revision & citation detail | `…/revisions`, `…/citations?revision_id=&raw=`, `/citations/{sha1}`, `/citations/{sha1}/history?domain=&page_id=&limit=&offset=`, `/citations/{sha1}/pages` | Postgres + `citation_history` / `revisions` Parquet |
 | 4 Lookup | `/templates/report?domain=&template=&parameter_key=&parameter_value=`, `/web-resources?url=` | Postgres + `template_param_index` |
 | v1 aliases | the `/api/v1/…` paths over the same handlers, domain defaulted to `API_DEFAULT_DOMAIN` | |
