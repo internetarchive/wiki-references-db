@@ -63,6 +63,14 @@ Header + `points[]`, one per revision (including zero-citation revisions):
 
 **Tables**: `page_metadata` (Postgres); `page_revision_stats` (Parquet, one bucket partition). Fallback: `revisions` ⋈ `citation_history` ⋈ `citation_instances_denorm` ⋈ `named_ref_uses`, grouped by revision.
 
+##### `GET /api/v2/pages/{domain}/{page_id}/sources?status=all|current|removed&sort=longest|uses|recent&limit=10&offset=0` *(2026-11-14, the article page)*
+`counts {all, current, removed}`, `total`, the page's first/latest revision, and `sources[]`: the `top-sources` identity fields plus `source_key`, `author`, `publication` (journal, else publisher, of the canonical part), `kind` (Book / Journal article / News / Web page, UVA's classifier), `days_on_page`, `uses_latest` (named reuses included), `other_pages`, and
+* `intervals[] {start, end, removed_at}` (with revision ids): stretches on the page; absences under 7 days (`ABSENCE_MERGE_DAYS`) are merged;
+* `events[] {kind: added|removed|restored|form_changed, revision_id, timestamp, label}`: `form_changed` only for a conversion to short-form citations;
+* `forms[] {label: Full citation|Bibliography|Short form|Named reuse|Earlier form, wikitext, normalized_sha1, first/last seen, current, uses_latest, templates[]}`: every normalized citation of the source on the page (display text repaired for the reftag normalizer's dropped `<r`), and named reuses in the latest revision.
+
+Sources are chosen and paged in Postgres (`page_source_summary` ⋈ `global_sources`; *longest* sorts by the gap-free span), then one DuckDB pass over the page's bucket (`revisions`, `citation_history`, `citation_instances_denorm`, `named_ref_uses`) computes runs, forms and reuses for those sources only: ~2 s for 10 sources on United States (4,217 sources).
+
 ##### `GET /api/v2/pages/{domain}/{page_id}/top-sources?limit=10`
 Header + `total_sources` + `sources[]`: `global_source_id, source_key, source_label, author_key, year, title, extracted_{doi,isbn,pmid,pmc,arxiv,wikidata_qid,librarybase_id,url}, source_type, page_citation_count (n_citations), cross_page_count (gs.n_pages), match_type, confidence, reliability_score, verdict, first_seen, last_seen, n_revisions_cited, n_self_closing_uses, is_current`.
 **Tables**: `page_source_summary` ⋈ `global_sources` ⋈ `page_metadata`. Pure Postgres. Order: `n_citations DESC, n_pages DESC` (UVA order).
@@ -116,6 +124,7 @@ v1 shape without `web_resource_id` (the URL is the key); each referencing citati
 | `/article?url=` | `web_resources`, `domains`, `page_metadata`, `revisions` | — |
 | `/pages/random/summary`, `/pages/{d}/{id}/summary` | `page_summary_cache`, `page_metadata` | — (7h rebuild: `revisions`, `citation_history`, `citation_instances_denorm`, `global_source_scores`) |
 | `/pages/{d}/{id}/timeline` | `page_metadata` | `page_revision_stats` |
+| `/pages/{d}/{id}/sources` | `page_source_summary`, `global_sources`, `normalized_citation_parts`, `normalized_citations` | `revisions`, `citation_history`, `citation_instances_denorm`, `named_ref_uses`, `template_params` |
 | `/pages/{d}/{id}/top-sources` | `page_source_summary`, `global_sources`, `page_metadata` | — |
 | `/sources?doi=…` (lookup) | `global_sources` | — |
 | `/sources/{id}/pages`, `/sources/{id}` | `page_source_summary`, `global_sources`, `page_metadata`, `domains`, `citation_source_resolution` | — |
