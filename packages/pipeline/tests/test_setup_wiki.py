@@ -1,4 +1,4 @@
-"""``wcd setup`` against a local dump site: discovery, resumable verified downloads,
+"""``wcd setup`` against a local content-history export site: discovery, resumable verified downloads,
 shards streamed through a stub RevisionChest and the real Stage 1, resume after a
 failure, and (with Postgres) the whole-wiki steps after the barrier."""
 from __future__ import annotations
@@ -17,17 +17,25 @@ import pytest
 from wcd_pipeline import dumps, setup_wiki
 from wcd_pipeline.synthetic import PAGE_A, PAGE_B
 
-DB, DATE, OLD = "testwiki", "20261101", "20261001"
+DB, DATE, OLD, NEWER = "testwiki", "2026-11-01", "2026-10-01", "2026-12-01"
+RUN_ID = f"{DB}-20261101"
 D = "en.wikipedia.org"
-#: page ranges as in real history shard names; the synthetic pages are 101 (A) and 202 (B)
-SHARDS = {f"{DB}-{DATE}-pages-meta-history1.xml-p1p150.7z": 3_000,
-          f"{DB}-{DATE}-pages-meta-history2.xml-p151p300.7z": 9_000,
-          f"{DB}-{DATE}-pages-meta-history3.xml-p301p400.7z": 1_000}   # no synthetic pages: an empty shard
+#: page ranges as in real export file names; the synthetic pages are 101 (A) and 202 (B)
+SHARDS = {f"{DB}-{DATE}-p1p150.xml.7z": 3_000,
+          f"{DB}-{DATE}-p151p300.xml.7z": 9_000,
+          f"{DB}-{DATE}-p301p400.xml.7z": 1_000}   # no synthetic pages: an empty shard
+#: the one shard the run directory's listing leaves out: its size comes from a HEAD request
+UNLISTED = f"{DB}-{DATE}-p301p400.xml.7z"
+
+
+def _stem(name: str) -> str:
+    return setup_wiki.bundle_name(name)[: -len(".mwrev.zst")]
 
 
 class DumpSite:
-    """A dumps.wikimedia.org look-alike on localhost: directory listing, dumpstatus.json,
-    and files served with Range support. Counts file GETs."""
+    """A dumps.wikimedia.org look-alike on localhost, laid out like the content-history
+    exports: directory listings, SHA256SUMS, and files served with Range support.
+    Counts file GETs."""
 
     def __init__(self, root: Path):
         self.root, self.gets = root, []
@@ -65,23 +73,32 @@ class DumpSite:
         self.server.shutdown()
 
 
+def _nginx_listing(entries) -> str:
+    """An nginx autoindex page: names truncated in the text, full in the href."""
+    rows = "".join(f'<a href="{n}">{n[:20]}..&gt;</a>{" " * 20}12-Nov-2026 05:19{" " * 12}{size}\n'
+                   for n, size in entries)
+    return f'<html><body><pre><a href="../">../</a>\n{rows}</pre></body></html>'
+
+
 @pytest.fixture
 def site(tmp_path):
     root = tmp_path / "site"
-    run = root / DB / DATE
+    wiki = root / dumps.DATASET / DB
+    run = wiki / DATE / "xml" / "7z"
     run.mkdir(parents=True)
-    files = {}
+    sums = []
     for name, size in SHARDS.items():
-        data = hashlib.sha256(name.encode()).digest() * (size // 32 + 1)
-        (run / name).write_bytes(data[:size])
-        files[name] = {"size": size, "url": f"/{DB}/{DATE}/{name}", "sha1": hashlib.sha1(data[:size]).hexdigest()}
-    (run / "dumpstatus.json").write_text(json.dumps({"jobs": {"metahistory7zdump": {"status": "done", "files": files}}}))
-    # an older run, and a newer one still in progress (must be skipped)
-    (root / DB / OLD).mkdir()
-    (root / DB / OLD / "dumpstatus.json").write_text(json.dumps({"jobs": {"metahistory7zdump": {"status": "done", "files": {}}}}))
-    (root / DB / "20261201").mkdir()
-    (root / DB / "20261201" / "dumpstatus.json").write_text(json.dumps({"jobs": {"metahistory7zdump": {"status": "in-progress"}}}))
-    (root / DB / "index.html").write_text("".join(f'<a href="{d}/">{d}/</a>\n' for d in (OLD, DATE, "20261201")))
+        data = (hashlib.sha256(name.encode()).digest() * (size // 32 + 1))[:size]
+        (run / name).write_bytes(data)
+        sums.append(f"{hashlib.sha256(data).hexdigest()}  {name}\n")
+    (run / dumps.SUMS).write_text("".join(sums))
+    (run / "index.html").write_text(_nginx_listing((n, s) for n, s in SHARDS.items() if n != UNLISTED))
+    # an older run whose SHA256SUMS is empty, and a newer one still being written (no SHA256SUMS): both skipped
+    (wiki / OLD / "xml" / "7z").mkdir(parents=True)
+    (wiki / OLD / "xml" / "7z" / dumps.SUMS).write_text("")
+    (wiki / NEWER / "xml" / "7z").mkdir(parents=True)
+    (wiki / NEWER / "xml" / "7z" / f"{DB}-{NEWER}-p1p150.xml.7z").write_bytes(b"partial")
+    (wiki / "index.html").write_text("".join(f'<a href="{d}/">{d}/</a>\n' for d in (OLD, DATE, NEWER)))
     s = DumpSite(root)
     yield s
     s.close()
@@ -132,14 +149,35 @@ def _args(site, tmp_path, stub, *extra):
 
 # -- discovery and download ------------------------------------------------------
 
-def test_find_run_takes_newest_finished(site):
+def test_find_run_takes_newest_published(site):
     run = dumps.find_run(DB, prefix=site.url)
-    assert run.date == DATE and run.run_id == f"{DB}-{DATE}" and len(run.files) == 3
-    assert run.total_bytes == sum(SHARDS.values())
+    assert run.date == DATE and run.run_id == RUN_ID and len(run.files) == 3
+    assert run.total_bytes == sum(SHARDS.values())                 # listed sizes, and one from HEAD
+    assert {f.name: f.size for f in run.files} == SHARDS
+    assert all(f.path.startswith(f"/{dumps.DATASET}/{DB}/{DATE}/xml/7z/") for f in run.files)
+    assert dumps.find_run(DB, prefix=site.url, date="20261101").files == run.files    # either date form
+    with pytest.raises(dumps.DumpError, match="not published"):
+        dumps.find_run(DB, prefix=site.url, date=NEWER)            # still being written: no SHA256SUMS
+    with pytest.raises(dumps.DumpError, match="not published"):
+        dumps.find_run(DB, prefix=site.url, date=OLD)              # empty SHA256SUMS
+    with pytest.raises(dumps.DumpError, match="no published"):
+        dumps.find_run(DB, prefix=site.url, fmt="bz2")             # no bzip2 export at all
+
+
+def test_parse_sums_and_listing():
+    h = "ab" * 32
+    assert dumps.parse_sums(f"{h}  a-p1p2.xml.7z\n{h.upper()} *b-p3r1r9.xml.7z\n\n") == \
+        {"a-p1p2.xml.7z": h, "b-p3r1r9.xml.7z": h}
     with pytest.raises(dumps.DumpError):
-        dumps.find_run(DB, prefix=site.url, date="20261201")       # still in progress
+        dumps.parse_sums("not a checksum line\n")
+    html = _nginx_listing([("enwiki-2026-11-01-p100096p100653.xml.7z", 33821005),
+                           ("enwiki-2026-11-01-p352651r1645726r973546134.xml.7z", 7)])
+    html += '<a href="SHA256SUMS">SHA256SUMS</a>   12-Nov-2026 12:25   1.2K\n'       # not a byte count: skipped
+    assert dumps.parse_listing_sizes(html) == {"enwiki-2026-11-01-p100096p100653.xml.7z": 33821005,
+                                               "enwiki-2026-11-01-p352651r1645726r973546134.xml.7z": 7}
+    assert dumps.normalize_date("20261101") == dumps.normalize_date("2026-11-01") == "2026-11-01"
     with pytest.raises(dumps.DumpError):
-        dumps.find_run(DB, prefix=site.url, date=OLD)               # done, but no files
+        dumps.normalize_date("Nov 2026")
 
 
 def test_download_resumes_and_verifies(site, tmp_path):
@@ -147,24 +185,25 @@ def test_download_resumes_and_verifies(site, tmp_path):
     f = max(run.files, key=lambda f: f.size)
     dest = tmp_path / "dl"
     dest.mkdir()
-    full = (site.root / DB / DATE / f.name).read_bytes()
+    full = (site.root / f.path.lstrip("/")).read_bytes()
     (dest / (f.name + ".part")).write_bytes(full[:4000])           # an interrupted download
     got = dumps.download(f, dest, prefix=site.url)
     assert got.read_bytes() == full and dumps.is_downloaded(got) and not (dest / (f.name + ".part")).exists()
     assert site.gets[-1] == (f.name, "bytes=4000-")
+    assert Path(f"{got}.ok").read_text().strip() == f.sha256
     n = len(site.gets)
     dumps.download(f, dest, prefix=site.url)                         # verified already: no request
     assert len(site.gets) == n
-    bad = dumps.DumpFile(f.name, f.path, f.size, "0" * 40)
-    with pytest.raises(dumps.DumpError, match="sha1"):
+    bad = dumps.DumpFile(f.name, f.path, f.size, "0" * 64)
+    with pytest.raises(dumps.DumpError, match="sha256"):
         dumps.download(bad, tmp_path / "dl2", prefix=site.url)
     assert not list((tmp_path / "dl2").iterdir())                   # a bad file is not kept
 
 
 def test_bundle_name_matches_revisionchest():
-    assert setup_wiki.bundle_name("enwiki-20240101-pages-meta-history1.xml-p1p857.bz2") == \
-        "enwiki-20240101-pages-meta-history1.xml-p1p857.mwrev.zst"
-    assert setup_wiki.bundle_name("a.xml.7z") == "a.xml.mwrev.zst"
+    assert setup_wiki.bundle_name("enwiki-2026-11-01-p1p794.xml.7z") == "enwiki-2026-11-01-p1p794.xml.mwrev.zst"
+    assert setup_wiki.bundle_name("enwiki-2026-11-01-p352651r1645726r973546134.xml.bz2") == \
+        "enwiki-2026-11-01-p352651r1645726r973546134.xml.mwrev.zst"
     assert setup_wiki.bundle_name("a.xml") == "a.mwrev.zst"
     assert setup_wiki.bundle_name("a") == "a.mwrev.zst"
 
@@ -173,13 +212,13 @@ def test_bundle_name_matches_revisionchest():
 
 def test_shards_stream_and_resume(site, tmp_path, stub, monkeypatch):
     path, log = stub
-    monkeypatch.setenv("STUB_FAIL", f"{DB}-{DATE}-pages-meta-history2.xml-p151p300.7z")
+    monkeypatch.setenv("STUB_FAIL", f"{DB}-{DATE}-p151p300.xml.7z")
     assert setup_wiki.main(_args(site, tmp_path, path, "--shards-only")) == 1    # one shard fails
-    run = tmp_path / "work" / D / f"{DB}-{DATE}"
+    run = tmp_path / "work" / D / RUN_ID
     staging = run / "staging"
-    assert (staging / f"{DB}-{DATE}-pages-meta-history1.xml-p1p150" / "DONE.txt").exists()
-    assert (staging / f"{DB}-{DATE}-pages-meta-history3.xml-p301p400" / "DONE.txt").exists()   # empty shard is fine
-    assert not (staging / f"{DB}-{DATE}-pages-meta-history2.xml-p151p300").exists()
+    assert (staging / _stem(f"{DB}-{DATE}-p1p150.xml.7z") / "DONE.txt").exists()
+    assert (staging / _stem(f"{DB}-{DATE}-p301p400.xml.7z") / "DONE.txt").exists()   # empty shard is fine
+    assert not (staging / _stem(f"{DB}-{DATE}-p151p300.xml.7z")).exists()
     assert len(site.gets) == 3 and all(dumps.is_downloaded(run / "dumps" / n) for n in SHARDS)
     # Stage 1 wrote the shard's tier files (page A is in shard 1)
     hist = list((tmp_path / "parquet" / "citation_history").rglob("*p1p150*.parquet"))
@@ -190,17 +229,17 @@ def test_shards_stream_and_resume(site, tmp_path, stub, monkeypatch):
     log.write_text("")
     assert setup_wiki.main(_args(site, tmp_path, path, "--shards-only")) == 0
     assert len(site.gets) == 3
-    assert log.read_text().split() == [f"{DB}-{DATE}-pages-meta-history2.xml-p151p300.7z"]
-    assert (staging / f"{DB}-{DATE}-pages-meta-history2.xml-p151p300" / "DONE.txt").exists()
+    assert log.read_text().split() == [f"{DB}-{DATE}-p151p300.xml.7z"]
+    assert (staging / _stem(f"{DB}-{DATE}-p151p300.xml.7z") / "DONE.txt").exists()
     assert sorted(p.name for p in (run / "meta").iterdir()) == sorted(
         setup_wiki.bundle_name(n).replace(".mwrev.zst", ".parquet") for n in SHARDS)
-    assert json.loads((run / "run.json").read_text())["run_id"] == f"{DB}-{DATE}"
+    assert json.loads((run / "run.json").read_text())["run_id"] == RUN_ID
 
 
 def test_delete_dumps_keeps_markers(site, tmp_path, stub):
     path, _ = stub
     assert setup_wiki.main(_args(site, tmp_path, path, "--shards-only", "--delete-dumps")) == 0
-    run = tmp_path / "work" / D / f"{DB}-{DATE}"
+    run = tmp_path / "work" / D / RUN_ID
     assert not any((run / "dumps" / n).exists() for n in SHARDS)
     assert all(Path(f"{run / 'dumps' / n}.ok").exists() for n in SHARDS)
     assert setup_wiki.main(_args(site, tmp_path, path, "--shards-only", "--delete-dumps")) == 0   # nothing to redo
@@ -212,15 +251,15 @@ def test_bundles_cut_into_pieces(site, tmp_path, stub):
     deleted once extracted, and the shard counts as extracted when both are done."""
     path, _ = stub
     assert setup_wiki.main(_args(site, tmp_path, path, "--shards-only", "--pieces", "2")) == 0
-    run = tmp_path / "work" / D / f"{DB}-{DATE}"
+    run = tmp_path / "work" / D / RUN_ID
     for name in SHARDS:
-        shard = setup_wiki.bundle_name(name)[: -len(".mwrev.zst")]
+        shard = _stem(name)
         assert (run / "state" / f"{shard}.pieces").read_text().strip() == "2"
         assert all((run / "staging" / f"{shard}-{i}" / "DONE.txt").exists() for i in (0, 1))
         assert not (run / "staging" / shard).exists()
     assert not list((run / "pieces").iterdir())
     # tier files carry the piece stems
-    assert list((tmp_path / "parquet" / "citation_history").rglob("*p1p150-*.parquet"))
+    assert list((tmp_path / "parquet" / "citation_history").rglob("*p1p150.xml-*.parquet"))
 
 
 def test_pieces_are_automatic_only_with_few_files(site, tmp_path, stub, monkeypatch):
@@ -228,13 +267,13 @@ def test_pieces_are_automatic_only_with_few_files(site, tmp_path, stub, monkeypa
     monkeypatch.setattr(setup_wiki, "MIN_PIECE_BYTES", 1)      # the synthetic bundles are tiny
     # 3 files, --jobs 2: enough files, no pieces
     assert setup_wiki.main(_args(site, tmp_path, path, "--shards-only")) == 0
-    run = tmp_path / "work" / D / f"{DB}-{DATE}"
+    run = tmp_path / "work" / D / RUN_ID
     assert {p.read_text().strip() for p in (run / "state").glob("*.pieces")} == {"1"}
     # 3 files, --jobs 7: ceil(7 / 3) = 3 pieces each
     args = _args(site, tmp_path, path, "--shards-only", "--work-dir", str(tmp_path / "work7"))
     args[args.index("--jobs") + 1] = "7"
     assert setup_wiki.main(args) == 0
-    run7 = tmp_path / "work7" / D / f"{DB}-{DATE}"
+    run7 = tmp_path / "work7" / D / RUN_ID
     assert {p.read_text().strip() for p in (run7 / "state").glob("*.pieces")} == {"3"}
 
 
@@ -264,14 +303,14 @@ def test_setup_builds_the_whole_wiki(site, tmp_path, stub, monkeypatch):
     try:
         # with pieces: the whole-wiki steps see piece staging dirs, the metadata the original bundles
         assert setup_wiki.main(_args(site, tmp_path, path, "--pieces", "2")) == 0
-        run = tmp_path / "work" / D / f"{DB}-{DATE}"
+        run = tmp_path / "work" / D / RUN_ID
         steps = [n for n, _ in setup_wiki.whole_wiki_steps(D, run, 2)]
         assert all((run / "state" / "steps" / f"{n}.done").exists() for n in steps)
         with engine.connect() as con:
             assert con.execute(text("SELECT count(*) FROM page_summary_cache")).scalar() == 2
             assert {r[0] for r in con.execute(text("SELECT page_id FROM page_metadata"))} == {PAGE_A, PAGE_B}
             gids = [r[0] for r in con.execute(text("SELECT global_source_id FROM global_sources"))]
-            assert gids and all(g.startswith(f"{DB}-{DATE}.") for g in gids)   # the run id qualifies them
+            assert gids and all(g.startswith(f"{RUN_ID}.") for g in gids)   # the run id qualifies them
         # a second run finds everything done
         assert setup_wiki.main(_args(site, tmp_path, path, "--pieces", "2")) == 0
     finally:
