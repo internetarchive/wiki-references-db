@@ -418,7 +418,8 @@ def main(argv=None) -> int:
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4,
                     help="workers (each builds a shard or extracts a unit at a time), and --jobs of the whole-wiki "
                          "steps (default: CPU count; each extract worker can take ~2 GB)")
-    ap.add_argument("--download-jobs", type=int, default=4, help="concurrent downloads (default 4)")
+    ap.add_argument("--download-jobs", type=int, default=dumps.MAX_CONNECTIONS,
+                    help=f"concurrent downloads (default {dumps.MAX_CONNECTIONS}: dumps.wikimedia.org's cap per IP)")
     ap.add_argument("--max-ahead", type=int, default=None,
                     help="downloaded-but-unbuilt shards allowed at once (disk); default unlimited, or 2 × --jobs "
                          "with --delete-dumps")
@@ -444,7 +445,14 @@ def main(argv=None) -> int:
         ap.error(f"--from-step must be one of: {', '.join(steps_preview)}")
     if args.jobs < 1 or args.download_jobs < 1 or args.pieces < 0:
         ap.error("--jobs and --download-jobs must be at least 1, --pieces at least 0")
+    if args.download_jobs > dumps.MAX_CONNECTIONS and args.mirror.rstrip("/") == dumps.PRIMARY:
+        log(f"warning: --download-jobs {args.download_jobs} is over {dumps.PRIMARY}'s cap of "
+            f"{dumps.MAX_CONNECTIONS} connections per IP; the extra connections will be refused (429) and retried")
 
+    if args.mirror.rstrip("/") == dumps.PRIMARY and not (
+            os.getenv("WIKIPEDIA_API_CONTACT_EMAIL") or os.getenv("CONTACT_EMAIL")):
+        log(f"warning: no WIKIPEDIA_API_CONTACT_EMAIL; {dumps.PRIMARY} enforces the Wikimedia User-Agent "
+            "policy (a contact in the User-Agent) and may block downloads without one")
     dbname = args.dbname or dumps.wiki_dbname(args.domain)
     try:
         run = dumps.find_run(dbname, prefix=args.mirror, date=args.date, fmt=args.format, log=log)

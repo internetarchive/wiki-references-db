@@ -20,8 +20,11 @@ sha256, and appears only once the whole export is written. File sizes come from
 the directory listing (or a HEAD request when the listing does not show one).
 
 Downloads resume (HTTP Range) into ``<file>.part``, are checked against the
-size and sha256, then renamed and marked ``<file>.ok``. Only the standard
-library is used.
+size and sha256, then renamed and marked ``<file>.ok``. dumps.wikimedia.org
+allows 3 connections per IP and enforces the User-Agent policy (a contact in
+the User-Agent: ``WIKIPEDIA_API_CONTACT_EMAIL``); a 429 is waited out
+(``Retry-After``, else exponential backoff) and retried, not failed. Only the
+standard library is used.
 """
 from __future__ import annotations
 
@@ -44,6 +47,10 @@ DATASET = "other/mediawiki_content_history"
 FORMATS = {"7z": "7z", "bz2": "bzip2"}
 SUMS = "SHA256SUMS"
 CHUNK = 4 * 2**20
+#: dumps.wikimedia.org's cap on connections per IP
+MAX_CONNECTIONS = 3
+#: HTTP statuses worth retrying: rate limiting and server errors
+RETRY_STATUSES = frozenset({429}) | frozenset(range(500, 600))
 
 
 class DumpError(RuntimeError):
@@ -88,23 +95,35 @@ def _open(url: str, *, headers: dict | None = None, timeout: float = 60, method:
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def http_get(url: str, *, retries: int = 4, timeout: float = 60) -> bytes:
-    """GET with a few retries on network errors and 5xx; 4xx raise at once."""
+def _backoff(attempt: int, error: Exception | None = None, cap: float = 120) -> float:
+    """Seconds to wait before retry ``attempt + 1``: the server's ``Retry-After``
+    (seconds) on a 429/503 when it sends one, else exponential, at most ``cap``."""
+    if isinstance(error, urllib.error.HTTPError) and error.headers is not None:
+        after = error.headers.get("Retry-After")
+        if after and after.strip().isdigit():
+            return min(cap, max(1, int(after)))
+    return min(cap, 2 ** attempt)
+
+
+def http_get(url: str, *, retries: int = 6, timeout: float = 60) -> bytes:
+    """GET with retries on network errors, 429 and 5xx; other 4xx raise at once."""
     for attempt in range(retries + 1):
         try:
             with _open(url, timeout=timeout) as resp:
                 return resp.read()
         except urllib.error.HTTPError as e:
-            if e.code < 500 or attempt == retries:
+            if e.code not in RETRY_STATUSES or attempt == retries:
                 raise
+            wait = _backoff(attempt, e)
         except (urllib.error.URLError, TimeoutError, ConnectionError):
             if attempt == retries:
                 raise
-        time.sleep(min(60, 2 ** attempt))
+            wait = _backoff(attempt)
+        time.sleep(wait)
     raise AssertionError("unreachable")
 
 
-def http_size(url: str, *, retries: int = 4) -> int:
+def http_size(url: str, *, retries: int = 6) -> int:
     """Content-Length of ``url`` from a HEAD request."""
     for attempt in range(retries + 1):
         try:
@@ -114,12 +133,14 @@ def http_size(url: str, *, retries: int = 4) -> int:
                     raise DumpError(f"{url}: no Content-Length")
                 return int(length)
         except urllib.error.HTTPError as e:
-            if e.code < 500 or attempt == retries:
+            if e.code not in RETRY_STATUSES or attempt == retries:
                 raise DumpError(f"{url}: HTTP {e.code}") from e
+            wait = _backoff(attempt, e)
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             if attempt == retries:
                 raise DumpError(f"{url}: {e}") from e
-        time.sleep(min(60, 2 ** attempt))
+            wait = _backoff(attempt)
+        time.sleep(wait)
     raise AssertionError("unreachable")
 
 
@@ -191,7 +212,7 @@ def run_files(prefix: str, dbname: str, date: str, fmt: str) -> tuple[DumpFile, 
     sizes = parse_listing_sizes(http_get(base).decode("utf-8", "replace"))
     missing = [n for n in sums if n not in sizes]
     if missing:                                       # the listing does not show them all: ask the server
-        with ThreadPoolExecutor(16) as pool:
+        with ThreadPoolExecutor(MAX_CONNECTIONS) as pool:
             sizes.update(zip(missing, pool.map(lambda n: http_size(base + urllib.request.pathname2url(n)), missing)))
     path = _run_path(dbname, date, fmt)
     return tuple(DumpFile(name=n, path=path + n, size=sizes[n], sha256=h) for n, h in sorted(sums.items()))
@@ -228,11 +249,13 @@ def is_downloaded(dest: Path) -> bool:
     return dest.exists() and Path(f"{dest}.ok").exists()
 
 
-def download(f: DumpFile, dest_dir: Path, *, prefix: str = PRIMARY, retries: int = 8,
+def download(f: DumpFile, dest_dir: Path, *, prefix: str = PRIMARY, retries: int = 12,
              progress: Callable[[int], None] = lambda n: None) -> Path:
     """Fetch ``f`` into ``dest_dir`` (resuming a ``.part``), verify size and sha256,
     mark it ``.ok``. Already-verified files are skipped. ``progress`` gets byte
-    counts as they arrive. A checksum mismatch deletes the partial file and fails."""
+    counts as they arrive. A 429 or 5xx, or a dropped connection, is retried with
+    backoff (``Retry-After`` when sent), resuming from what arrived. A checksum
+    mismatch deletes the partial file and fails."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f.name
     if is_downloaded(dest):
@@ -261,12 +284,14 @@ def download(f: DumpFile, dest_dir: Path, *, prefix: str = PRIMARY, retries: int
         except urllib.error.HTTPError as e:
             if e.code == 416:              # range past the end: the part is complete (or bad); verify below
                 break
-            if e.code < 500 or attempt == retries:
+            if e.code not in RETRY_STATUSES or attempt == retries:
                 raise DumpError(f"{url}: HTTP {e.code}") from e
+            wait = _backoff(attempt, e)
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             if attempt == retries:
                 raise DumpError(f"{url}: {e}") from e
-        time.sleep(min(120, 2 ** attempt))
+            wait = _backoff(attempt)
+        time.sleep(wait)
     size = part.stat().st_size if part.exists() else 0
     if size != f.size:
         raise DumpError(f"{f.name}: got {size:,} bytes, expected {f.size:,}")

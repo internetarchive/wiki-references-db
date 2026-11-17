@@ -10,6 +10,7 @@ import os
 import stat
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,7 @@ class DumpSite:
 
     def __init__(self, root: Path):
         self.root, self.gets = root, []
+        self.throttle: set[str] = set()      # file names whose next GET is refused with 429
         site = self
 
         class Handler(http.server.SimpleHTTPRequestHandler):
@@ -54,6 +56,12 @@ class DumpSite:
                 if not path.is_file() or path.suffix not in (".7z", ".bz2"):
                     return super().do_GET()
                 site.gets.append((path.name, rng))
+                if path.name in site.throttle:
+                    site.throttle.discard(path.name)
+                    self.send_response(429)
+                    self.send_header("Retry-After", "1")
+                    self.end_headers()
+                    return
                 data = path.read_bytes()
                 start = int(rng.split("=")[1].split("-")[0]) if rng else 0
                 if start >= len(data) and rng:
@@ -198,6 +206,17 @@ def test_download_resumes_and_verifies(site, tmp_path):
     with pytest.raises(dumps.DumpError, match="sha256"):
         dumps.download(bad, tmp_path / "dl2", prefix=site.url)
     assert not list((tmp_path / "dl2").iterdir())                   # a bad file is not kept
+
+
+def test_download_waits_out_429(site, tmp_path):
+    """A rate-limited GET (429, Retry-After) is waited out and retried, not failed."""
+    run = dumps.find_run(DB, prefix=site.url)
+    f = min(run.files, key=lambda f: f.size)
+    site.throttle.add(f.name)
+    t = time.time()
+    got = dumps.download(f, tmp_path / "dl", prefix=site.url)
+    assert dumps.is_downloaded(got) and time.time() - t >= 1           # honoured Retry-After: 1
+    assert [g for g in site.gets if g[0] == f.name] == [(f.name, None), (f.name, None)]
 
 
 def test_bundle_name_matches_revisionchest():
