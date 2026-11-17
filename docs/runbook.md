@@ -24,7 +24,7 @@ repository root with `.env` filled in (`example.env`).
 | `MATCH_GLOBAL_CHUNK_ROWS`, `MATCH_GLOBAL_BLOCK_ROWS` | Stage 6d | merged sources per output file of the component build (8M; memory follows it); rows of a fuzzy author+year group per rapidfuzz call (2048) |
 | `MATERIALIZE_CHUNK_ROWS`, `STAGE7_WORK_MEM` | Stage 7 | rows per COPY chunk (500k); Postgres `work_mem` of 7e/7f's whole-table UPDATEs (1GB; one backend, no parallel workers) |
 | `REVISION_BUNDLES_DIR` | Stage 1 | the `.mwrev.zst` bundles, one directory per domain |
-| `WCD_WORK_DIR`, `DUMPS_MIRROR`, `REVISIONCHEST` | `wcd setup` | root of its run directories (`./wcd-work`); dump URL prefix (a mirror laid out like dumps.wikimedia.org); the RevisionChest binary (default: the repo's release build, else `PATH`) |
+| `WCD_WORK_DIR`, `DUMPS_MIRROR`, `REVISIONCHEST` | `wcd setup` | root of its run directories (`./wcd-work`); URL prefix of the content-history exports (dumps.wikimedia.org, or a mirror laid out like it); the RevisionChest binary (default: the repo's release build, else `PATH`) |
 | `WCD_RUN_ID` | Stage 6d | this build run's id (`[a-z0-9][a-z0-9_-]{0,39}`, e.g. `enwiki-20261101`); global source ids are written `<run id>.<hash>`. Unset: bare hashes, as the 2026-11 enwiki build. Set it for every new build so its ids cannot be confused with an earlier build's |
 | `API_*`, `WIKIPEDIA_API_*` | the API | CORS, default domain, pool size, User-Agent for title lookups; `API_LEGACY_TEMPLATE_IDS` (v1 template id table), `API_BASE_RUN_ID` (the run bare global source ids belong to), `API_DUCKDB_MEMORY_LIMIT` / `API_DUCKDB_THREADS` (per request: 1GB, 2) |
 
@@ -58,23 +58,43 @@ window (201.7 GB before it) and 49.6 GB of metadata in one Parquet file, in
 2 h 08 min with `build -d -j 18` on 28 cores (45 core-hours, 3.8 GB peak
 RSS); see the plan, §17.
 
-## Setting up a wiki from its dumps: `wcd setup`
+## Setting up a wiki from its history export: `wcd setup`
 
 ```
 uv run wcd setup --domain de.wikipedia.org --jobs 24 \
-    [--mirror https://dumps.wikimedia.your.org] [--date 20261101] [--shards-only]
+    [--mirror PREFIX] [--date 2026-11-01] [--format 7z|bz2] [--shards-only]
 ```
 
-One command from a domain to a built database. It finds the dumps (the site's
-`wikiid` from siteinfo, then the newest run whose page-history dump is done, or
-`--date`; listing and `dumpstatus.json` from `--mirror`, falling back to the
-primary site's status file if a mirror lacks it) and **streams the history
-dump's files** instead of waiting for all of them:
+One command from a domain to a built database. The source is the wiki's
+**MediaWiki Content File Export** of its full history
+(<https://wikitech.wikimedia.org/wiki/MediaWiki_Content_File_Exports>), under
+`<prefix>/other/mediawiki_content_history/<dbname>/<YYYY-MM-DD>/xml/<7z|bzip2>/`.
+It replaced the legacy `pages-meta-history` dumps, which are not published
+after January 2027 and are no longer supported here. The XML format is the
+same (export-0.11), but the source changed in four ways:
+
+* **Cutoff.** An export is the whole wiki at 00:00 UTC on its date (the 1st of
+  the month), a consistent snapshot. The legacy dumps' cutoff varied by page
+  over the days their stubs took. A sync that starts before that date covers
+  the seam.
+* **Published = `SHA256SUMS` exists.** It appears once the whole export is
+  written and lists every file with its sha256. There is no `dumpstatus.json`.
+  Sizes come from the directory listing, or from a HEAD request where the
+  listing does not show one.
+* **Files** are split by page-id range (`<dbname>-<date>-p<lo>p<hi>.xml.7z`;
+  enwiki 2026-11-01: 3,429 files, ~200 GB of 7z). A very large page is split
+  further by revision range (`…-p<page>r<lo>r<hi>.xml.7z`), so its history can
+  span several bundles. Stage 1 is per revision, so this does not change its
+  output.
+* **Publication** is monthly, about 7–10 days after the 1st.
+
+`wcd setup` finds the site's `wikiid` from siteinfo, then the newest published
+export (or `--date`, as `YYYY-MM-DD` or `YYYYMMDD`), and **streams the
+export's files** instead of waiting for all of them:
 
 * `--download-jobs` (4) files download at once, largest first, resuming
-  (`.part`, HTTP Range) and verified against the listed size and sha1
-  (`<file>.ok`; the same marker `tools/fetch_one.sh` wrote, so `--dumps-dir`
-  can point at an existing download).
+  (`.part`, HTTP Range) and verified against their size and sha256
+  (`<file>.ok`, so `--dumps-dir` can point at an existing download).
 * As each file is verified, one of `--jobs` shard workers runs `RevisionChest
   build` on it (bundle + that shard's metadata Parquet) and then Stage 1
   `extract` on the bundle. Downloading, the Stage 0 build and Stage 1 overlap.
@@ -83,12 +103,12 @@ dump's files** instead of waiting for all of them:
   `dedup` and the rest. From there the steps of "Full build, one domain" below
   run in order, each ending with its gate; `--shards-only` stops at the barrier.
 
-**Wikis with few dump files.** Small and mid-sized wikis publish their whole
-history as one file, which would extract on one core. When a dump has fewer
+**Wikis with few export files.** Small wikis publish their whole history as
+one file, which would extract on one core. When an export has fewer
 files than `--jobs`, each bundle is cut on page boundaries into about
 `jobs / files` pieces (at least 8 MiB each; `wcd_pipeline.split_bundle`) that
 all workers share; the pieces are deleted once extracted, and the metadata
-still refers to the bundle. A wiki with many shards (enwiki: 980) is not cut,
+still refers to the bundle. A wiki with many shards (enwiki: 3,429) is not cut,
 since more extract units mean more small Parquet files per bucket. `--pieces N`
 overrides the choice.
 
@@ -99,15 +119,16 @@ shard is redone from its last finished step. A failed shard fails the run once
 the others finish, and the whole-wiki steps do not start. `--from-step NAME`
 redoes the whole-wiki steps from one of them.
 
-**Layout:** `<work-dir>/<domain>/<dbname>-<date>/` holds `dumps/` (or
+**Layout:** `<work-dir>/<domain>/<dbname>-<YYYYMMDD>/` holds `dumps/` (or
 `--dumps-dir`), `bundles/`, `meta/`, `staging/`, `state/`, `logs/` (one log per
 shard step and per whole-wiki step) and `run.json`. The Parquet tier goes to
-`PARQUET_DIR`, Postgres to `DATABASE_URL`. The run id `<dbname>-<date>` becomes
-`WCD_RUN_ID` (unless set), so the build's global source ids are qualified.
+`PARQUET_DIR`, Postgres to `DATABASE_URL`. The run id `<dbname>-<YYYYMMDD>` (the
+export's cutoff date) becomes `WCD_RUN_ID` (unless set), so the build's global
+source ids are qualified.
 
 **Tuning.** Shard workers are CPU-bound by Stage 1 (enwiki: ~1,200 core-hours,
 ~2 GB peak per worker), so `--jobs` ≈ cores. `--namespace` defaults to `0`
-(articles; `''` for all). `--delete-dumps` removes each dump file once its
+(articles; `''` for all). `--delete-dumps` removes each export file once its
 bundle is built (the `.ok` marker stays) and then caps downloaded-but-unbuilt
 files at 2 × `--jobs` (`--max-ahead`). The whole-wiki steps take their memory
 settings from the environment as described below (`DUCKDB_MEMORY_LIMIT`, …):
@@ -329,11 +350,9 @@ Rules of thumb:
 What the enwiki build (plan §§17–24) taught about running these steps on one
 machine beside Postgres.
 
-**Building bundles while the dump downloads.** A 7z dump file can only be
-read once it is complete. `scripts/revisionchest_dump_pipeline.sh` runs
-`RevisionChest build` on each file as soon as its `<file>.ok` checksum marker
-appears, several at once, and records per-file timings; it is re-runnable and
-stops when free disk runs low.
+**Building bundles while the export downloads.** A 7z file can only be read
+once it is complete. `wcd setup` runs `RevisionChest build` on each file as
+soon as it is verified, several at once (see "Setting up a wiki" above).
 
 **Run heavy steps in a memory-capped scope.** Start each DuckDB-heavy step with
 `sudo systemd-run --scope --uid=$USER --gid=$(id -g) -p MemoryMax=<cap> …` and
