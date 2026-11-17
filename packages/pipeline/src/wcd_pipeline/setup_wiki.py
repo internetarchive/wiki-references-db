@@ -1,18 +1,18 @@
-"""``wcd setup``: build a wiki's database from its dumps, streaming the shards.
+"""``wcd setup``: build a wiki's database from its content-history export, streaming the shards.
 
-    wcd setup --domain de.wikipedia.org [--mirror https://dumps.wikimedia.your.org] [--date 20261101]
+    wcd setup --domain de.wikipedia.org [--mirror PREFIX] [--date 2026-11-01]
 
-Finds the wiki's dumps (database name from the site's siteinfo, the newest run
-whose page-history dump is finished, or ``--date``), then works through the
-history dump's files ("shards") as they arrive instead of waiting for all of
-them:
+Finds the wiki's MediaWiki Content File Export (``wcd_pipeline.dumps``: database
+name from the site's siteinfo, the newest published run, or ``--date``), then
+works through the export's files ("shards") as they arrive instead of waiting
+for all of them:
 
   download ──► RevisionChest build ──► extract (Stage 1)        per shard, overlapped
                                                                ─── barrier: every shard done ───
   init-db → stage0-load → dedup → load → gate 3 → parts → … → revision-stats     whole wiki
 
 ``--download-jobs`` files download at once (largest first, so the longest
-shards start early); as each is verified (sha1) it is queued for one of
+shards start early); as each is verified (sha256) it is queued for one of
 ``--jobs`` workers, which builds its bundle and metadata and queues its
 extraction. So downloading, Stage 0 and Stage 1 overlap, and the run only
 waits at the first step that needs the whole wiki: ``stage0-load`` (it
@@ -20,8 +20,8 @@ rebuilds the domain's ``revisions`` dataset from every shard's metadata), then
 ``dedup`` and everything after it, which run in the runbook's order.
 ``--shards-only`` stops at the barrier.
 
-A wiki with fewer dump files than ``--jobs`` (small and mid-sized wikis publish
-their whole history as one file) would extract on one core per file, so each
+A wiki with fewer export files than ``--jobs`` (small wikis publish their whole
+history as one file) would extract on one core per file, so each
 bundle is then cut on page boundaries into about ``jobs / files`` pieces that
 the workers share (``--pieces`` to choose). A wiki with many shards is not cut:
 more units would mean more small Parquet files per bucket.
@@ -35,15 +35,15 @@ others finish) without touching the barrier.
 
 Layout, under ``--work-dir`` (default ``WCD_WORK_DIR``, else ``./wcd-work``)::
 
-    <work>/<domain>/<dbname>-<date>/
-        dumps/      the dump files (or --dumps-dir)
+    <work>/<domain>/<dbname>-<YYYYMMDD>/
+        dumps/      the export files (or --dumps-dir)
         bundles/    .mwrev.zst bundles           meta/   per-shard RevisionChest metadata
         pieces/     bundle pieces (deleted once extracted)
         staging/    Stage 1 staging, then dedup  state/  markers      logs/  per shard and step
 
 The Parquet tier goes to ``PARQUET_DIR`` (``--parquet-dir``) and Postgres to
 ``DATABASE_URL``, as for every stage. Global source ids are qualified with the
-run id ``<dbname>-<date>`` (``WCD_RUN_ID``, unless set). DuckDB and Postgres
+run id ``<dbname>-<YYYYMMDD>`` (``WCD_RUN_ID``, unless set), the export's cutoff date. DuckDB and Postgres
 settings for the whole-wiki steps come from the environment, as in the runbook.
 """
 from __future__ import annotations
@@ -76,7 +76,7 @@ MIN_PIECE_BYTES = 8 * 2**20
 
 def bundle_name(dump_name: str) -> str:
     """RevisionChest's ``bundle_name``: one trailing ``.bz2``/``.7z``/``.gz``/``.xml`` dropped,
-    ``.mwrev.zst`` appended (``…history1.xml-p1p857.7z`` → ``…history1.xml-p1p857.mwrev.zst``)."""
+    ``.mwrev.zst`` appended (``enwiki-2026-11-01-p1p794.xml.7z`` → ``enwiki-2026-11-01-p1p794.xml.mwrev.zst``)."""
     for ext in (".bz2", ".7z", ".gz", ".xml"):
         if dump_name.endswith(ext):
             return dump_name[: -len(ext)] + ".mwrev.zst"
@@ -143,11 +143,11 @@ class Progress:
 
 
 class ShardRunner:
-    """Downloads, builds and extracts the shards of one dump run.
+    """Downloads, builds and extracts the shards of one export run.
 
     One queue feeds ``--jobs`` workers with two kinds of work: a downloaded shard
     to build (RevisionChest) and an extract unit (Stage 1). A shard is one unit,
-    unless the dump has fewer files than ``--jobs``: then each bundle is cut on
+    unless the export has fewer files than ``--jobs``: then each bundle is cut on
     page boundaries into ~``jobs / files`` pieces (``split_bundle``), so a wiki
     whose history is one file still uses every worker. Pieces are disposable and
     deleted once extracted; the shard's metadata still refers to its bundle."""
@@ -404,32 +404,34 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--domain", required=True, help="the wiki, e.g. de.wikipedia.org")
     ap.add_argument("--mirror", default=os.getenv("DUMPS_MIRROR", dumps.PRIMARY),
-                    help=f"dump URL prefix, laid out like {dumps.PRIMARY} (e.g. https://dumps.wikimedia.your.org; "
-                         "default DUMPS_MIRROR, else the primary site)")
-    ap.add_argument("--date", help="dump run date (YYYYMMDD); default: the newest run whose history dump is done")
-    ap.add_argument("--dbname", help="the wiki's dump name (e.g. dewiki); default: its siteinfo wikiid")
-    ap.add_argument("--format", choices=sorted(dumps.HISTORY_JOBS), default="7z", help="history dump format (default 7z)")
+                    help=f"URL prefix laid out like {dumps.PRIMARY}, holding {dumps.DATASET}/ "
+                         "(default DUMPS_MIRROR, else the primary site)")
+    ap.add_argument("--date", help="export date (YYYY-MM-DD or YYYYMMDD; the 1st of a month); default: the newest "
+                                   "published export")
+    ap.add_argument("--dbname", help="the wiki's database name (e.g. dewiki); default: its siteinfo wikiid")
+    ap.add_argument("--format", choices=sorted(dumps.FORMATS), default="7z", help="export compression (default 7z)")
     ap.add_argument("--work-dir", default=os.getenv("WCD_WORK_DIR", "./wcd-work"),
                     help="root of the run directories (default WCD_WORK_DIR, else ./wcd-work)")
-    ap.add_argument("--dumps-dir", help="where the dump files go (default <run>/dumps); point at an existing "
+    ap.add_argument("--dumps-dir", help="where the export files go (default <run>/dumps); point at an existing "
                                         "download to reuse it (files with <name>.ok are not fetched again)")
     ap.add_argument("--parquet-dir", default=os.getenv("PARQUET_DIR"), help="Parquet tier base (default PARQUET_DIR)")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4,
                     help="workers (each builds a shard or extracts a unit at a time), and --jobs of the whole-wiki "
                          "steps (default: CPU count; each extract worker can take ~2 GB)")
-    ap.add_argument("--download-jobs", type=int, default=4, help="concurrent downloads (default 4)")
+    ap.add_argument("--download-jobs", type=int, default=dumps.MAX_CONNECTIONS,
+                    help=f"concurrent downloads (default {dumps.MAX_CONNECTIONS}: dumps.wikimedia.org's cap per IP)")
     ap.add_argument("--max-ahead", type=int, default=None,
                     help="downloaded-but-unbuilt shards allowed at once (disk); default unlimited, or 2 × --jobs "
                          "with --delete-dumps")
-    ap.add_argument("--delete-dumps", action="store_true", help="delete each dump file once its bundle is built")
+    ap.add_argument("--delete-dumps", action="store_true", help="delete each export file once its bundle is built")
     ap.add_argument("--pieces", type=int, default=0,
                     help="cut each bundle into this many pieces for Stage 1 (default 0: automatic, only when the "
-                         "dump has fewer files than --jobs, into ~jobs/files pieces of at least 8 MiB)")
+                         "export has fewer files than --jobs, into ~jobs/files pieces of at least 8 MiB)")
     ap.add_argument("--namespace", default="0", help="namespaces to keep, comma-separated (default 0; '' for all)")
     ap.add_argument("--revisionchest", default=os.getenv("REVISIONCHEST") or (
         str(DEFAULT_REVISIONCHEST) if DEFAULT_REVISIONCHEST.exists() else shutil.which("RevisionChest") or "RevisionChest"),
                     help="RevisionChest binary (default REVISIONCHEST, the repo's release build, or PATH)")
-    ap.add_argument("--run-id", help="WCD_RUN_ID for the build (default: WCD_RUN_ID, else <dbname>-<date>)")
+    ap.add_argument("--run-id", help="WCD_RUN_ID for the build (default: WCD_RUN_ID, else <dbname>-<YYYYMMDD>)")
     ap.add_argument("--shards-only", action="store_true", help="stop at the barrier (all shards built and extracted)")
     ap.add_argument("--from-step", help="redo the whole-wiki steps from this one (their markers are removed)")
     ap.add_argument("--status-interval", type=float, default=60, help="seconds between progress lines (default 60)")
@@ -443,9 +445,20 @@ def main(argv=None) -> int:
         ap.error(f"--from-step must be one of: {', '.join(steps_preview)}")
     if args.jobs < 1 or args.download_jobs < 1 or args.pieces < 0:
         ap.error("--jobs and --download-jobs must be at least 1, --pieces at least 0")
+    if args.download_jobs > dumps.MAX_CONNECTIONS and args.mirror.rstrip("/") == dumps.PRIMARY:
+        log(f"warning: --download-jobs {args.download_jobs} is over {dumps.PRIMARY}'s cap of "
+            f"{dumps.MAX_CONNECTIONS} connections per IP; the extra connections will be refused (429) and retried")
 
+    if args.mirror.rstrip("/") == dumps.PRIMARY and not (
+            os.getenv("WIKIPEDIA_API_CONTACT_EMAIL") or os.getenv("CONTACT_EMAIL")):
+        log(f"warning: no WIKIPEDIA_API_CONTACT_EMAIL; {dumps.PRIMARY} enforces the Wikimedia User-Agent "
+            "policy (a contact in the User-Agent) and may block downloads without one")
     dbname = args.dbname or dumps.wiki_dbname(args.domain)
-    run = dumps.find_run(dbname, prefix=args.mirror, date=args.date, fmt=args.format, log=log)
+    try:
+        run = dumps.find_run(dbname, prefix=args.mirror, date=args.date, fmt=args.format, log=log)
+    except dumps.DumpError as e:
+        log(f"error: {e}")
+        return 2
     run_dir = Path(args.work_dir) / args.domain / run.run_id
     dumps_dir = Path(args.dumps_dir) if args.dumps_dir else run_dir / "dumps"
     run_id = args.run_id or os.getenv("WCD_RUN_ID") or run.run_id
@@ -453,7 +466,7 @@ def main(argv=None) -> int:
         check_run_id(run_id)
     except ValueError as e:
         ap.error(f"{e} (pass --run-id)")
-    log(f"{args.domain}: {run.dbname} {run.date} {run.job}, {len(run.files)} files, {_gb(run.total_bytes)} "
+    log(f"{args.domain}: {run.dbname} {run.date} content-history export ({run.fmt}), {len(run.files)} files, {_gb(run.total_bytes)} "
         f"from {args.mirror}; run {run_dir} (run id {run_id})")
     if args.dry_run:
         for f in sorted(run.files, key=lambda f: -f.size):
@@ -463,7 +476,7 @@ def main(argv=None) -> int:
 
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "run.json").write_text(json.dumps({
-        "domain": args.domain, "dbname": run.dbname, "date": run.date, "job": run.job, "mirror": args.mirror,
+        "domain": args.domain, "dbname": run.dbname, "date": run.date, "dataset": dumps.DATASET, "format": run.fmt, "mirror": args.mirror,
         "run_id": run_id, "namespace": args.namespace, "files": [f.__dict__ for f in run.files]}, indent=1))
     # the steps run as child processes with this environment (this process's own is left alone)
     env = {**os.environ, "PARQUET_DIR": args.parquet_dir, "STAGING_DIR": str(run_dir / "staging"), "WCD_RUN_ID": run_id}

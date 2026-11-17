@@ -1,6 +1,6 @@
 """Build a small MediaWiki XML dump containing only selected pages.
 
-Streams one or more ``pages-meta-history`` XML dumps (``.xml`` or
+Streams one or more full-history XML dumps (content-history exports; ``.xml`` or
 ``.xml.bz2``; for ``.7z`` pipe ``7z x -so FILE`` into ``-``) and writes a
 single, valid dump holding the full revision history of every page whose id
 or title is listed in the page-list file. The output is what RevisionChest
@@ -13,7 +13,7 @@ ignored. Which pages go on that list is decided by the sampling strategy
 
 Usage:
     wcd fixture-dump -p pages.txt -o fixture.xml.bz2 DUMP [DUMP ...]
-    7z x -so enwiki-…-pages-meta-history1.xml-p1p857.7z | wcd fixture-dump -p pages.txt -o out.xml.bz2 -
+    7z x -so enwiki-2026-11-01-p1p794.xml.7z | wcd fixture-dump -p pages.txt -o out.xml.bz2 -
 """
 from __future__ import annotations
 

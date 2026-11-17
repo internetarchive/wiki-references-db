@@ -805,3 +805,28 @@ InternetArchiveBot needs the date a link was added to an article, to pick the ar
 **Decisions taken without asking:** absences under 7 days are merged (vandalism and its revert); a form change is marked only for a conversion to short-form citations (every text edit makes a new normalized form, which would mark nearly every source); "Order in article" is not offered (citation positions are not stored) and Bibcode is not a badge (not extracted); forms show the normalized text, repaired for display; the report links of the old citations list moved into each form row.
 
 **Seen on the way:** global sources from author+year fuzzy matching can gather unrelated citations (Albert Einstein's "Einstein" by Woolley lists citations of other works); that is Stage 6 matching quality, not the page.
+
+## 29. `wcd setup` reads the MediaWiki Content File Exports; the legacy dumps are dropped (2026-11-17)
+
+**Why.** Wikimedia is retiring the legacy `pages-meta-history` XML dumps: they are marked "Deprecated, sunset in January 2027", none are published after that, and they are already late. On 2026-11-17 the enwiki-20261101 bz2 history job had been running for 9 days with about a quarter of its files written. The replacement is the MediaWiki Content File Exports (<https://wikitech.wikimedia.org/wiki/MediaWiki_Content_File_Exports>), which use the same export-0.11 XML. The enwiki 2026-11-01 export was complete on 2026-11-12. This came up while preparing the sync benchmark (SCA-389), which needs a build from a recent base.
+
+**What.** `wcd_pipeline.dumps` now only reads `<prefix>/other/mediawiki_content_history/<dbname>/<YYYY-MM-DD>/xml/<7z|bzip2>/`:
+- A run is published once its `SHA256SUMS` exists, and that file is the file list.
+- File sizes come from the directory listing's `href`s (nginx truncates the displayed names), with a HEAD request for any size the listing lacks.
+- Downloads are verified against sha256.
+
+The `dumpstatus.json` code, the sha1 checks and `scripts/revisionchest_dump_pipeline.sh` are gone. `--date` takes `YYYY-MM-DD` or `YYYYMMDD`, and the run id stays `<dbname>-<YYYYMMDD>` (`enwiki-20261101`). Runbook "Setting up a wiki" rewritten.
+
+**Properties of the new source that matter here.**
+- **Cutoff.** An export is the wiki at 00:00 UTC on the 1st, one consistent snapshot. The legacy cutoff varied by page over the days the stubs took (Nov 1–7 for 20261101). This gives a fixed seam for a sync: RevisionChest `sync` from before the 1st covers it.
+- **Size.** enwiki is 3,429 files and 197.0 GB of 7z, against 980 files and 240.7 GB for the legacy 20261001 set.
+- **Split pages.** 61 very large pages are split by revision range over 256 files (`…-p<page>r<lo>r<hi>.xml.7z`), so one page's history can span bundles. Stage 1 is per revision (`PageRefCache` is only a memo, cleared on each page change), so its output does not depend on this. Sync bundles have the same property.
+
+**Verified.**
+- `test_setup_wiki.py` was rewritten against a local site in the export layout. It covers newest-published discovery; skipping a run with no `SHA256SUMS` and one with an empty `SHA256SUMS`; both date forms; listing sizes plus the HEAD fallback; resumed sha256-verified downloads; streaming, resume, pieces and `--delete-dumps`; and the whole-wiki build on Postgres.
+- The full suite passes on Postgres. The `test_fixture_ci` goldens and the API source tests fail only when a local `.env` sets `WCD_RUN_ID`, because that prefixes global source ids.
+- Live checks: a dry run found enwiki 2026-11-01 in 1.7 s, every size from the listing, and refused the unpublished 2026-12-01. One export file, sha256-verified, built with RevisionChest unchanged; its newest revision was 2026-10-31T01:46Z.
+
+**Decisions taken without asking:** 7z stays the default format. A mirror must have the same layout; mirrors are due to receive the exports by rsync from December 2026.
+
+**Open:** following an export that is still being written. Its files are not listed in `SHA256SUMS` until the end, so setup waits for publication.
