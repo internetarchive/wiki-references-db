@@ -92,9 +92,13 @@ same (export-0.11), but the source changed in four ways:
 export (or `--date`, as `YYYY-MM-DD` or `YYYYMMDD`), and **streams the
 export's files** instead of waiting for all of them:
 
-* `--download-jobs` (4) files download at once, largest first, resuming
+* `--download-jobs` (3) files download at once, largest first, resuming
   (`.part`, HTTP Range) and verified against their size and sha256
   (`<file>.ok`, so `--dumps-dir` can point at an existing download).
+  dumps.wikimedia.org allows **3 connections per IP** and enforces the
+  Wikimedia User-Agent policy: set `WIKIPEDIA_API_CONTACT_EMAIL` (setup warns
+  without it). A 429 is waited out (`Retry-After`, else backoff) and retried,
+  not counted as a failed file.
 * As each file is verified, one of `--jobs` shard workers runs `RevisionChest
   build` on it (bundle + that shard's metadata Parquet) and then Stage 1
   `extract` on the bundle. Downloading, the Stage 0 build and Stage 1 overlap.
