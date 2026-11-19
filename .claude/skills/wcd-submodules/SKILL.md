@@ -11,7 +11,8 @@ description: Edit the WCD git submodules (packages/extractor, packages/normalize
 | `packages/normalizer` | internetarchive/wiki-references-normalizer | `citation_normalizer` |
 | `rust/revisionchest` | internetarchive/RevisionChest | Cargo workspace: `mwdump`, `mwrev`, `revisionchest-meta`, the `RevisionChest` binary |
 
-Each submodule tracks a local `v3` branch. Each is its own repository, used
+Each submodule tracks its upstream `main` branch (the former `v3` branches
+were merged into `main` in November 2026). Each is its own repository, used
 outside this monorepo too.
 
 ## Rules
@@ -32,7 +33,7 @@ outside this monorepo too.
 ```
 git submodule update --init --recursive        # after any pull
 cd packages/extractor
-git status && git switch v3                     # don't commit on a detached HEAD
+git status && git switch main                   # don't commit on a detached HEAD
 # … edit, then run the submodule's own tests:
 uv run pytest packages/extractor/tests -q       # from the repo root (the workspace includes them)
 git commit -am "…"                              # inside the submodule
@@ -58,8 +59,7 @@ fixture `fixture.xml` must stay byte-exact (don't let an editor reformat it).
 
 CI checks out with `submodules: recursive`, so every submodule commit that the
 superproject points at must be reachable on that submodule's remote. Push the
-submodule branch first, then the superproject. At the time of writing, the
-extractor's and RevisionChest's `v3` branches exist only locally. **Ask the
+submodule branch first, then the superproject. **Ask the
 owner before pushing anything to an internetarchive remote.**
 
 `git diff --submodule=log` shows which submodule commits a superproject
