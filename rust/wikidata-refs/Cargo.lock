@@ -963,7 +963,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mwrev"
-version = "0.2.0"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3711778ad84b74dd6960625d3c84d6dcd09ab701434c20a4277ca05f18935ad7"
 dependencies = [
  "thiserror",
  "zstd",

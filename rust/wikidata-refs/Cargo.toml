@@ -16,8 +16,8 @@ name = "wikidata-refs"
 path = "src/main.rs"
 
 [dependencies]
-# The bundle format. From the RevisionChest submodule until `mwrev` is on crates.io.
-mwrev = { path = "../revisionchest/crates/mwrev" }
+# The bundle format, as RevisionChest publishes it.
+mwrev = "0.1"
 # The Wikibase data model and the reference diff (`scatter_wikibase_changeset::refs`).
 scatter-wikibase-model = { git = "https://github.com/scatterbase/triplespace", branch = "main" }
 scatter-wikibase-changeset = { git = "https://github.com/scatterbase/triplespace", branch = "main" }

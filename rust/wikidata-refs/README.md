@@ -68,8 +68,8 @@ cargo build --release      # target/release/wikidata-refs
 cargo test
 ```
 
-`mwrev` is taken from the RevisionChest submodule (`../revisionchest`) and
-needs `RevisionHeader::text_hidden`; the two scatter crates are git
+`mwrev` comes from crates.io (0.1, which has `RevisionHeader::text_hidden`),
+not from the RevisionChest submodule; the two scatter crates are git
 dependencies on scatterbase/triplespace `main`, at the commit `Cargo.lock`
 pins (`cargo update -p scatter-wikibase-changeset -p scatter-wikibase-model`
 moves it).
