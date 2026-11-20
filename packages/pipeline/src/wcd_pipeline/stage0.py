@@ -187,8 +187,11 @@ def _sorted_revisions(path: str, bundle_ids: dict[str, int], work_dir: str) -> s
     con.execute("CREATE TEMP TABLE bundle_ids (file_path VARCHAR, id INTEGER)")
     con.executemany("INSERT INTO bundle_ids VALUES (?, ?)", list(bundle_ids.items()))
     con.execute(
-        f"""COPY (SELECT m.rev_id, m.page_id, m.parent_rev_id, m.timestamp, b.id AS bundle_id,
-                         m.offset_begin, m.length
+        # BIGINT throughout: files whose IDs are int64 and uint64, read together by name,
+        # would widen to a 128-bit integer, which has no row-group statistics to range on.
+        f"""COPY (SELECT m.rev_id::BIGINT AS rev_id, m.page_id::BIGINT AS page_id,
+                         m.parent_rev_id::BIGINT AS parent_rev_id, m.timestamp, b.id AS bundle_id,
+                         m.offset_begin::BIGINT AS offset_begin, m.length::BIGINT AS length
                   FROM {metadata_source(path)} m LEFT JOIN bundle_ids b USING (file_path)
                   WHERE m.type = 'revision' ORDER BY m.rev_id)
             TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {REVISION_GROUP})"""

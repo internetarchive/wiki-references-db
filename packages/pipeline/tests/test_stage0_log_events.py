@@ -38,7 +38,7 @@ def _metadata(dirpath):
     con.execute("""COPY (SELECT 'page' AS type, 7::UBIGINT AS page_id, 0::BIGINT AS ns, 'P7' AS title,
                           NULL::UBIGINT AS rev_id, NULL::UBIGINT AS parent_rev_id, NULL AS file_path,
                           NULL::UBIGINT AS offset_begin, NULL::UBIGINT AS length, NULL AS timestamp)
-                   TO '{}' (FORMAT PARQUET)""".format(dirpath / "old.parquet"))
+                   TO '""" + str(dirpath / "old.parquet") + "' (FORMAT PARQUET)")
     # A file from a sync that saw a revision being hidden and a page deleted.
     con.execute("""COPY (SELECT * FROM (VALUES
                      ('log', 7::UBIGINT, 0::BIGINT, 'P7', NULL::UBIGINT, NULL::UBIGINT, NULL, NULL::UBIGINT,
@@ -48,7 +48,7 @@ def _metadata(dirpath):
                       3, NULL, 'delete', 'delete', NULL))
                    AS t(type, page_id, ns, title, rev_id, parent_rev_id, file_path, offset_begin, length,
                         timestamp, rcid, log_id, log_type, log_action, log_params))
-                   TO '{}' (FORMAT PARQUET)""".format(dirpath / "new.parquet"))
+                   TO '""" + str(dirpath / "new.parquet") + "' (FORMAT PARQUET)")
 
 
 def test_old_and_new_metadata_read_together_and_log_rows_load_once(engine, tmp_path):
@@ -73,8 +73,8 @@ def test_old_and_new_metadata_read_together_and_log_rows_load_once(engine, tmp_p
 
 def test_metadata_without_log_rows_loads_none(engine, tmp_path):
     con = duckdb.connect()
-    con.execute("COPY (SELECT 'page' AS type, 1::UBIGINT AS page_id) TO '{}' (FORMAT PARQUET)"
-                .format(tmp_path / "m.parquet"))
+    con.execute("COPY (SELECT 'page' AS type, 1::UBIGINT AS page_id) TO '"
+                + str(tmp_path / "m.parquet") + "' (FORMAT PARQUET)")
     session = sessionmaker(bind=engine)()
     try:
         assert stage0.load_log_events(session, str(tmp_path), stage0.ensure_domain(session, DOMAIN)) == 0
