@@ -115,6 +115,22 @@
       ],
       "stored": "full"
     },
+    "pg.log_events": {
+      "rows": 0,
+      "columns": [
+        "domain_id__value",
+        "rcid",
+        "log_id",
+        "log_type",
+        "log_action",
+        "page_id",
+        "page_namespace",
+        "page_title",
+        "log_timestamp",
+        "log_params"
+      ],
+      "stored": "full"
+    },
     "pg.normalized_citation_parts": {
       "rows": 8538,
       "columns": [
@@ -614,25 +630,25 @@
     }
   },
   "timings_seconds": {
-    "init-db --no-indexes": 0.22,
-    "stage0-load": 1.2,
-    "gate 0": 0.06,
-    "extract-all": 60.12,
-    "dedup": 0.19,
-    "load": 5.25,
-    "gate 3": 0.28,
-    "init-db --add-indexes": 0.28,
-    "parts": 3.09,
-    "gate 4": 0.04,
-    "denorm-export": 0.67,
-    "ref-name-links": 1.52,
-    "gate 5": 0.06,
-    "match": 5.0,
-    "gate 6": 0.04,
-    "materialize": 10.87,
-    "gate 7": 0.09,
-    "revision-stats": 0.91,
-    "gate 8": 0.03
+    "init-db --no-indexes": 0.03,
+    "stage0-load": 3.37,
+    "gate 0": 0.02,
+    "extract-all": 20.32,
+    "dedup": 0.05,
+    "load": 2.17,
+    "gate 3": 0.07,
+    "init-db --add-indexes": 0.03,
+    "parts": 1.17,
+    "gate 4": 0.01,
+    "denorm-export": 0.16,
+    "ref-name-links": 0.42,
+    "gate 5": 0.09,
+    "match": 2.81,
+    "gate 6": 0.05,
+    "materialize": 1.23,
+    "gate 7": 0.04,
+    "revision-stats": 0.57,
+    "gate 8": 0.01
   },
-  "recorded": "2026-11-11T02:55:02+00:00"
+  "recorded": "2026-11-20T05:19:05+00:00"
 }
