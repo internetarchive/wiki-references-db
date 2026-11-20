@@ -1,0 +1,22 @@
+{
+  "wikidata_reference_events": [
+    ["page_id", "int32"],
+    ["entity_id", "string"],
+    ["revision_id", "int64"],
+    ["revision_timestamp", "timestamp[s]"],
+    ["statement_id", "string"],
+    ["statement_property", "string"],
+    ["reference_hash", "string"],
+    ["added", "bool"],
+    ["baseline", "bool"]
+  ],
+  "wikidata_reference_snaks": [
+    ["page_id", "int32"],
+    ["reference_hash", "string"],
+    ["snak_order", "int32"],
+    ["property", "string"],
+    ["snaktype", "string"],
+    ["value_type", "string"],
+    ["value", "string"]
+  ]
+}

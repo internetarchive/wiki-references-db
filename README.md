@@ -37,6 +37,9 @@ rust/
                   bundle format), `revisionchest-meta` (Parquet / Postgres
                   metadata sinks) and the `RevisionChest` binary (build, sync).
                   Stage 0: XML dumps → bundles + revisions / page_metadata.
+  wikidata-refs/  Stage 1 for a Wikibase wiki (Wikidata): folds each entity's revisions in
+                  the bundles into reference-added / reference-removed events, as staging
+                  Parquet. A crate of its own, not part of the RevisionChest workspace.
 legacy/         the v1 Flask API and explorer, frozen; served until v2 cutover.
 fixtures/       committed test inputs and golden outputs (see fixtures/README.md).
 docs/design/    the plan: proposed_*.md, decisions, executive summary.
