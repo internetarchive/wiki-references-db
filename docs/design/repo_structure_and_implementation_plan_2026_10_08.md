@@ -863,3 +863,28 @@ The `dumpstatus.json` code, the sha1 checks and `scripts/revisionchest_dump_pipe
 - **Whether wikidatawiki is in the MediaWiki Content File Exports** (§29) has not been checked.
 - **Dependencies.** The two scatter crates are git dependencies on scatterbase/triplespace `main`, at the commit `Cargo.lock` pins (the merge of scatterbase/triplespace#275), and the RevisionChest submodule is on its `main` (the merge of internetarchive/RevisionChest#9), both since 2026-11-19. `mwrev` is a path dependency until it is on crates.io.
 - **Scale.** No throughput or size numbers. Every revision is parsed in full and every reference re-hashed; if that is too slow, cache computed hashes by the hash the revision carries, within a page.
+
+## 31. RevisionChest `sync` on `mwrecent`: committed positions, gaps and log events (2026-11-20)
+
+**Why.** `sync` resumed a fixed overlap before its newest recorded revision (24 hours, then 60 minutes), which repeats revisions after a restart without Postgres and misses those committed late; it refused any store more than 30 days old, fetched no log events, and so could not record a deletion or a hidden revision (SCA-449).
+
+**What.**
+- `sync` follows recent changes through `mwrecent` (RevisionChest's poller, ported from Triplespace), coalescing off: every revision is kept. Late changes are found by the settle window and the tail pass (`--settle`, `--tail`), repeats dropped by `rcid`.
+- A cycle commits its bundle frames, metadata and position together (`recentchanges/position.json`). A cycle that did not commit is rolled forward on the next start from the bundles (`mwrev::recover`): its revisions are reported again, not fetched again; a frame cut off part way is cut back; its unfinished Parquet file is removed. `--overlap` is gone.
+- A gap (a position older than `--rc-max-age` days and than the wiki's oldest retained change) refuses to start; `--accept-gap` resumes from the oldest change and records the gap in `recentchanges/gaps.jsonl`.
+- Log events are recorded, never applied to bundles: `log` rows in the Parquet metadata (new columns `rcid`, `log_id`, `log_type`, `log_action`, `log_params`) and the new Stage-0 table `log_events`. Readers derive deletions and hidden revisions from them. `stage0-load` loads them, and reads old and new metadata files together (`union_by_name`). `fixtures/golden/stage0/fixture.parquet` is regenerated from the release binary: the same 13 rows, field for field, with the five log columns added and null.
+
+**Verified.**
+- RevisionChest: `cargo test`, `clippy -D warnings` and `fmt` over the workspace. The `sync` tests run against a fake wiki: a restart after a cycle that appended but did not commit (with a half-written Parquet file and a frame cut off part way) neither fetches nor writes a revision twice and reports the rolled-forward locations correctly; a duplicate row and a late one are written once; a gap is refused, then accepted and recorded; a quiet wiki within its retention is no gap; log events and hidden text; a backlog read by continuation. The Postgres sink test, with `log_events`, against a scratch Postgres 18.
+- **Not verified:** the Python tests (`test_stage0_log_events.py` and the DDL parity test were not run: no `uv` on the machine), and no run against a live wiki.
+
+**Decisions taken without asking.**
+- `--rc-max-age` defaults to 30 days (Wikimedia's `$wgRCMaxAge`); a gap needs the position to be older than that *and* than the oldest retained change, so a quiet wiki is not refused.
+- Accepted gaps go to `recentchanges/gaps.jsonl`, not to the metadata sinks.
+- `log_events` is keyed `(domain_id, rcid)`; `log_params` is JSONB as the wiki sent it.
+- `mwrecent` reads every namespace when given none, and carries the log entry's ID.
+
+**Open.**
+- **Live run across a restart**, the ticket's acceptance test, against a real wiki.
+- **Readers.** Nothing derives tombstones from `log_events` yet.
+

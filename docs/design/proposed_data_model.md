@@ -26,6 +26,7 @@ Domain — not language code, not project family — is the site identifier, so 
 |---|---|
 | `domains`, `containers` | Stage 3 load (from staging), plus RevisionChest's `domains` insert (same `value` key; idempotent) |
 | `revisions`, `revision_bundles`, `page_metadata` | **RevisionChest** (Stage 0), via its Postgres mode or a Stage 3 load of its `--parquet` metadata file |
+| `log_events` | **RevisionChest** `sync` (Stage 0): each log event from recent changes, as it came; deletions and hidden revisions are derived from these, never applied to the bundles |
 | `web_resources` (article curid URLs) | RevisionChest (Stage 0) |
 | `web_resources` (cited URLs), `normalized_citation_web_resources` | Stage 3 load |
 | `documents` | Nothing in Stages 0–8 (citation-graph phase). RevisionChest's title-keyed `documents` insert is removed. |

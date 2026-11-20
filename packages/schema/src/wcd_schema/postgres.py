@@ -288,6 +288,30 @@ class PageMetadata(Base):
 CITATION_TYPES = ('ref_tag', 'template', 'bare_url', 'endnote', 'shorthand', 'external_link')
 
 
+
+class LogEvent(Base):
+    """A log event from a wiki's recent changes (deletion, restoration,
+    revision-visibility change, suppression, move, merge), as RevisionChest's
+    ``sync`` received it. Bundles are never rewritten: whether a revision or
+    page is deleted or hidden is derived from these rows (a ``delete`` /
+    ``revision`` event names its revisions in ``log_params``), and a later
+    restoration lifts it."""
+    __tablename__ = 'log_events'
+    domain_id = Column(Integer, ForeignKey('domains.id'), nullable=False)
+    rcid = Column(BigInteger, nullable=False)
+    log_id = Column(BigInteger)
+    log_type = Column(String, nullable=False)
+    log_action = Column(String, nullable=False)
+    page_id = Column(Integer)
+    page_namespace = Column(Integer)
+    page_title = Column(String)
+    log_timestamp = Column(DateTime(timezone=False), nullable=False)
+    log_params = Column(JSONB)
+    __table_args__ = (
+        PrimaryKeyConstraint('domain_id', 'rcid', name='pk_log_events'),
+        Index('idx_log_events_page', 'domain_id', 'page_id'),
+    )
+
 class NormalizedCitation(Base):
     """One row per distinct normalized reference text (the ``<ref …>`` wrapper
     included). Semantic columns are on ``normalized_citation_parts``."""
@@ -657,7 +681,7 @@ class PageSummaryCache(Base):
 
 # Tables grouped by the stage that writes them, for `wcd init-db --table` and the gates.
 STAGE_TABLES = {
-    0: ('domains', 'revision_bundles', 'revisions', 'page_metadata', 'web_resources'),
+    0: ('domains', 'revision_bundles', 'revisions', 'page_metadata', 'web_resources', 'log_events'),
     3: ('containers', 'domains', 'web_resources', 'wiki_templates', 'normalized_citations',
         'citation_instances', 'normalized_citation_web_resources', 'template_value_counts'),
     4: ('normalized_citation_parts',),

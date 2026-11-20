@@ -196,8 +196,11 @@ change to the order above.
 
 ### Stage 0 load: parallelism, memory, disk
 
-`wcd stage0-load` loads pages, then revisions, then writes the `revisions/`
-Parquet dataset and runs gate 0:
+`wcd stage0-load` loads pages, then revisions, then the log events `sync`
+recorded (`log_events`, once per `rcid`), then writes the `revisions/`
+Parquet dataset and runs gate 0. Metadata files from before RevisionChest
+recorded log events are read beside newer ones, their missing columns as
+NULL:
 
 * **Pages** (`page_metadata` and the article `web_resources` rows) are
   `COPY`'d in 100k-row batches and upserted with set-based SQL, one commit per

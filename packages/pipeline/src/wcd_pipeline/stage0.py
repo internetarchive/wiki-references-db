@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import re
 import shutil
@@ -33,11 +34,12 @@ import time
 
 import duckdb
 from sqlalchemy import create_engine, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
 from wcd_schema import parquet as layout
-from wcd_schema.postgres import Domain, RevisionBundle
+from wcd_schema.postgres import Domain, LogEvent, RevisionBundle
 
 from .config import database_url, load_dotenv  # noqa: F401
 
@@ -78,9 +80,16 @@ def metadata_glob(path: str) -> str:
     return os.path.join(path, "*.parquet") if os.path.isdir(path) else path
 
 
+def metadata_source(path: str) -> str:
+    """``read_parquet`` over the metadata, matching columns by name: files
+    written before RevisionChest recorded log events lack the ``rcid`` and
+    ``log_*`` columns, which read as NULL."""
+    return f"read_parquet('{metadata_glob(path)}', union_by_name=true)"
+
+
 def metadata_counts(path: str) -> dict:
     con = _duckdb()
-    rows = con.execute(f"SELECT type, count(*) FROM read_parquet('{metadata_glob(path)}') GROUP BY type").fetchall()
+    rows = con.execute(f"SELECT type, count(*) FROM {metadata_source(path)} GROUP BY type").fetchall()
     return {t: n for t, n in rows}
 
 
@@ -97,7 +106,7 @@ def ensure_domain(session: Session, domain: str) -> int:
 def load_bundles(session: Session, path: str) -> dict[str, int]:
     con = _duckdb()
     paths = [r[0] for r in con.execute(
-        f"SELECT DISTINCT file_path FROM read_parquet('{metadata_glob(path)}') WHERE type = 'revision' AND file_path IS NOT NULL ORDER BY 1"
+        f"SELECT DISTINCT file_path FROM {metadata_source(path)} WHERE type = 'revision' AND file_path IS NOT NULL ORDER BY 1"
     ).fetchall()]
     RevisionBundle.bulk_upsert(session, [{"file_path": p} for p in paths])
     session.commit()
@@ -122,7 +131,7 @@ def load_pages(session: Session, path: str, domain: str, domain_id: int) -> int:
     batch (overlapping ``sync`` files) is written once."""
     con = _duckdb()
     cur = con.execute(
-        f"SELECT page_id, ns, title FROM read_parquet('{metadata_glob(path)}') WHERE type = 'page' ORDER BY page_id"
+        f"SELECT page_id, ns, title FROM {metadata_source(path)} WHERE type = 'page' ORDER BY page_id"
     )
     url_prefix = f"https://{domain}/w/index.php?curid="
     n = 0
@@ -178,9 +187,12 @@ def _sorted_revisions(path: str, bundle_ids: dict[str, int], work_dir: str) -> s
     con.execute("CREATE TEMP TABLE bundle_ids (file_path VARCHAR, id INTEGER)")
     con.executemany("INSERT INTO bundle_ids VALUES (?, ?)", list(bundle_ids.items()))
     con.execute(
-        f"""COPY (SELECT m.rev_id, m.page_id, m.parent_rev_id, m.timestamp, b.id AS bundle_id,
-                         m.offset_begin, m.length
-                  FROM read_parquet('{metadata_glob(path)}') m LEFT JOIN bundle_ids b USING (file_path)
+        # BIGINT throughout: files whose IDs are int64 and uint64, read together by name,
+        # would widen to a 128-bit integer, which has no row-group statistics to range on.
+        f"""COPY (SELECT m.rev_id::BIGINT AS rev_id, m.page_id::BIGINT AS page_id,
+                         m.parent_rev_id::BIGINT AS parent_rev_id, m.timestamp, b.id AS bundle_id,
+                         m.offset_begin::BIGINT AS offset_begin, m.length::BIGINT AS length
+                  FROM {metadata_source(path)} m LEFT JOIN bundle_ids b USING (file_path)
                   WHERE m.type = 'revision' ORDER BY m.rev_id)
             TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {REVISION_GROUP})"""
     )
@@ -307,6 +319,32 @@ def load_revisions(session: Session, path: str, domain_id: int, bundle_ids: dict
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def load_log_events(session: Session, path: str, domain_id: int) -> int:
+    """``log_events`` from the metadata's ``log`` rows, which ``sync`` writes;
+    an event already loaded (same ``rcid``) is left as it is."""
+    if not metadata_counts(path).get("log"):
+        return 0
+    con = _duckdb()
+    rows = con.execute(
+        f"""SELECT rcid, log_id, log_type, log_action, page_id, ns, title, timestamp, log_params
+            FROM {metadata_source(path)} WHERE type = 'log' ORDER BY rcid"""
+    ).fetchall()
+    keys = ("rcid", "log_id", "log_type", "log_action", "page_id", "page_namespace",
+            "page_title", "log_timestamp", "log_params")
+    values = []
+    for r in rows:
+        v = dict(zip(keys, r))
+        v["domain_id"] = domain_id
+        v["log_params"] = json.loads(v["log_params"]) if v["log_params"] else None
+        values.append(v)
+    for i in range(0, len(values), BATCH):
+        stmt = pg_insert(LogEvent).values(values[i:i + BATCH]).on_conflict_do_nothing(
+            index_elements=["domain_id", "rcid"])
+        session.execute(stmt)
+    session.commit()
+    return len(values)
+
+
 def load_to_postgres(session: Session, path: str, domain: str, jobs: int = 8, work_dir: str | None = None) -> dict:
     domain_id = ensure_domain(session, domain)
     bundles = load_bundles(session, path)
@@ -315,7 +353,10 @@ def load_to_postgres(session: Session, path: str, domain: str, jobs: int = 8, wo
     log(f"{n_pages} page_metadata rows")
     n_revs = load_revisions(session, path, domain_id, bundles, jobs=jobs, work_dir=work_dir)
     log(f"{n_revs} revisions")
-    return {"domain_id": domain_id, "bundles": len(bundles), "pages": n_pages, "revisions": n_revs}
+    n_logs = load_log_events(session, path, domain_id)
+    log(f"{n_logs} log events")
+    return {"domain_id": domain_id, "bundles": len(bundles), "pages": n_pages, "revisions": n_revs,
+            "log_events": n_logs}
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +394,7 @@ def _write_revisions_parquet(path: str, domain: str, parquet_base: str, con: duc
     if domain_dir.exists():
         shutil.rmtree(domain_dir)
     dom = domain.replace("'", "''")
-    src = f"read_parquet('{metadata_glob(path)}')"
+    src = metadata_source(path)
     # The window that keeps one row per rev_id is the expensive part (enwiki:
     # 17 min of 1-2 cores and ~78 GB of spill, against 5 min without it), and
     # only overlapping files (``sync`` batches) produce duplicates: count them
@@ -427,7 +468,8 @@ def main(argv=None) -> int:
     MEMORY_LIMIT = args.memory_limit
 
     counts = metadata_counts(args.metadata)
-    log(f"metadata: {counts.get('page', 0)} page rows, {counts.get('revision', 0)} revision rows")
+    log(f"metadata: {counts.get('page', 0)} page rows, {counts.get('revision', 0)} revision rows, "
+        f"{counts.get('log', 0)} log rows")
     session = None
     if not args.no_postgres:
         session = make_session()
