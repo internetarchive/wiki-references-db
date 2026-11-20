@@ -70,5 +70,6 @@ cargo test
 
 `mwrev` is taken from the RevisionChest submodule (`../revisionchest`) and
 needs `RevisionHeader::text_hidden`; the two scatter crates are git
-dependencies on scatterbase/triplespace (its `reference-diff` branch until
-scatterbase/triplespace#275 merges).
+dependencies on scatterbase/triplespace `main`, at the commit `Cargo.lock`
+pins (`cargo update -p scatter-wikibase-changeset -p scatter-wikibase-model`
+moves it).

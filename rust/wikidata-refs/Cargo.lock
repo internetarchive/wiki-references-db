@@ -1308,7 +1308,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "scatter-normalize"
 version = "0.0.1"
-source = "git+https://github.com/scatterbase/triplespace?branch=reference-diff#a7474952dfd3831f6001b81b9a831a39eb9ee461"
+source = "git+https://github.com/scatterbase/triplespace?branch=main#c223550820e322aee5a3a74456a3cd4c3e840870"
 dependencies = [
  "getrandom 0.3.4",
  "icu_casemap",
@@ -1325,7 +1325,7 @@ dependencies = [
 [[package]]
 name = "scatter-providers"
 version = "0.0.1"
-source = "git+https://github.com/scatterbase/triplespace?branch=reference-diff#a7474952dfd3831f6001b81b9a831a39eb9ee461"
+source = "git+https://github.com/scatterbase/triplespace?branch=main#c223550820e322aee5a3a74456a3cd4c3e840870"
 dependencies = [
  "getrandom 0.3.4",
  "oxrdf",
@@ -1337,7 +1337,7 @@ dependencies = [
 [[package]]
 name = "scatter-wikibase-changeset"
 version = "0.0.1"
-source = "git+https://github.com/scatterbase/triplespace?branch=reference-diff#a7474952dfd3831f6001b81b9a831a39eb9ee461"
+source = "git+https://github.com/scatterbase/triplespace?branch=main#c223550820e322aee5a3a74456a3cd4c3e840870"
 dependencies = [
  "indexmap",
  "scatter-providers",
@@ -1351,7 +1351,7 @@ dependencies = [
 [[package]]
 name = "scatter-wikibase-model"
 version = "0.0.1"
-source = "git+https://github.com/scatterbase/triplespace?branch=reference-diff#a7474952dfd3831f6001b81b9a831a39eb9ee461"
+source = "git+https://github.com/scatterbase/triplespace?branch=main#c223550820e322aee5a3a74456a3cd4c3e840870"
 dependencies = [
  "getrandom 0.3.4",
  "indexmap",
