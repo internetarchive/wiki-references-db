@@ -6,7 +6,9 @@ to break without noticing.
 
 The WCD extracts every reference string from Wikipedia articles across their
 full revision history, resolves those strings to real-world sources, and serves
-the result through `/api/v2` and a dashboard. Work happens on the **`v3`** branch.
+the result through `/api/v2` and a dashboard. Work is done on a separate
+branch and merged into **`main`** by pull request; don't commit to `main`
+directly.
 
 ## Map
 
