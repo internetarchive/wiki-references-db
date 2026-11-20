@@ -17,6 +17,7 @@ the result through `/api/v2` and a dashboard. Work happens on the **`v3`** branc
 | `packages/semantic/` (`wcd_semantic`) | Vendored UVA classifiers, normalizers, matchers, scorer | Only under the vendoring rules in `packages/semantic/NOTICE` |
 | `apps/api/` (`wcd_api`, `wcd-api`) | FastAPI `/api/v2` (and `/api/v1` aliases) | Yes |
 | `apps/frontend/` | Dashboard: plain HTML/JS/CSS, no build step, served by the API at `/` | Yes |
+| `rust/wikidata-refs/` | Stage 1 for a Wikibase wiki: reference events from bundles of entity revisions. Its two staging tables are `wcd_schema.staging.WIKIBASE_SCHEMAS`; `tests/schema.json` is the Rust copy, held in step by `packages/schema/tests/test_wikidata_refs_schema_parity.py` | Yes |
 | `packages/extractor/`, `packages/normalizer/`, `rust/revisionchest/` | **Git submodules** (internetarchive repos) | Commit inside the submodule first; see skill `wcd-submodules` |
 | `legacy/` | Frozen v1 Flask API and explorer | **No.** Deleted at v2 cutover |
 | `fixtures/` | Committed test inputs and goldens | Only through the regeneration commands in `fixtures/README.md` |

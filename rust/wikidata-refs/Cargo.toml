@@ -1,0 +1,38 @@
+[package]
+name = "wikidata-refs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/internetarchive/wiki-references-db"
+description = "Stage 1 for a Wikibase wiki: folds each entity's revisions in RevisionChest bundles into reference-added and reference-removed events, as staging Parquet"
+publish = false
+
+[lib]
+name = "wikidata_refs"
+
+[[bin]]
+name = "wikidata-refs"
+path = "src/main.rs"
+
+[dependencies]
+# The bundle format. From the RevisionChest submodule until `mwrev` is on crates.io.
+mwrev = { path = "../revisionchest/crates/mwrev" }
+# The Wikibase data model and the reference diff (`scatter_wikibase_changeset::refs`).
+# On the `reference-diff` branch until scatterbase/triplespace#275 merges; then `main`.
+scatter-wikibase-model = { git = "https://github.com/scatterbase/triplespace", branch = "reference-diff" }
+scatter-wikibase-changeset = { git = "https://github.com/scatterbase/triplespace", branch = "reference-diff" }
+serde_json = "1"
+arrow = { version = "53.0", default-features = false }
+parquet = { version = "53.0", default-features = false, features = ["arrow", "zstd"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap = { version = "4.5", features = ["derive"] }
+rayon = "1.10"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

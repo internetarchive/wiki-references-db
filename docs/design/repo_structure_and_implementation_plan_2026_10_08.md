@@ -830,3 +830,36 @@ The `dumpstatus.json` code, the sha1 checks and `scripts/revisionchest_dump_pipe
 **Decisions taken without asking:** 7z stays the default format. A mirror must have the same layout; mirrors are due to receive the exports by rsync from December 2026.
 
 **Open:** following an export that is still being written. Its files are not listed in `SHA256SUMS` until the end, so setup waits for publication.
+
+## 30. Stage 1 for Wikidata: reference events from entity revisions (2026-11-19)
+
+**Why.** A Wikidata citations database needs what the Wikipedia one has: for each reference, when it arrived and when it left. On Wikidata the references are already structured, so there is nothing to extract from text. What is needed is the difference between consecutive revisions of an entity, over the whole history.
+
+**What.**
+- `rust/wikidata-refs` (`wikidata-refs extract`): reads `.mwrev.zst` bundles of entity revisions and writes two staging tables per bundle, `wikidata_reference_events` (one row per reference added to a statement or removed from one) and `wikidata_reference_snaks` (a reference's snaks, the first time a page shows it). The fold keeps only the previous revision's reference keys. Its README has the rules.
+- The schemas are `wcd_schema.staging.WIKIBASE_SCHEMAS`. The crate keeps a copy (`tests/schema.json`), held in step from both sides: its own test and `test_wikidata_refs_schema_parity.py`.
+- RevisionChest: a bundle header carries ` text_hidden=1` when the wiki has hidden the revision's text (`build` from the dump's `deleted="deleted"`, `sync` from `texthidden`). It was written as a blank revision, which a diff reads as every reference removed and then added back. Existing bundles and readers are unaffected: the key is absent otherwise, and `wcd_pipeline.extract` ignores keys it does not know.
+- The reading of an entity and the reference diff come from scatterbase/triplespace (`scatter-wikibase-model`, `scatter_wikibase_changeset::refs`), as git dependencies. `mwrev` is made publishable (crates.io has no crate of that name).
+
+**Verified.**
+- `cargo test`, `clippy -D warnings` and `fmt` in `rust/wikidata-refs` (5 tests, one running the binary over a bundle and reading the Parquet back) and in RevisionChest; the fast pytest tier (313 passed; the Postgres tier was not run).
+- **A real Wikibase's history, end to end.** `RevisionChest build` on Triplespace's Librarybase sample dump (254 entities, 295 revisions), then `extract`: all 295 revisions read as entities, none unparsed. That sample has no references, so it shows the reading and not the diff.
+- **Real Wikidata references.** The five Wikidata entities in Triplespace's samples (551 references on their statements), each written into a bundle as three revisions (without references, with, without): 551 added and 551 removed, every `(statement_id, reference_hash)` equal to the statement GUID and the reference hash Wikidata itself serves. DuckDB reads `revision_timestamp` as a `TIMESTAMP`.
+- **Not verified: no Wikidata history dump has been read.** Nothing here measures the legacy revisions, hidden revisions or redirects of real history, or throughput.
+
+**Decisions taken without asking.**
+- A reference is (statement, recomputed reference hash); the hash a revision carries is ignored.
+- A hidden, legacy or unreadable revision leaves the state standing; a redirect removes every reference.
+- Events carry `entity_id` and `revision_timestamp`, though both can be joined from Stage 0.
+- Default namespaces 0 and 120 (items and properties); lexemes are left out.
+- Snaks are deduplicated per page only; a global pass belongs to a consolidating stage.
+- The crate is outside the RevisionChest workspace and the uv workspace, with its own `Cargo.toml`.
+
+**Open.**
+- **Legacy revisions.** Wikibase's serialization of before 2014-2015 is counted and skipped. References added in that period will be dated late until it is read. How many revisions this is has to be measured on a history file.
+- **Split pages.** The first state of a page's continuation is written with `baseline = true`; nothing joins the parts yet.
+- **Later stages.** No dedup, load, gate or API for these tables. Reference URLs (`P854` and the like) have not been put through the normalizer, and "stated in" values are item IDs, not yet sources.
+- **Sync.** `sync` bundles are refused (not grouped by page); following Wikidata needs the fold to start from a stored state.
+- **Whether wikidatawiki is in the MediaWiki Content File Exports** (§29) has not been checked.
+- **Dependencies.** Until scatterbase/triplespace#275 merges, the two scatter crates are taken from its `reference-diff` branch, and `Cargo.lock` pins that branch's commit: point them at `main` and re-lock once it has merged. The RevisionChest submodule points at the `bundle-hidden-text` branch's commit until that merges. `mwrev` is a path dependency until it is on crates.io.
+- **Scale.** No throughput or size numbers. Every revision is parsed in full and every reference re-hashed; if that is too slow, cache computed hashes by the hash the revision carries, within a page.
