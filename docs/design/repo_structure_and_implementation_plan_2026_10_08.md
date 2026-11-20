@@ -876,7 +876,8 @@ The `dumpstatus.json` code, the sha1 checks and `scripts/revisionchest_dump_pipe
 
 **Verified.**
 - RevisionChest: `cargo test`, `clippy -D warnings` and `fmt` over the workspace. The `sync` tests run against a fake wiki: a restart after a cycle that appended but did not commit (with a half-written Parquet file and a frame cut off part way) neither fetches nor writes a revision twice and reports the rolled-forward locations correctly; a duplicate row and a late one are written once; a gap is refused, then accepted and recorded; a quiet wiki within its retention is no gap; log events and hidden text; a backlog read by continuation. The Postgres sink test, with `log_events`, against a scratch Postgres 18.
-- **Not verified:** the Python tests (`test_stage0_log_events.py` and the DDL parity test were not run: no `uv` on the machine), and no run against a live wiki.
+- The Python suite, before merging: 418 passed, 1 skipped, on Postgres with `REVISIONCHEST_BIN` set, after recording `fixtures/golden/ci/pg.log_events.parquet` (empty: the ci shard is built from a dump, which has no log events).
+- **A live run across a restart** (2026-11-20, against test.wikipedia.org, the binary from internetarchive/RevisionChest `f8f6b33`). `sync --ongoing` from two days back was killed with SIGKILL during its first cycle; the restart removed the half-written Parquet file, reported the 250 revisions the dead cycle had appended from the bundles without fetching them, fetched the rest and committed three cycles; a one-shot restart after that fetched nothing. Checked against the wiki's own `list=recentchanges` for the window: 360 revisions listed, all 360 in the bundles, none duplicated; 360 metadata rows, each location reading back its revision; 42 log rows. The window held no deletion, revision-visibility change or late change, so those paths are covered by the unit tests only.
 
 **Decisions taken without asking.**
 - `--rc-max-age` defaults to 30 days (Wikimedia's `$wgRCMaxAge`); a gap needs the position to be older than that *and* than the oldest retained change, so a quiet wiki is not refused.
@@ -885,6 +886,6 @@ The `dumpstatus.json` code, the sha1 checks and `scripts/revisionchest_dump_pipe
 - `mwrecent` reads every namespace when given none, and carries the log entry's ID.
 
 **Open.**
-- **Live run across a restart**, the ticket's acceptance test, against a real wiki.
 - **Readers.** Nothing derives tombstones from `log_events` yet.
+- **Fixed after the live run.** The position recorded the pending Parquet file by a relative path, so a restart from another working directory would not have found it to remove it; it is recorded by its absolute path since internetarchive/RevisionChest#15.
 
