@@ -6,12 +6,14 @@ directory of files, with a ``page_id`` column; RevisionChest metadata qualifies,
 so the refresh's new metadata file is its own page list.
 
 A page-partitioned dataset's bucket is then rewritten as its other pages' rows
-plus the new rows of the set's pages (``replace_pages``). The write is not atomic
-across files, so a step calling it keeps the bucket's completion marker removed
-while it runs: a bucket left without one is redone in full, which is always right.
+plus the new rows of the set's pages (``replace_pages``). Each rewrite is journaled
+(``.replace.json`` in the bucket), so an interrupted one is completed or undone the
+next time the bucket is replaced, and running the same page set again gives the
+same rows.
 """
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from collections import defaultdict
@@ -46,16 +48,34 @@ def by_bucket(pages: list[int]) -> dict[int, list[int]]:
     return dict(out)
 
 
+JOURNAL = ".replace.json"
+
+
+def _recover(d: Path) -> None:
+    """Finish or undo a rewrite of bucket ``d`` that stopped part way."""
+    journal = d / JOURNAL
+    if not journal.exists():
+        return
+    j = json.loads(journal.read_text())
+    if (d / j["new"]).exists():          # moved in: the old files go
+        for f in j["old"]:
+            (d / f).unlink(missing_ok=True)
+    else:                                # never moved in: the old files stay
+        (d / j["tmp"]).unlink(missing_ok=True)
+    journal.unlink()
+
+
 def replace_pages(parquet_base: str | os.PathLike, dataset: str, domain: str, bucket: int,
                   pages: list[int], new: pa.Table) -> int:
     """Rewrite one bucket of ``dataset`` as its rows for pages not in ``pages`` plus ``new``
     (the re-computed rows of ``pages``, possibly none); returns the rows written.
 
-    The bucket becomes one file, written beside the old ones under a temporary name
-    and moved in before they are removed."""
+    The bucket becomes one file: written under a temporary name, then moved in and the
+    old files removed, with a journal so that an interruption is repaired next time."""
     schema = layout.SCHEMAS[dataset]
     d = layout.partition_dir(parquet_base, dataset, domain, bucket)
     d.mkdir(parents=True, exist_ok=True)
+    _recover(d)
     old_files = sorted(d.glob(layout.FILE_GLOB))
     parts = []
     if old_files:
@@ -65,10 +85,12 @@ def replace_pages(parquet_base: str | os.PathLike, dataset: str, domain: str, bu
     if new.num_rows:
         parts.append(new.select(schema.names).cast(schema))
     table = pa.concat_tables(parts) if parts else schema.empty_table()
-    tmp = d / f".pages-{uuid.uuid4().hex}.tmp"
-    pq.write_table(table, tmp, compression="zstd")
-    target = d / f"pages-{uuid.uuid4().hex[:12]}.parquet"
-    os.replace(tmp, target)
+    token = uuid.uuid4().hex[:12]
+    tmp, target = f".pages-{token}.tmp", f"pages-{token}.parquet"
+    pq.write_table(table, d / tmp, compression="zstd")
+    (d / JOURNAL).write_text(json.dumps({"old": [f.name for f in old_files], "new": target, "tmp": tmp}))
+    os.replace(d / tmp, d / target)
     for f in old_files:
         f.unlink()
+    (d / JOURNAL).unlink()
     return table.num_rows

@@ -49,8 +49,10 @@ FROM citation_instances ci
 JOIN normalized_citations nc ON nc.id = ci.normalized_id
 JOIN normalized_citation_parts p ON p.normalized_id = nc.id
 {join}
-WHERE ci.domain_id = %(d)s
+WHERE ci.domain_id = %(d)s{pages}
 """
+# with a page set (``--pages-from``): its pages, from a temporary table of them
+_PAGES = " AND ci.page_id IN (SELECT page_id FROM refresh_pages)"
 # No ORDER BY: tier.repartition sorts by (page_id, citation_instance_id,
 # part_index), a unique key, so a Postgres sort of the whole join (one backend,
 # ~100+ GB of wide rows on enwiki) would only be redone.
@@ -75,11 +77,35 @@ def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [denorm] {msg}", flush=True)
 
 
-def expected_count(pg, domain_id: int) -> int:
+def expected_count(pg, domain_id: int, pages: list[int] | None = None) -> int:
     with pg.cursor() as cur:
         cur.execute("SELECT count(*) FROM citation_instances ci JOIN normalized_citation_parts p "
-                    "ON p.normalized_id = ci.normalized_id WHERE ci.domain_id = %s", (domain_id,))
+                    "ON p.normalized_id = ci.normalized_id WHERE ci.domain_id = %s"
+                    + (_PAGES if pages is not None else ""), (domain_id,))
         return cur.fetchone()[0]
+
+
+def _load_pages(pg, pages: list[int]) -> None:
+    """The temporary table ``refresh_pages`` the page-set queries read."""
+    import io
+    with pg.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS refresh_pages")
+        cur.execute("CREATE TEMP TABLE refresh_pages (page_id integer PRIMARY KEY)")
+        cur.copy_expert("COPY refresh_pages FROM STDIN", io.StringIO("".join(f"{p}\n" for p in pages)))
+        cur.execute("ANALYZE refresh_pages")
+
+
+def _replace_page_rows(con, flat: str, parquet_base: str, domain: str, pages: list[int]) -> int:
+    """Each bucket of the page set: its pages' rows replaced by those in ``flat``."""
+    from .pages import by_bucket, replace_pages
+    n = 0
+    for b, ps in sorted(by_bucket(pages).items()):
+        result = con.execute(f"SELECT * FROM read_parquet('{flat}') WHERE page_id % {layout.PAGE_BUCKETS} = {b} "
+                             "ORDER BY page_id, citation_instance_id, part_index")
+        rows = (getattr(result, "to_arrow_table", None) or result.fetch_arrow_table)()
+        n += rows.num_rows
+        replace_pages(parquet_base, DATASET, domain, b, ps, rows)
+    return n
 
 
 def _repartition_in_groups(con, flat: str, groups_dir: str, parquet_base: str, domain: str) -> int:
@@ -111,8 +137,10 @@ def _repartition_in_groups(con, flat: str, groups_dir: str, parquet_base: str, d
 
 
 def export_citation_instances_denorm(dsn: str, domain: str, parquet_base: str, resolved: bool = False,
-                                     scratch_dir: str | None = None, reuse_export: bool = False) -> dict:
-    """Replace the domain's ``citation_instances_denorm`` partitions. Returns counts;
+                                     scratch_dir: str | None = None, reuse_export: bool = False,
+                                     pages: list[int] | None = None) -> dict:
+    """Replace the domain's ``citation_instances_denorm`` partitions (with ``pages``, only
+    those pages' rows, in the buckets they fall in). Returns counts;
     raises if the Parquet row count differs from the Postgres join count (the 4.6 / 7c gate).
 
     The scratch directory (the exported CSV, ~200 GB for enwiki) is removed after
@@ -132,6 +160,9 @@ def export_citation_instances_denorm(dsn: str, domain: str, parquet_base: str, r
             domain_id = row[0]
         os.makedirs(scratch, exist_ok=True)
         resolution, join = _RESOLVED if resolved else _UNRESOLVED
+        if pages is not None:
+            _load_pages(pg, pages)
+            reuse_export = False   # an export is only reusable for the same selection
         csv_path = os.path.join(scratch, f"{STEM}.csv")
         if reuse_export and os.path.exists(csv_path):
             log(f"reusing the exported CSV ({os.path.getsize(csv_path) / 2**30:.1f} GiB)")
@@ -143,7 +174,8 @@ def export_citation_instances_denorm(dsn: str, domain: str, parquet_base: str, r
                 cur.execute(f"SET work_mem = '{os.environ.get('DENORM_WORK_MEM', '256MB')}'")
                 # COPY (query) runs a parallel plan; a server-side cursor never does, and on
                 # enwiki the serial 3-way join spilled 95 GB of hash batches before its first row
-                sql = _SELECT.format(resolution=resolution, join=join).replace("%(d)s", str(int(domain_id)))
+                sql = _SELECT.format(resolution=resolution, join=join, pages=_PAGES if pages is not None else ""
+                                     ).replace("%(d)s", str(int(domain_id)))
                 with open(csv_path + ".partial", "wb") as f:
                     cur.copy_expert(f"COPY ({sql}) TO STDOUT WITH (FORMAT csv, HEADER true)", f)
             os.replace(csv_path + ".partial", csv_path)
@@ -169,15 +201,22 @@ def export_citation_instances_denorm(dsn: str, domain: str, parquet_base: str, r
                                 TO '{flat}.partial' (FORMAT PARQUET, COMPRESSION ZSTD)""")
                 os.replace(flat + ".partial", flat)
                 log(f"converted to Parquet ({time.time() - t0:.0f}s)")
-            n = _repartition_in_groups(con, flat, os.path.join(scratch, "groups"), parquet_base, domain)
+            if pages is not None:
+                n = _replace_page_rows(con, flat, parquet_base, domain, pages)
+            else:
+                n = _repartition_in_groups(con, flat, os.path.join(scratch, "groups"), parquet_base, domain)
         finally:
             con.close()
         log(f"repartitioned {n:,} rows ({time.time() - t0:.0f}s)")
-        want = expected_count(pg, domain_id)
+        want = expected_count(pg, domain_id, pages)
         if n != want:
-            raise RuntimeError(f"{DATASET}: wrote {n} rows but citation_instances ⋈ parts has {want} for {domain}")
+            raise RuntimeError(f"{DATASET}: wrote {n} rows but citation_instances ⋈ parts has {want} for {domain}"
+                               + (f" ({len(pages)} pages)" if pages is not None else ""))
         ok = True
-        return {"rows": n, "resolved": resolved, "seconds": round(time.time() - t0, 1)}
+        out = {"rows": n, "resolved": resolved, "seconds": round(time.time() - t0, 1)}
+        if pages is not None:
+            out["pages"] = len(pages)
+        return out
     finally:
         if ok:
             shutil.rmtree(scratch, ignore_errors=True)
@@ -195,11 +234,18 @@ def main(argv=None) -> int:
     ap.add_argument("--reuse-export", action="store_true",
                     help="convert the complete CSV a failed run left in the scratch directory instead of exporting "
                          "again (only if the tables have not changed since)")
+    ap.add_argument("--pages-from", metavar="PARQUET",
+                    help="export only these pages (the distinct page_id of a Parquet file or directory, such as a "
+                         "refresh's RevisionChest metadata), replacing their rows in the buckets they fall in")
     args = ap.parse_args(argv)
     if not args.parquet_dir:
         ap.error("--parquet-dir (or PARQUET_DIR) is required")
+    pages = None
+    if args.pages_from:
+        from .pages import read_page_set
+        pages = read_page_set(args.pages_from)
     counts = export_citation_instances_denorm(psycopg_dsn(), args.domain, args.parquet_dir, args.resolved,
-                                              reuse_export=args.reuse_export)
+                                              reuse_export=args.reuse_export, pages=pages)
     log(f"done: {counts}")
     return 0
 

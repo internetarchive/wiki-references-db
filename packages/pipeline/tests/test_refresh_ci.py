@@ -186,12 +186,12 @@ def refresh(run: Run) -> None:
     run.wcd("B: parts", "parts", "--domain", DOMAIN, "--resume",
             "--redo-from", str(run.staging_b / "deduped" / "changes" / "normalized_citations.parquet"))
     run.wcd("B: gate 4", "gate", "4", "--domain", DOMAIN, *run.pq())
-    run.wcd("B: denorm-export", "denorm-export", "--domain", DOMAIN, *run.pq())
-    run.wcd("B: ref-name-links", "ref-name-links", "--domain", DOMAIN, *run.pq())
+    b_pages = ("--pages-from", str(run.meta / "b.parquet"))
+    run.wcd("B: denorm-export", "denorm-export", "--domain", DOMAIN, *run.pq(), *b_pages)
+    run.wcd("B: ref-name-links", "ref-name-links", "--domain", DOMAIN, *run.pq(), *b_pages)
     run.wcd("B: gate 5", "gate", "5", "--domain", DOMAIN, *run.pq())
     # 6a-6c for B's pages only (its metadata lists them); 6d over the domain
-    run.wcd("B: match", "match", "--domain", DOMAIN, *run.pq(), "--jobs", JOBS,
-            "--pages-from", str(run.meta / "b.parquet"))
+    run.wcd("B: match", "match", "--domain", DOMAIN, *run.pq(), "--jobs", JOBS, *b_pages)
     run.wcd("B: gate 6", "gate", "6", "--domain", DOMAIN, *run.pq())
     run.wcd("B: materialize", "materialize", "--domain", DOMAIN, *run.pq(), "--force")
     run.wcd("B: gate 7", "gate", "7", "--domain", DOMAIN, *run.pq())

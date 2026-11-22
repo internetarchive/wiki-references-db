@@ -69,16 +69,18 @@ def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [ref_name_links] {msg}", flush=True)
 
 
-def load_named_instances(con: duckdb.DuckDBPyConnection, pg, domain_id: int) -> int:
+def load_named_instances(con: duckdb.DuckDBPyConnection, pg, domain_id: int, pages: list[int] | None = None) -> int:
     """Copy the domain's named instances (id, page_id, ref_name) into DuckDB,
     100k rows at a time as Arrow batches (row-by-row ``executemany`` was the
-    slow part at enwiki scale)."""
+    slow part at enwiki scale); with ``pages``, those pages' only."""
     con.execute("CREATE OR REPLACE TABLE named_instances (id BIGINT, page_id INTEGER, ref_name VARCHAR, page_bucket INTEGER)")
     n = 0
     with pg.cursor(name="stage5_named") as cur:
         cur.itersize = 100_000
         cur.execute("SELECT id, page_id, reference_name FROM citation_instances "
-                    "WHERE domain_id = %s AND reference_name IS NOT NULL", (domain_id,))
+                    "WHERE domain_id = %s AND reference_name IS NOT NULL"
+                    + (" AND page_id = ANY(%s)" if pages is not None else ""),
+                    (domain_id,) + ((pages,) if pages is not None else ()))
         while True:
             rows = cur.fetchmany(100_000)
             if not rows:
@@ -126,6 +128,45 @@ def write_bucket_postgres(con: duckdb.DuckDBPyConnection, cur, domain_id: int) -
     pa_csv.write_csv(table, buf, pa_csv.WriteOptions(include_header=False, quoting_style="all_valid"))
     buf.seek(0)
     cur.copy_expert("COPY ref_name_links (domain_id, " + ", ".join(COLUMNS) + ") FROM STDIN WITH (FORMAT csv)", buf)
+
+
+def run_pages(dsn: str, domain: str, parquet_base: str, pages: list[int]) -> dict:
+    """The links of ``pages`` only: their rows replaced in Postgres and in each bucket's
+    Parquet, the other pages' kept. A bucket is one transaction in Postgres."""
+    from .pages import by_bucket, replace_pages
+    pg = psycopg2.connect(dsn)
+    con = duckdb_connect()
+    t0 = time.time()
+    try:
+        with pg.cursor() as cur:
+            cur.execute("SELECT id FROM domains WHERE value = %s", (domain,))
+            row = cur.fetchone()
+            if row is None:
+                raise SystemExit(f"domain {domain!r} is not in domains")
+            domain_id = row[0]
+        n_named = load_named_instances(con, pg, domain_id, pages)
+        log(f"{n_named} named instances on {len(pages)} pages of {domain}")
+        have = set(layout.list_buckets(parquet_base, "citation_history", domain))
+        total = 0
+        sets = {b: ps for b, ps in by_bucket(pages).items() if b in have}
+        for b, ps in sorted(sets.items()):
+            n = build_bucket(con, parquet_base, domain, b)
+            result = con.execute("SELECT * FROM out_rows ORDER BY page_id, ref_name, first_revision_id")
+            replace_pages(parquet_base, "ref_name_links", domain, b,
+                          ps, (getattr(result, "to_arrow_table", None) or result.fetch_arrow_table)())
+            with pg.cursor() as cur:
+                cur.execute("DELETE FROM ref_name_links WHERE domain_id = %s AND page_id = ANY(%s)", (domain_id, ps))
+                if n:
+                    write_bucket_postgres(con, cur, domain_id)
+            pg.commit()
+            total += n
+        return {"pages": len(pages), "buckets": len(sets), "links": total, "seconds": round(time.time() - t0, 1)}
+    except Exception:
+        pg.rollback()
+        raise
+    finally:
+        con.close()
+        pg.close()
 
 
 def run(dsn: str, domain: str, parquet_base: str, defer_fks: bool = True) -> dict:
@@ -182,11 +223,18 @@ def main(argv=None) -> int:
     ap.add_argument("--no-gate", action="store_true")
     ap.add_argument("--defer-fks", action=argparse.BooleanOptionalAction, default=True,
                     help="drop ref_name_links' foreign keys while it is empty, validate them after (default: on)")
+    ap.add_argument("--pages-from", metavar="PARQUET",
+                    help="these pages only (the distinct page_id of a Parquet file or directory, such as a "
+                         "refresh's RevisionChest metadata), replacing their links")
     args = ap.parse_args(argv)
     if not args.parquet_dir:
         ap.error("--parquet-dir (or PARQUET_DIR) is required")
     dsn = psycopg_dsn()
-    counts = run(dsn, args.domain, args.parquet_dir, args.defer_fks)
+    if args.pages_from:
+        from .pages import read_page_set
+        counts = run_pages(dsn, args.domain, args.parquet_dir, read_page_set(args.pages_from))
+    else:
+        counts = run(dsn, args.domain, args.parquet_dir, args.defer_fks)
     log(f"done: {counts}")
     if not args.no_gate:
         from .gates import make_session, report, stage5
