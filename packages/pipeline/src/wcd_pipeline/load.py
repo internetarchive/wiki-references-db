@@ -79,9 +79,16 @@ def log(msg):
     print(f"{ts} [load] {msg}", flush=True)
 
 
-def find_deduped_parquet(staging_dir, table_name):
-    """Find the deduped Parquet file for a given table."""
+# `load --changes`: the tables load from deduped/changes/ (written by `dedup --previous`)
+CHANGES = False
+
+
+def find_deduped_parquet(staging_dir, table_name, changes=None):
+    """Find the deduped Parquet file for a given table (its change set with ``changes``,
+    by default when the run loads changes)."""
     deduped_dir = os.path.join(staging_dir, 'deduped')
+    if CHANGES if changes is None else changes:
+        deduped_dir = os.path.join(deduped_dir, 'changes')
     path = os.path.join(deduped_dir, f'{table_name}.parquet')
     if os.path.exists(path):
         return path
@@ -793,6 +800,138 @@ def write_template_parquet(session, staging_dir, parquet_base):
     _write_template_counts(session, domains, counts)
 
 
+def write_template_parquet_changes(session, staging_dir, parquet_base):
+    """The template phase of ``load --changes``: update ``template_param_index``,
+    ``template_params`` and ``template_value_counts`` for what the change set touches,
+    giving what ``write_template_parquet`` would build from the whole deduped set.
+
+    C is the citations (``normalized_sha1``) with a new or changed template_data row,
+    C2 those plus the citations of new instances. Every row of C in the index, and of
+    C2 in template_params, is replaced by its rows built from the merged deduped set
+    (``deduped/``); only partitions holding such rows are rewritten, and the heavy-value
+    counts are recomputed for the rewritten search buckets (a (template, key, value)
+    lives in exactly one)."""
+    import shutil
+
+    td_all = find_deduped_parquet(staging_dir, 'template_data', changes=False)
+    ci_all = find_deduped_parquet(staging_dir, 'citation_instances', changes=False)
+    td_new = find_deduped_parquet(staging_dir, 'template_data', changes=True)
+    ci_new = find_deduped_parquet(staging_dir, 'citation_instances', changes=True)
+    if not td_all:
+        return
+    work = os.path.join(staging_dir, '.template-work')
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    con = _duck(temp_dir=os.path.join(work, 'duckdb-tmp'))
+    td = f"read_parquet('{_q(td_all)}')"
+    td_where = ("domain_label IS NOT NULL AND template_name IS NOT NULL AND parameter_key IS NOT NULL "
+                "AND normalized_sha1 IS NOT NULL")
+    empty = "SELECT CAST(NULL AS VARCHAR) AS normalized_sha1 WHERE false"
+    counts, rewritten = [], set()   # rewritten: (domain, search_bucket)
+
+    def replace(dest, select_sql):
+        os.makedirs(dest, exist_ok=True)
+        old = [os.path.join(dest, f) for f in os.listdir(dest) if f.endswith('.parquet')]
+        tmp = os.path.join(dest, '.data.parquet.tmp')
+        con.execute(f"COPY ({select_sql}) TO '{_q(tmp)}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)")
+        for f in old:
+            os.remove(f)
+        os.replace(tmp, os.path.join(dest, 'data.parquet'))
+
+    def existing(dest, columns):
+        files = [f for f in (os.listdir(dest) if os.path.isdir(dest) else []) if f.endswith('.parquet')]
+        if not files:
+            return f"SELECT {', '.join(f'NULL AS {c}' for c in columns)} WHERE false"
+        return f"SELECT {', '.join(columns)} FROM read_parquet('{_q(dest)}/*.parquet', hive_partitioning=false)"
+
+    try:
+        con.execute("CREATE TEMP TABLE c AS " + (f"SELECT DISTINCT normalized_sha1 FROM read_parquet('{_q(td_new)}')"
+                                                  if td_new else empty))
+        con.execute("CREATE TEMP TABLE c2 AS SELECT normalized_sha1 FROM c UNION " +
+                    (f"SELECT DISTINCT normalized_sha1 FROM read_parquet('{_q(ci_new)}')" if ci_new else empty))
+        log(f"template changes: {con.execute('SELECT count(*) FROM c').fetchone()[0]} citations with new template "
+            f"rows, {con.execute('SELECT count(*) FROM c2').fetchone()[0]} with them or new instances")
+
+        # -- template_param_index
+        t = time.time()
+        bucket = template_search_bucket_sql('template_name', 'parameter_key', 'parameter_value')
+        con.execute(f"""CREATE TEMP TABLE ni AS SELECT domain_label AS domain, {bucket} AS search_bucket, template_name,
+                               parameter_key, parameter_value, normalized_sha1
+                        FROM {td} WHERE {td_where} AND normalized_sha1 IN (SELECT normalized_sha1 FROM c)""")
+        idx_cols = ['template_name', 'parameter_key', 'parameter_value', 'normalized_sha1']
+        targets = set(con.execute("SELECT DISTINCT domain, search_bucket FROM ni").fetchall())
+        root = layout.dataset_dir(parquet_base, 'template_param_index')
+        for d, b, path in _partitions(str(root), 'domain', 'search_bucket') if root.exists() else []:
+            if (d, b) not in targets and con.execute(
+                    f"SELECT count(*) FROM ({existing(path, idx_cols)}) WHERE normalized_sha1 IN (SELECT * FROM c)"
+            ).fetchone()[0]:
+                targets.add((d, b))
+        for d, b in sorted(targets):
+            dest = os.path.join(str(root), f'domain={d}', f'search_bucket={b}')
+            replace(dest, f"""SELECT DISTINCT * FROM (
+                    SELECT * FROM ({existing(dest, idx_cols)}) WHERE normalized_sha1 NOT IN (SELECT * FROM c)
+                    UNION ALL SELECT {', '.join(idx_cols)} FROM ni WHERE domain = '{_q(d)}' AND search_bucket = {b})
+                ORDER BY template_name, parameter_key, parameter_value, normalized_sha1""")
+            for name, key, value, n in con.execute(
+                    f"""SELECT template_name, parameter_key, parameter_value, count(*)
+                        FROM read_parquet('{_q(dest)}/data.parquet') WHERE parameter_value IS NOT NULL
+                        GROUP BY ALL HAVING count(*) >= {TEMPLATE_COUNT_MIN}""").fetchall():
+                counts.append((d, name, key, value, n))
+            rewritten.add((d, b))
+        log(f"template_param_index: {len(targets)} search buckets rewritten in {time.time() - t:.0f}s")
+
+        # -- template_params
+        t = time.time()
+        if ci_all:
+            con.execute(f"""CREATE TEMP TABLE cp AS SELECT DISTINCT domain, page_id, normalized_sha1
+                            FROM read_parquet('{_q(ci_all)}')
+                            WHERE domain IS NOT NULL AND page_id IS NOT NULL
+                              AND normalized_sha1 IN (SELECT normalized_sha1 FROM c2)""")
+            con.execute(f"""CREATE TEMP TABLE np AS
+                            SELECT c.domain, CAST(c.page_id % {PAGE_BUCKETS} AS INTEGER) AS page_bucket, c.page_id,
+                                   t.normalized_sha1, t.template_name, t.offset_start, t.parameter_key, t.parameter_value
+                            FROM {td} t JOIN cp c ON c.domain = t.domain_label AND c.normalized_sha1 = t.normalized_sha1
+                            WHERE t.template_name IS NOT NULL AND t.parameter_key IS NOT NULL""")
+            par_cols = ['page_id', 'normalized_sha1', 'template_name', 'offset_start', 'parameter_key', 'parameter_value']
+            pbs = con.execute(f"SELECT DISTINCT domain, CAST(page_id % {PAGE_BUCKETS} AS INTEGER) FROM cp").fetchall()
+            for d, b in sorted(pbs):
+                dest = os.path.join(str(layout.dataset_dir(parquet_base, 'template_params')),
+                                    f'domain={d}', f'page_bucket={b}')
+                replace(dest, f"""SELECT * FROM (
+                        SELECT * FROM ({existing(dest, par_cols)}) WHERE normalized_sha1 NOT IN (SELECT * FROM c2)
+                        UNION ALL SELECT {', '.join(par_cols)} FROM np WHERE domain = '{_q(d)}' AND page_bucket = {b})
+                    ORDER BY page_id, normalized_sha1, offset_start, parameter_key""")
+            log(f"template_params: {len(pbs)} page buckets rewritten in {time.time() - t:.0f}s")
+    finally:
+        con.close()
+        shutil.rmtree(work, ignore_errors=True)
+    _replace_template_counts(session, rewritten, counts)
+
+
+def _replace_template_counts(session, rewritten, counts):
+    """Replace the ``template_value_counts`` rows whose (template, key, value) falls in a
+    rewritten (domain, search bucket) with the heavy values found there."""
+    from wcd_schema.ids import template_search_bucket
+    stored = session.execute(text(
+        "SELECT t.wiki_template_id, t.parameter_key, t.parameter_value_md5, d.value, w.name, t.parameter_value "
+        "FROM template_value_counts t JOIN wiki_templates w ON w.id = t.wiki_template_id "
+        "JOIN domains d ON d.id = w.domain")).all()
+    stale = [{"w": w, "k": k, "m": m} for w, k, m, d, name, v in stored
+             if (d, template_search_bucket(name, k, v)) in rewritten]
+    if stale:
+        session.execute(text("DELETE FROM template_value_counts WHERE wiki_template_id = :w AND parameter_key = :k "
+                             "AND parameter_value_md5 = :m"), stale)
+    ids = {(d, n): i for d, n, i in session.execute(text(
+        "SELECT d.value, w.name, w.id FROM wiki_templates w JOIN domains d ON d.id = w.domain")).all()}
+    rows = [{"w": ids[(d, n)], "k": k, "v": v, "n": c} for d, n, k, v, c in counts if (d, n) in ids]
+    if rows:
+        session.execute(text(
+            "INSERT INTO template_value_counts (wiki_template_id, parameter_key, parameter_value_md5, parameter_value, n_citations) "
+            "VALUES (:w, :k, md5(:v), :v, :n)"), rows)
+    session.commit()
+    log(f"template_value_counts: {len(stale)} replaced by {len(rows)} heavy values in {len(rewritten)} search buckets")
+
+
 def _write_template_counts(session, domains, counts):
     """Replace ``template_value_counts`` for ``domains`` (those this run wrote
     template parameters for) with the heavy values found; other domains keep theirs."""
@@ -817,7 +956,7 @@ def _write_template_counts(session, domains, counts):
 # ---------------------------------------------------------------------------
 
 def main(argv=None):
-    global BATCH_SIZE, LOAD_JOBS, DEFER_FKS
+    global BATCH_SIZE, LOAD_JOBS, DEFER_FKS, CHANGES
     parser = argparse.ArgumentParser(description='Load staged Parquet files into PostgreSQL')
     parser.add_argument('-d', '--staging-dir', default=os.environ.get('STAGING_DIR', './staging'),
                         help='Staging directory (default: STAGING_DIR env or ./staging)')
@@ -843,9 +982,13 @@ def main(argv=None):
         ('citation_instances',   ('Phase 6: citation_instances',    lambda s, d, ctx: load_citation_instances(s, d))),
         ('ncwr',                 ('Phase 7: ncwr',                  lambda s, d, ctx: load_ncwr(s, d))),
         ('template_data',        ('Phase 8: template parameters → Parquet',
-                                  lambda s, d, ctx: write_template_parquet(s, d, ctx['parquet_dir']))),
+                                  lambda s, d, ctx: (write_template_parquet_changes if CHANGES else write_template_parquet)(
+                                      s, d, ctx['parquet_dir']))),
     ])
 
+    parser.add_argument('--changes', action='store_true',
+                        help='load the change set of `wcd dedup --previous` (deduped/changes/) onto the build it '
+                             'was deduped against, and update the template datasets for it instead of replacing them')
     parser.add_argument('--tables', nargs='+', metavar='TABLE',
                         choices=list(all_phases.keys()),
                         help='Load only the specified table(s). '
@@ -861,6 +1004,7 @@ def main(argv=None):
         raise SystemExit("--jobs must be at least 1")
     LOAD_JOBS = args.jobs
     DEFER_FKS = args.defer_fks
+    CHANGES = args.changes
     log(f"jobs {LOAD_JOBS}, defer foreign keys {DEFER_FKS}")
 
     session = make_session()

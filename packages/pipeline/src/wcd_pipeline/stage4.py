@@ -306,10 +306,59 @@ def run(dsn: str, domain: str | None = None, resume: bool = False, batch: int = 
     return {"citations": n_cit, "parts": n_parts, "seconds": round(time.time() - t0, 1)}
 
 
+_PART_KEY = ("part_index", "part_sha1", "part_type", "norm_subtype", "extracted_url")
+
+
+def redo(dsn: str, sha1s: list[str], batch: int = 2000) -> dict:
+    """Re-build the parts of the citations in ``sha1s`` that have parts, where they come out
+    different (a refresh merged a different ``citation_type`` into the citation, which
+    ``--resume`` would skip). Their ``citation_source_resolution`` rows refer to the old
+    parts (``fk_csr_part``) and are deleted first; Stage 7b writes them again."""
+    con = psycopg2.connect(dsn)
+    n_checked = n_redone = 0
+    try:
+        with con.cursor() as cur:
+            for i in range(0, len(sha1s), batch):
+                cur.execute("""SELECT nc.id, nc.reference_normalized, nc.citation_type FROM normalized_citations nc
+                               WHERE nc.normalized_sha1 = ANY(%s) AND EXISTS
+                                 (SELECT 1 FROM normalized_citation_parts p WHERE p.normalized_id = nc.id)""",
+                            (sha1s[i:i + batch],))
+                cits = cur.fetchall()
+                if not cits:
+                    continue
+                cur.execute(f"SELECT normalized_id, {', '.join(_PART_KEY)} FROM normalized_citation_parts "
+                            "WHERE normalized_id = ANY(%s) ORDER BY normalized_id, part_index",
+                            ([c[0] for c in cits],))
+                stored: dict[int, list] = {}
+                for nid, *key in cur.fetchall():
+                    stored.setdefault(nid, []).append(tuple(key))
+                rows, ids = [], []
+                for nid, text, ctype in cits:
+                    new = parts_of(nid, text, ctype or "ref_tag")
+                    if [tuple(r[k] for k in _PART_KEY) for r in new] != stored.get(nid, []):
+                        ids.append(nid)
+                        rows.extend(new)
+                n_checked += len(cits)
+                if ids:
+                    cur.execute("DELETE FROM citation_source_resolution WHERE normalized_id = ANY(%s)", (ids,))
+                    write_batch(cur, rows, ids)
+                    n_redone += len(ids)
+                con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return {"checked": n_checked, "redone": n_redone}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Stage 4: split normalized citations into semantic parts (normalized_citation_parts)")
     ap.add_argument("--domain", help="only citations first seen on this domain (default: all)")
     ap.add_argument("--resume", action="store_true", help="skip citations that already have parts")
+    ap.add_argument("--redo-from", metavar="PARQUET",
+                    help="also re-build the parts of the citations (normalized_sha1) in this file that have parts, "
+                         "where they come out different: a refresh's deduped/changes/normalized_citations.parquet")
     ap.add_argument("--batch", type=int, default=2000, help="citations per transaction (default: 2000)")
     ap.add_argument("--no-gate", action="store_true", help="skip the Stage-4 gate afterwards (gate needs --domain)")
     ap.add_argument("--jobs", type=int, default=PARTS_JOBS,
@@ -324,6 +373,10 @@ def main(argv=None) -> int:
     log(f"jobs {args.jobs}, defer foreign keys {args.defer_fks}")
     counts = run(dsn, args.domain, args.resume, args.batch, args.jobs, args.defer_fks)
     log(f"done: {counts}")
+    if args.redo_from:
+        import pyarrow.parquet as pq
+        sha1s = pq.read_table(args.redo_from, columns=["normalized_sha1"]).column(0).to_pylist()
+        log(f"redo from {args.redo_from}: {redo(dsn, sorted(set(s for s in sha1s if s)), args.batch)}")
     if not args.no_gate and args.domain:
         from .gates import make_session, report, stage4
         session = make_session()

@@ -9,6 +9,13 @@ one partition, so the output is the same as one GROUP BY over everything. Only t
 the per-revision datasets (citation_history, named_ref_uses,
 revision_signals) are written by Stage 1 in their final layout.
 
+**On top of a previous build** (``--previous DIR``, a refresh): the previous
+``deduped/`` files join the staged rows as one more input. Every table is a
+GROUP BY with MIN, or a DISTINCT, and its deduped file has the staged columns, so
+this gives the rows a dedup of every shard ever staged would, without re-reading
+the old shards. ``deduped/changes/<table>.parquet`` then holds the rows that are
+new or changed against the previous set: what ``wcd load --changes`` loads.
+
 The **instance-id collision gate** runs with ``citation_instances``: the
 deterministic ``citation_instance_id`` must be unique per distinct
 ``(domain, page_id, raw_sha1)`` over the whole staging set; a collision
@@ -18,6 +25,7 @@ Usage:
     wcd dedup -d ./staging
     wcd dedup -d ./staging --memory-limit 8GB
     wcd dedup -d ./staging --tables citation_instances normalized_citations
+    wcd dedup -d ./staging-refresh --previous ./staging/deduped
 """
 
 import argparse
@@ -307,6 +315,46 @@ ALL_TABLES = [
 ]
 
 
+PREVIOUS_SUBDIR = 'previous-deduped'
+
+
+def link_previous(staging_dir, previous_dir, tables):
+    """Link each table's previous deduped file into the staging set under a name the
+    staging glob matches (``previous-deduped/previous-<table>-0000.parquet``)."""
+    import pyarrow.parquet as pq
+    from wcd_schema.staging import SCHEMAS
+    d = os.path.join(staging_dir, PREVIOUS_SUBDIR)
+    os.makedirs(d, exist_ok=True)
+    for table in tables:
+        src = os.path.abspath(_out(previous_dir, table))
+        link = os.path.join(d, f'previous-{table}-0000.parquet')
+        if os.path.lexists(link):
+            os.remove(link)
+        if not os.path.exists(src):
+            continue
+        names = pq.read_schema(src).names
+        if names != SCHEMAS[table].names:   # read by position with the staged files
+            raise RuntimeError(f"{src}: columns {names}, staged {table} has {SCHEMAS[table].names}")
+        os.symlink(src, link)
+
+
+def write_changes(con, deduped_dir, previous_dir, table):
+    """``deduped/changes/<table>.parquet``: the deduped rows not in the previous set
+    (new keys, or keys whose merged values changed)."""
+    out = _out(deduped_dir, table)
+    if not os.path.exists(out):
+        return
+    changes = os.path.join(deduped_dir, 'changes')
+    os.makedirs(changes, exist_ok=True)
+    prev = _out(previous_dir, table)
+    sql = f"SELECT * FROM '{out}'" + (f" EXCEPT SELECT * FROM '{prev}'" if os.path.exists(prev) else "")
+    target = _out(changes, table)
+    con.execute(f"COPY ({sql}) TO '{target}.partial' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)")
+    os.replace(target + '.partial', target)
+    n = con.execute(f"SELECT count(*) FROM '{target}'").fetchone()[0]
+    log(f"{table}: {n} rows new or changed against {previous_dir}")
+
+
 def main(argv=None):
     global ROWS_PER_PARTITION, PARTITION_BASE
     parser = argparse.ArgumentParser(
@@ -332,6 +380,9 @@ def main(argv=None):
     parser.add_argument('--rows-per-partition', type=int, default=ROWS_PER_PARTITION,
                         help='Staged rows per key partition for the large tables '
                              '(default: DEDUP_ROWS_PER_PARTITION or 20000000); lower it if a partition runs out of memory')
+    parser.add_argument('--previous', metavar='DIR',
+                        help="the previous build's deduped directory: its rows are merged with the staged ones, "
+                             "and deduped/changes/ gets the rows new or changed against it (a refresh)")
     parser.add_argument('--tables', nargs='+', metavar='TABLE',
                         choices=[t for t, _ in ALL_TABLES],
                         help='Dedup only the specified table(s)')
@@ -371,6 +422,11 @@ def main(argv=None):
         table_set = set(args.tables)
         tables_to_run = [(n, f) for n, f in ALL_TABLES if n in table_set]
 
+    if args.previous:
+        if os.path.abspath(args.previous) == os.path.abspath(deduped_dir):
+            parser.error("--previous must be another staging set's deduped directory")
+        link_previous(staging_dir, args.previous, [n for n, _ in tables_to_run])
+
     t0 = time.time()
     for table_name, dedup_fn in tables_to_run:
         if _is_done(deduped_dir, table_name):
@@ -383,6 +439,8 @@ def main(argv=None):
         t1 = time.time()
         try:
             dedup_fn(con, staging_dir, deduped_dir)
+            if args.previous:
+                write_changes(con, deduped_dir, args.previous, table_name)
             elapsed = time.time() - t1
             _mark_done(deduped_dir, table_name)
             log(f"{table_name}: done in {elapsed:.1f}s")

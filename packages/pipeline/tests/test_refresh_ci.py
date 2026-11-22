@@ -91,6 +91,7 @@ class Run:
         self.work = work
         self.parquet = work / "parquet"
         self.staging = work / "staging"
+        self.staging_b = work / "staging-b"
         self.meta = work / "meta"
         self.shard_a = work / "shard-a"
         self.shard_b = work / "shard-b"
@@ -175,13 +176,15 @@ def refresh(run: Run) -> None:
     shutil.copy(run.work / "meta-b.parquet", run.meta / "b.parquet")
     run.wcd("B: stage0-load", "stage0-load", "--domain", DOMAIN, "--metadata", str(run.meta), *run.pq())
     run.wcd("B: gate 0", "gate", "0", "--domain", DOMAIN, *run.pq())
-    run.wcd("B: extract-all", "extract-all", "-d", str(run.shard_b), "-o", str(run.staging), "--domain", DOMAIN,
+    # B's shards staged on their own, deduped together with A's deduped set, and only the
+    # rows new or changed against it loaded
+    run.wcd("B: extract-all", "extract-all", "-d", str(run.shard_b), "-o", str(run.staging_b), "--domain", DOMAIN,
             *run.pq(), "--jobs", JOBS)
-    shutil.rmtree(run.staging / "deduped", ignore_errors=True)
-    run.wcd("B: dedup", "dedup", "-d", str(run.staging))
-    run.wcd("B: load", "load", "-d", str(run.staging), *run.pq())
+    run.wcd("B: dedup", "dedup", "-d", str(run.staging_b), "--previous", str(run.staging / "deduped"))
+    run.wcd("B: load", "load", "-d", str(run.staging_b), *run.pq(), "--changes")
     run.wcd("B: gate 3", "gate", "3", "--domain", DOMAIN, *run.pq(), "--all-buckets")
-    run.wcd("B: parts", "parts", "--domain", DOMAIN, "--resume")
+    run.wcd("B: parts", "parts", "--domain", DOMAIN, "--resume",
+            "--redo-from", str(run.staging_b / "deduped" / "changes" / "normalized_citations.parquet"))
     run.wcd("B: gate 4", "gate", "4", "--domain", DOMAIN, *run.pq())
     run.wcd("B: denorm-export", "denorm-export", "--domain", DOMAIN, *run.pq())
     run.wcd("B: ref-name-links", "ref-name-links", "--domain", DOMAIN, *run.pq())
