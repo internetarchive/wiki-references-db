@@ -332,7 +332,7 @@ runbook's `max_wal_size` or more, and watch `pg_stat_bgwriter.checkpoints_req`.
 | `denorm-export` | `citation_instances_denorm/` | the domain's partitions | domain |
 | `ref-name-links` | `ref_name_links` table and Parquet | the domain | domain |
 | `match` | `matching_intermediate/*` (6d: `global_source_map/`, `global_sources_stage/` as several `data-NNNN.parquet`, and its saved unions in `_global_unions/`) | bucket directories with a `_SUCCESS` marker are skipped unless `--force`; `--buckets 3,17` selects; 6d always reruns, from the saved unions with `--reuse-unions` (only when 6a–6c are unchanged) | bucket (6a–6c), domain (6d) |
-| `materialize` | `global_sources`, `citation_source_resolution`, resolved `citation_instances_denorm/`, `page_source_summary`, counts, scores, `global_source_scores/`, `page_summary_cache` | the domain, step by step; 7d keeps each bucket's summary rows in `$PARQUET_DIR/_scratch/7d/` (a bucket with its file is skipped; the load into Postgres reruns whole; the scratch is removed when 7d is done), 7h checkpoints per bucket under `$PARQUET_DIR/_checkpoints/`; `--steps a,b` selects; `--force` ignores both | domain |
+| `materialize` | `global_sources`, `citation_source_resolution`, resolved `citation_instances_denorm/`, `page_source_summary`, counts, scores, `global_source_scores/`, `page_summary_cache` | the domain, step by step; 7d keeps each bucket's summary rows in `$PARQUET_DIR/_scratch/7d/` (a bucket with its file is skipped; the load into Postgres reruns whole; the scratch is removed when 7d is done), 7h checkpoints per bucket under `$PARQUET_DIR/_checkpoints/`; 7d ends by deleting the global sources no resolution or summary row refers to any more; `--steps a,b` selects; `--force` ignores both | domain |
 | `revision-stats` | `page_revision_stats/` | bucket directories | bucket |
 
 Rules of thumb:
@@ -407,9 +407,12 @@ whatever their job count or file layout (all but the file count).
 metadata file per run into the `--parquet` directory. Treat each day's bundle
 as a new shard: `stage0-load` on the metadata *directory* (every revision
 once, overlapping batches included), `extract` on the new bundle, then the
-domain re-run from `dedup` onward. Incremental matching (re-running only the
-buckets a new bundle touched) is designed but not built; a full domain re-run
-of Stages 4–8 is the current refresh.
+domain re-run from `dedup` onward (delete `$STAGING/deduped/` first; `parts
+--resume`, `match --force`, `materialize --force`). A full domain re-run of
+Stages 3–8 is the current refresh; `packages/pipeline/tests/test_refresh_ci.py`
+checks that it gives exactly the full build's output on the ci fixture.
+Refreshing only what changed is proposed in
+`docs/design/proposed_incremental_refresh.md`.
 
 ## Serving
 

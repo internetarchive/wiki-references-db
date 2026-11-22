@@ -29,7 +29,10 @@ the 2026-11-01 → 22 sync (2.66M revisions):
   saves only 2.4×, so for long gaps a full rebuild stays competitive.
 * **Global work dominates once page work shrinks.** Of the base build's 43 h,
   6d took 3.3 h and 7a–7g took 11.3 h. Each of them reads the whole domain. A
-  day's touched pages cite 5.15M of 122.2M global sources (4.2%).
+  day's touched pages cite 5.15M of 122.2M global sources (4.2%), which
+  appear on 8.14M of 131.9M page–source pairs (6.2%); the most cited of them
+  is on 8,871 pages. That is an upper bound on what phase 2 re-runs for a
+  day, since most of those components will not change.
 
 Base build step times, for reference: stage0-load 2.2 h, dedup 2.2 h, load
 9.0 h, gate 3 2.3 h, parts 2.6 h, denorm-export 2.8 h, ref-name-links 2.1 h,
@@ -133,11 +136,16 @@ refresh whose touched pages hold more than about a third of the domain's history
 
 ### 7. Plan
 
-1. The A + B = AB equivalence test on the ci fixture, with today's full re-run
-   as the refresh (it must pass trivially).
-2. Load merges (`LEAST`) and the Postgres-aware collision gate. Today's full
-   path never loads a partial staging set, so this changes no current output;
-   it makes a partial load safe.
+1. **Done.** The A + B = AB equivalence test on the ci fixture
+   (`test_refresh_ci.py`), with today's full re-run as the refresh. It did not
+   pass trivially: 7b's delete of unreferenced global sources broke a foreign
+   key on any re-run, because `page_source_summary` still referred to them
+   until 7d. The delete now runs at the end of 7d.
+2. **Done.** Load merges (`LEAST`) and the Postgres-aware collision gate.
+   Today's full path never loads a partial staging set, so this changes no
+   current output; it makes a partial load safe. Still open from this item: a
+   changed `citation_type` must re-do that citation's parts, which `--resume`
+   skips and whose deletion `fk_csr_part` blocks until 7b re-runs.
 3. Phase 1 writers, one step at a time, each kept equal by the test.
 4. Measure the 6d closure for a day of edits on the enwiki build.
 5. Phase 2.

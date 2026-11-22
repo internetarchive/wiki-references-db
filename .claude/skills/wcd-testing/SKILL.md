@@ -12,6 +12,7 @@ description: Run the WCD test suite at the right tier (fast, Postgres, full ci f
 | Fast | `uv run pytest -q` | ~5 s | nothing (≈191 pass, ≈74 skip) |
 | Postgres | `WCD_TEST_DATABASE_URL=… uv run pytest -q` | ~1 min | scratch Postgres 16 |
 | Full ci fixture | `WCD_TEST_DATABASE_URL=… uv run pytest packages/pipeline/tests/test_fixture_ci.py -v` | 10–14 min (Stage 1 dominates; single bundle, so `--jobs` doesn't help) | scratch Postgres 16 |
+| Refresh equivalence | `WCD_TEST_DATABASE_URL=… uv run pytest packages/pipeline/tests/test_refresh_ci.py` | ~3 min | scratch Postgres; builds the ci fixture from its history before 2024, refreshes with the rest, and compares with the same goldens |
 | Rust | `cargo test --workspace` in `rust/revisionchest` (+ clippy `-D warnings`, `fmt --check`) | minutes | Rust ≥ 1.85; `REVISIONCHEST_TEST_DATABASE_URL` for the Postgres sink test |
 
 Rules of thumb:
