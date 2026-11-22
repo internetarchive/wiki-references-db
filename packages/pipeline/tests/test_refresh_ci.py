@@ -7,8 +7,10 @@ whatever `refresh()` runs; today it is the runbook's "Incremental updates" path 
 the metadata directory, extract the new bundle as a shard, then the domain from dedup on).
 Every step that is made incremental must keep this test passing.
 
-The split is by revision timestamp: B holds the revisions from CUTOFF on (1,691 of 17,432,
-on 50 of the 51 pages, 4 of which are created in B), as a `sync` bundle would.
+B holds the revisions from CUTOFF on of the pages with page_id % 4 != 0 (1,373 of 17,432
+revisions, on 35 of the 51 pages, 3 of which are created in B), as a `sync` bundle would hold
+recent edits; the other 16 pages are untouched, so a step that re-runs B's pages only has to
+keep their rows as they were.
 
 Needs a scratch Postgres database, like test_fixture_ci (its schema ``public`` is dropped).
 ``WCD_REFRESH_WORK=/some/dir`` keeps the work directory.
@@ -41,10 +43,17 @@ pytestmark = [
 ]
 
 
-def split_by_time(bundle: Path, cutoff: str, before: Path, after: Path) -> tuple[int, int]:
-    """Copy each revision of ``bundle`` to ``before`` or ``after`` by its timestamp."""
+def in_b(page_id: int, timestamp: str) -> bool:
+    return timestamp >= CUTOFF and page_id % 4 != 0
+
+
+IN_B_SQL = f"(timestamp >= '{CUTOFF}' AND page_id % 4 <> 0)"   # in_b, for the metadata
+
+
+def split_bundle(bundle: Path, a: Path, b: Path) -> tuple[int, int]:
+    """Copy each revision of ``bundle`` to ``a`` or ``b`` (``in_b``); returns the counts."""
     counts = [0, 0]
-    with open(before, "wb") as fa, open(after, "wb") as fb:
+    with open(a, "wb") as fa, open(b, "wb") as fb:
         wa = zstd.ZstdCompressor(level=3).stream_writer(fa)
         wb = zstd.ZstdCompressor(level=3).stream_writer(fb)
         target = None
@@ -52,8 +61,8 @@ def split_by_time(bundle: Path, cutoff: str, before: Path, after: Path) -> tuple
             reader = zstd.ZstdDecompressor().stream_reader(fh, read_across_frames=True)
             for line in io.BufferedReader(reader, buffer_size=4 * 2**20):
                 if line.startswith(b"#"):
-                    ts = next((t[10:].decode() for t in line[1:].split() if t.startswith(b"timestamp=")), "")
-                    k = 0 if ts < cutoff else 1
+                    meta = dict(t.decode().split("=", 1) for t in line[1:].split() if b"=" in t)
+                    k = int(in_b(int(meta["page_id"]), meta.get("timestamp", "")))
                     target = (wa, wb)[k]
                     counts[k] += 1
                 if target is not None:
@@ -63,12 +72,12 @@ def split_by_time(bundle: Path, cutoff: str, before: Path, after: Path) -> tuple
     return counts[0], counts[1]
 
 
-def split_metadata(meta: Path, cutoff: str, before: Path, after: Path) -> None:
-    """Revision rows by timestamp; each side gets the page rows of the pages it has revisions of
+def split_metadata(meta: Path, a: Path, b: Path) -> None:
+    """Revision rows by ``in_b`` (``IN_B_SQL``); each side gets the page rows of the pages it has revisions of
     (as RevisionChest writes a page row for every page in a build or sync batch)."""
     con = duckdb.connect()
     src = f"read_parquet('{meta}')"
-    for path, cond in ((before, f"timestamp < '{cutoff}'"), (after, f"timestamp >= '{cutoff}'")):
+    for path, cond in ((a, f"NOT {IN_B_SQL}"), (b, IN_B_SQL)):
         con.execute(f"""COPY (
             SELECT * FROM {src} WHERE type = 'revision' AND {cond}
             UNION ALL
@@ -126,12 +135,13 @@ def run(tmp_path_factory) -> Run:
 
 
 def test_00_split(run: Run):
-    a, b = split_by_time(BUNDLE, CUTOFF, run.shard_a / "fixture-ci-a.mwrev.zst",
-                         run.shard_b / "fixture-ci-b.mwrev.zst")
-    split_metadata(SHARD / "meta.parquet", CUTOFF, run.work / "meta-a.parquet", run.work / "meta-b.parquet")
-    n_a = pq.read_metadata(run.work / "meta-a.parquet").num_rows
-    assert (a, b) == (15741, 1691), (a, b)
-    assert n_a > a
+    a, b = split_bundle(BUNDLE, run.shard_a / "fixture-ci-a.mwrev.zst", run.shard_b / "fixture-ci-b.mwrev.zst")
+    split_metadata(SHARD / "meta.parquet", run.work / "meta-a.parquet", run.work / "meta-b.parquet")
+    assert (a, b) == (16059, 1373), (a, b)
+    con = duckdb.connect()
+    assert con.execute(f"SELECT count(*) FILTER (WHERE type = 'revision'), count(DISTINCT page_id) "
+                       f"FROM '{run.work / 'meta-b.parquet'}'").fetchone() == (1373, 35)
+    assert pq.read_metadata(run.work / "meta-a.parquet").num_rows > a
 
 
 def build(run: Run) -> None:
@@ -160,7 +170,8 @@ def build(run: Run) -> None:
 
 
 def refresh(run: Run) -> None:
-    """Apply B to the build of A: the runbook's "Incremental updates" path, with every gate."""
+    """Apply B to the build of A, with every gate: the runbook's "Incremental updates" path,
+    with the steps made incremental so far run for B's pages only."""
     shutil.copy(run.work / "meta-b.parquet", run.meta / "b.parquet")
     run.wcd("B: stage0-load", "stage0-load", "--domain", DOMAIN, "--metadata", str(run.meta), *run.pq())
     run.wcd("B: gate 0", "gate", "0", "--domain", DOMAIN, *run.pq())
@@ -175,7 +186,9 @@ def refresh(run: Run) -> None:
     run.wcd("B: denorm-export", "denorm-export", "--domain", DOMAIN, *run.pq())
     run.wcd("B: ref-name-links", "ref-name-links", "--domain", DOMAIN, *run.pq())
     run.wcd("B: gate 5", "gate", "5", "--domain", DOMAIN, *run.pq())
-    run.wcd("B: match", "match", "--domain", DOMAIN, *run.pq(), "--jobs", JOBS, "--force")
+    # 6a-6c for B's pages only (its metadata lists them); 6d over the domain
+    run.wcd("B: match", "match", "--domain", DOMAIN, *run.pq(), "--jobs", JOBS,
+            "--pages-from", str(run.meta / "b.parquet"))
     run.wcd("B: gate 6", "gate", "6", "--domain", DOMAIN, *run.pq())
     run.wcd("B: materialize", "materialize", "--domain", DOMAIN, *run.pq(), "--force")
     run.wcd("B: gate 7", "gate", "7", "--domain", DOMAIN, *run.pq())
