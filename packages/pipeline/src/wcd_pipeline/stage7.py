@@ -188,15 +188,25 @@ def step_b(pg, con, domain: str, domain_id: int, parquet_base: str) -> int:
     finally:
         session.close()
         shutil.rmtree(split, ignore_errors=True)
+    # global sources that no resolution row refers to any more are removed at the end of 7d:
+    # until 7d replaces page_source_summary, its old rows can still refer to them
+    return n
+
+
+def _remove_unreferenced_global_sources(pg) -> int:
+    """Delete the global sources no ``citation_source_resolution`` or ``page_source_summary``
+    row refers to (sources a re-run of 6d dissolved or renamed)."""
     with pg.cursor() as cur:
-        # global sources no longer referenced by any resolution row
-        cur.execute("""DELETE FROM global_sources gs WHERE NOT EXISTS
-                       (SELECT 1 FROM citation_source_resolution r WHERE r.global_source_id = gs.global_source_id)""")
+        cur.execute("""DELETE FROM global_sources gs
+                       WHERE NOT EXISTS (SELECT 1 FROM citation_source_resolution r
+                                         WHERE r.global_source_id = gs.global_source_id)
+                         AND NOT EXISTS (SELECT 1 FROM page_source_summary p
+                                         WHERE p.global_source_id = gs.global_source_id)""")
         orphans = cur.rowcount
     pg.commit()
     if orphans:
-        log(f"7b: removed {orphans} unreferenced global_sources")
-    return n
+        log(f"7d: removed {orphans} unreferenced global_sources")
+    return orphans
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +340,7 @@ def step_d(pg, con, domain: str, domain_id: int, parquet_base: str, force: bool)
     finally:
         session.close()
     shutil.rmtree(scratch)
+    _remove_unreferenced_global_sources(pg)
     return total
 
 
