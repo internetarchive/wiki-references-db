@@ -505,6 +505,16 @@ def load_wiki_templates(session, staging_dir):
     log(f"wiki_templates: {count} rows loaded")
 
 
+# A row loaded again merges with the stored one as `wcd dedup` merges staged rows
+# (MIN of each column, strings in byte order as in DuckDB), so loading staging sets
+# one after another gives the rows a single load of their union gives. The WHERE of
+# each upsert skips rows the merge would not change.
+_NC_NEW_DOMAIN_FIRST = """(SELECT value FROM domains WHERE id = EXCLUDED.appears_on_domain_id) COLLATE "C"
+                    < (SELECT value FROM domains WHERE id = nc.appears_on_domain_id) COLLATE "C" """
+_CI_NEW_SHA1_FIRST = """(SELECT normalized_sha1 FROM normalized_citations WHERE id = EXCLUDED.normalized_id) COLLATE "C"
+                    < (SELECT normalized_sha1 FROM normalized_citations WHERE id = ci.normalized_id) COLLATE "C" """
+
+
 def load_normalized_citations(session, staging_dir):
     filepath = find_deduped_parquet(staging_dir, 'normalized_citations')
     if not filepath:
@@ -522,20 +532,24 @@ def load_normalized_citations(session, staging_dir):
                  'citation_type'],
         # rows with an unknown domain, no page id or no citation_type are skipped
         insert_sql="""
-            INSERT INTO normalized_citations
+            INSERT INTO normalized_citations AS nc
                 (normalized_sha1, reference_normalized, appears_on_domain_id, appears_on_page_id, citation_type)
             SELECT s.normalized_sha1, s.reference_normalized, d.id, s.appears_on_page_id, s.citation_type
             FROM _nc_stage s JOIN domains d ON d.value = s.appears_on_domain
             WHERE s.appears_on_page_id IS NOT NULL AND s.citation_type <> ''
             ON CONFLICT (normalized_sha1) DO UPDATE SET
-                reference_normalized = EXCLUDED.reference_normalized,
-                appears_on_domain_id = EXCLUDED.appears_on_domain_id,
-                appears_on_page_id = EXCLUDED.appears_on_page_id,
-                citation_type = EXCLUDED.citation_type""",
+                appears_on_domain_id = CASE WHEN {new_domain_first}
+                    THEN EXCLUDED.appears_on_domain_id ELSE nc.appears_on_domain_id END,
+                appears_on_page_id = LEAST(nc.appears_on_page_id, EXCLUDED.appears_on_page_id),
+                citation_type = LEAST(nc.citation_type COLLATE "C", EXCLUDED.citation_type COLLATE "C")
+            WHERE {new_domain_first}
+               OR EXCLUDED.appears_on_page_id < nc.appears_on_page_id
+               OR EXCLUDED.citation_type COLLATE "C" < nc.citation_type COLLATE "C" """.format(
+            new_domain_first=_NC_NEW_DOMAIN_FIRST),
         sort_by='normalized_sha1')
     if staged != written:
         log(f"normalized_citations: warning: {staged - written} rows skipped "
-            f"(unknown domain, missing page id or citation_type)")
+            f"(unknown domain, missing page id or citation_type, or already loaded and unchanged)")
 
 
 def load_citation_instances(session, staging_dir):
@@ -563,25 +577,34 @@ def load_citation_instances(session, staging_dir):
         temp_ddl='id bigint, domain text, page_id integer, raw_sha1 char(40), normalized_sha1 char(40), '
                  'reference_type smallint, reference_name text',
         columns=['id', 'domain', 'page_id', 'raw_sha1', 'normalized_sha1', 'reference_type', 'reference_name'],
-        # rows without a matching normalized citation or domain are skipped
+        # rows without a matching normalized citation or domain are skipped. The conflict
+        # target is the natural key, whose id is computed above: an id already taken by a
+        # different (domain, page_id, raw_sha1) breaks the primary key and stops the load
+        # (the instance-id collision gate of `wcd dedup`, against the rows already loaded)
         insert_sql="""
-            INSERT INTO citation_instances
+            INSERT INTO citation_instances AS ci
                 (id, domain_id, page_id, raw_sha1, normalized_id, reference_type, reference_name)
             SELECT s.id, d.id, s.page_id, s.raw_sha1, n.id, s.reference_type, s.reference_name
             FROM _ci_stage s
             JOIN domains d ON d.value = s.domain
             JOIN normalized_citations n ON n.normalized_sha1 = s.normalized_sha1
-            ON CONFLICT (id) DO UPDATE SET
-                normalized_id = EXCLUDED.normalized_id,
-                reference_type = EXCLUDED.reference_type,
-                reference_name = EXCLUDED.reference_name""",
+            ON CONFLICT ON CONSTRAINT uix_ci_domain_page_raw DO UPDATE SET
+                normalized_id = CASE WHEN {new_sha1_first}
+                    THEN EXCLUDED.normalized_id ELSE ci.normalized_id END,
+                reference_type = LEAST(ci.reference_type, EXCLUDED.reference_type),
+                reference_name = LEAST(ci.reference_name COLLATE "C", EXCLUDED.reference_name COLLATE "C")
+            WHERE {new_sha1_first}
+               OR EXCLUDED.reference_type < ci.reference_type
+               OR EXCLUDED.reference_name COLLATE "C" < ci.reference_name COLLATE "C"
+               OR (ci.reference_name IS NULL AND EXCLUDED.reference_name IS NOT NULL)""".format(
+            new_sha1_first=_CI_NEW_SHA1_FIRST),
         index_lookups=True,
         # the order of uix_ci_domain_page_raw, the largest index; the 8-byte
         # primary key and the normalized_sha1 lookups stay random but small
         sort_by='domain, page_id, raw_sha1')
     if staged != written:
         log(f"citation_instances: warning: {staged - written} rows skipped "
-            f"(no matching normalized citation or unknown domain)")
+            f"(no matching normalized citation or unknown domain, or already loaded and unchanged)")
 
 
 def load_ncwr(session, staging_dir):

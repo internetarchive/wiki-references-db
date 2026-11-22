@@ -164,6 +164,71 @@ def test_citation_instance_id_mismatch_fails(engine, tmp_path):
         assert con.execute(text("SELECT count(*) FROM citation_instances")).scalar() == 0
 
 
+def _stage_set(staging, nc_rows, ci_rows):
+    """A deduped staging set of normalized citations and instances (all on EN)."""
+    _write(staging, None, "domains", {"value": [EN], "for_container_label": pa.array([None], pa.string())})
+    _write(staging, None, "normalized_citations", {
+        "normalized_sha1": [r[0] for r in nc_rows], "reference_normalized": [f"ref {r[0][0]}" for r in nc_rows],
+        "appears_on_page_id": pa.array([r[1] for r in nc_rows], pa.int64()),
+        "appears_on_domain": [EN] * len(nc_rows), "citation_type": [r[2] for r in nc_rows]})
+    _write(staging, None, "citation_instances", {
+        "citation_instance_id": pa.array([instance_id(EN, r[0], r[1]) for r in ci_rows], pa.int64()),
+        "domain": [EN] * len(ci_rows), "page_id": pa.array([r[0] for r in ci_rows], pa.int64()),
+        "raw_sha1": [r[1] for r in ci_rows], "normalized_sha1": [r[2] for r in ci_rows],
+        "reference_type": pa.array([r[3] for r in ci_rows], pa.int8()),
+        "reference_name": pa.array([r[4] for r in ci_rows], pa.string())})
+
+
+LOAD_TABLES = ["--tables", "domains", "normalized_citations", "citation_instances"]
+
+
+@pytest.mark.parametrize("order", ["first-second", "second-first"])
+def test_loading_sets_one_after_another_merges_as_dedup(engine, tmp_path, order):
+    """A refresh loads only its new staging set. A row already loaded merges with the new one
+    as `wcd dedup` would have merged them in one set (MIN of each column, strings in byte
+    order), so the order of the loads does not matter."""
+    first = (  # normalized citations (sha1, page, type); instances (page, raw, sha1, type, name)
+        [(SHA_A, 9, "template"), (SHA_B, 9, "ref_tag")],
+        [(9, RAW_1, SHA_B, 2, None), (9, RAW_2, SHA_A, 1, "b")])
+    second = (
+        [(SHA_A, 7, "ref_tag"), (SHA_B, 12, "bare_url"), (SHA_C, 12, "template")],
+        [(9, RAW_1, SHA_A, 1, "Zed"), (9, RAW_2, SHA_B, 2, "a"), (12, RAW_3, SHA_C, 0, None)])
+    sets = [first, second] if order == "first-second" else [second, first]
+    for i, (nc, ci) in enumerate(sets):
+        _stage_set(tmp_path / f"set{i}", nc, ci)
+        load.main(["-d", str(tmp_path / f"set{i}"), *LOAD_TABLES])
+    got = _snapshot(engine)
+    assert got["normalized_citations"] == [
+        (SHA_A, "ref a", EN, 7, "ref_tag"),      # "ref_tag" < "template"
+        (SHA_B, "ref b", EN, 9, "bare_url"),     # page and type each take their own minimum
+        (SHA_C, "ref c", EN, 12, "template"),
+    ]
+    assert got["citation_instances"] == sorted([
+        (instance_id(EN, 9, RAW_1), EN, 9, RAW_1, SHA_A, 1, "Zed"),   # "Zed" beats NULL; SHA_A < SHA_B
+        (instance_id(EN, 9, RAW_2), EN, 9, RAW_2, SHA_A, 1, "a"),     # byte order: "a" < "b"
+        (instance_id(EN, 12, RAW_3), EN, 12, RAW_3, SHA_C, 0, None),
+    ])
+    # loading either set again changes nothing
+    load.main(["-d", str(tmp_path / "set0"), *LOAD_TABLES])
+    assert _snapshot(engine) == got
+
+
+def test_instance_id_taken_by_another_key_fails(engine, tmp_path):
+    """The instance-id collision gate, against rows already loaded: an id held by a different
+    (domain, page_id, raw_sha1) stops the load instead of updating that row."""
+    _stage_set(tmp_path, [(SHA_A, 9, "template")], [(9, RAW_1, SHA_A, 1, None)])
+    load.main(["-d", str(tmp_path), "--tables", "domains", "normalized_citations"])
+    with engine.begin() as con:
+        con.execute(text(
+            "INSERT INTO citation_instances (id, domain_id, page_id, raw_sha1, normalized_id, reference_type) "
+            "SELECT :id, d.id, 9, :raw, n.id, 1 FROM domains d, normalized_citations n"),
+            {"id": instance_id(EN, 9, RAW_1), "raw": RAW_2})
+    with pytest.raises(Exception, match="pk_citation_instances|duplicate key"):
+        load.main(["-d", str(tmp_path), "--tables", "citation_instances"])
+    with engine.connect() as con:
+        assert con.execute(text("SELECT raw_sha1 FROM citation_instances")).scalars().all() == [RAW_2]
+
+
 def test_sorted_copy_orders_row_groups(tmp_path, monkeypatch):
     """Units are the sorted copy's row groups, so they must come out in key order
     (``_duck`` turns preserve_insertion_order off, which ORDER BY must override)."""
