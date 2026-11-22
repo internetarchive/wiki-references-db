@@ -414,12 +414,10 @@ def test_20_update_goldens(run: Run, snapshots, cov, duck):
 SNAPSHOT_NAMES = [f"pg.{t}" for t in PG_TABLES] + ["pq." + d.replace("/", ".") for d in PQ_DATASETS]
 
 
-@pytest.mark.parametrize("name", SNAPSHOT_NAMES)
-def test_30_matches_golden(name: str, snapshots, duck):
-    if UPDATE:
-        pytest.skip("goldens were just recorded")
+def compare_with_golden(name: str, t: pa.Table | None, duck) -> None:
+    """Fail unless snapshot ``t`` of ``name`` equals its golden in fixtures/golden/ci/
+    (also used by test_refresh_ci, whose refreshed build must equal the full one)."""
     full, fp = GOLDEN / f"{name}.parquet", GOLDEN / f"{name}.fp.parquet"
-    t = snapshots.get(name)
     if not full.exists() and not fp.exists():
         if t is None:
             pytest.skip(f"{name}: not produced and no golden")
@@ -448,3 +446,10 @@ def test_30_matches_golden(name: str, snapshots, duck):
                               f"{diff[:10]}{' …' if len(diff) > 10 else ''}")
     finally:
         duck.unregister("cur")
+
+
+@pytest.mark.parametrize("name", SNAPSHOT_NAMES)
+def test_30_matches_golden(name: str, snapshots, duck):
+    if UPDATE:
+        pytest.skip("goldens were just recorded")
+    compare_with_golden(name, snapshots.get(name), duck)
