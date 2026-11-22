@@ -404,15 +404,42 @@ whatever their job count or file layout (all but the file count).
 ## Incremental updates (RevisionChest `sync`)
 
 `RevisionChest sync` appends recent changes to daily bundles and writes a
-metadata file per run into the `--parquet` directory. Treat each day's bundle
-as a new shard: `stage0-load` on the metadata *directory* (every revision
-once, overlapping batches included), `extract` on the new bundle, then the
-domain re-run from `dedup` onward (delete `$STAGING/deduped/` first; `parts
---resume`, `match --force`, `materialize --force`). A full domain re-run of
-Stages 3–8 is the current refresh; `packages/pipeline/tests/test_refresh_ci.py`
-checks that it gives exactly the full build's output on the ci fixture.
-Refreshing only what changed is proposed in
-`docs/design/proposed_incremental_refresh.md`.
+metadata file per run into the `--parquet` directory. A refresh applies one
+such batch (the new bundles, `$NEW`, and their metadata file, `$META_NEW`,
+which is also the list of pages they touch) to a built domain:
+
+```
+uv run wcd stage0-load --domain D --metadata $META          # the directory, $META_NEW included
+uv run wcd extract-all -d $NEW -o $STAGING_R --domain D     # a staging set of its own
+uv run wcd dedup -d $STAGING_R --previous $STAGING_PREV/deduped
+uv run wcd load -d $STAGING_R --changes
+uv run wcd gate 3 --domain D
+uv run wcd parts --domain D --resume --redo-from $STAGING_R/deduped/changes/normalized_citations.parquet
+uv run wcd denorm-export --domain D --pages-from $META_NEW
+uv run wcd ref-name-links --domain D --pages-from $META_NEW
+uv run wcd match --domain D --pages-from $META_NEW        # 6a–6c for those pages, 6d for the domain
+uv run wcd materialize --domain D --force
+uv run wcd revision-stats --domain D
+```
+
+* `dedup --previous` merges the previous build's deduped set with the new
+  shards (the same rows as a dedup of every shard) and writes the rows new or
+  changed against it to `deduped/changes/`; `load --changes` loads only those,
+  and updates the template datasets for them. `$STAGING_R/deduped` is the
+  `--previous` of the next refresh; the old staging sets can then go.
+* `parts --redo-from` re-builds the parts of citations whose merged
+  `citation_type` changed, deleting their `citation_source_resolution` rows for
+  7b to write again.
+* `--pages-from` steps replace the rows of those pages and keep the rest.
+  6d and materialize (7a–7g) still cover the domain; 7h and revision-stats do
+  too, for now.
+* The old path, every step for the whole domain from `dedup` on (delete
+  `$STAGING/deduped/` first; `parts --resume`, `match --force`,
+  `materialize --force`), gives the same result.
+
+`packages/pipeline/tests/test_refresh_ci.py` checks that this refresh gives
+exactly the full build's output on the ci fixture;
+`docs/design/proposed_incremental_refresh.md` has the design and what is left.
 
 ## Serving
 
