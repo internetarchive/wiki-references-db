@@ -174,7 +174,10 @@ def refresh(run: Run) -> None:
     """Apply B to the build of A, with every gate: the runbook's "Incremental updates" path,
     with the steps made incremental so far run for B's pages only."""
     shutil.copy(run.work / "meta-b.parquet", run.meta / "b.parquet")
-    run.wcd("B: stage0-load", "stage0-load", "--domain", DOMAIN, "--metadata", str(run.meta), *run.pq())
+    # B's metadata alone: Postgres upserts it, and the revisions dataset gains its rows as
+    # one more file per bucket
+    run.wcd("B: stage0-load", "stage0-load", "--domain", DOMAIN, "--metadata", str(run.meta / "b.parquet"),
+            "--append", *run.pq())
     run.wcd("B: gate 0", "gate", "0", "--domain", DOMAIN, *run.pq())
     # B's shards staged on their own, deduped together with A's deduped set, and only the
     # rows new or changed against it loaded

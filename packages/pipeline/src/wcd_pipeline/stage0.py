@@ -21,6 +21,7 @@ Usage:
     wcd stage0-load --domain en.wikipedia.org --metadata bundles/metadata.parquet --parquet-dir data/parquet
     wcd stage0-load --domain en.wikipedia.org --metadata bundles/metadata.parquet --no-postgres   # Parquet only
     wcd stage0-load --domain en.wikipedia.org --metadata bundles/sync/ …                           # a directory of files
+    wcd stage0-load --domain en.wikipedia.org --metadata bundles/sync/new.parquet --append …       # a refresh's new file
 """
 from __future__ import annotations
 
@@ -445,6 +446,73 @@ def gate(session: Session | None, domain: str, parquet_base: str | None) -> list
     return stage0(session, domain, parquet_base)
 
 
+def append_revisions_parquet(path: str, domain: str, parquet_base: str, work_dir: str | None = None) -> int:
+    """Add the revisions of new metadata (a refresh's ``sync`` batch: a file, or each file of
+    a directory) to the domain's ``revisions`` dataset instead of rebuilding it from all
+    metadata: each bucket gains ``meta-<file stem>.parquet``. Revisions the dataset already
+    has are left out, so the result is what a rebuild from old and new metadata gives; a
+    re-run replaces the file's own bucket files. Returns the rows added."""
+    import glob
+    import tempfile
+
+    n = 0
+    for f in sorted(glob.glob(metadata_glob(path))):
+        spill = tempfile.mkdtemp(prefix="stage0-append-", dir=_work_base(work_dir))
+        try:
+            n += _append_one(f, domain, parquet_base, spill)
+        finally:
+            shutil.rmtree(spill, ignore_errors=True)
+    return n
+
+
+def _append_one(path: str, domain: str, parquet_base: str, tmp: str) -> int:
+    from pathlib import Path
+
+    name = "meta-" + re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(path).removesuffix(".parquet")) + ".parquet"
+    domain_dir = layout.partition_dir(parquet_base, "revisions", domain)
+    con = _duckdb(temp_dir=os.path.join(tmp, "duckdb-tmp"))
+    try:
+        con.execute(f"SET partitioned_write_max_open_files = {layout.PAGE_BUCKETS + 64}")
+    except duckdb.Error:
+        pass  # DuckDB without the setting (< 1.1)
+    # revisions the dataset has, other than from this file's own earlier run
+    existing = ""
+    if any(domain_dir.glob(f"page_bucket=*/{layout.FILE_GLOB}")):
+        existing = f"""ANTI JOIN (SELECT revision_id
+                                  FROM read_parquet('{layout.partition_glob(parquet_base, "revisions", domain)}', filename = true)
+                                  WHERE NOT ends_with(filename, '/{name}')) e ON e.revision_id = m.rev_id"""
+    dom = domain.replace("'", "''")
+    out = Path(tmp) / "out"
+    con.execute(
+        f"""COPY (
+                SELECT '{dom}' AS domain,
+                       CAST(m.page_id % {layout.PAGE_BUCKETS} AS INTEGER) AS page_bucket,
+                       CAST(m.rev_id AS BIGINT) AS revision_id,
+                       CAST(m.page_id AS INTEGER) AS page_id,
+                       CAST(m.parent_rev_id AS BIGINT) AS parent_revision_id,
+                       CAST(strptime(m.timestamp, '%Y-%m-%dT%H:%M:%SZ') AS TIMESTAMP) AS revision_timestamp
+                FROM {metadata_source(path)} m {existing}
+                WHERE m.type = 'revision'
+                QUALIFY row_number() OVER (PARTITION BY m.rev_id ORDER BY m.timestamp) = 1
+                ORDER BY m.page_id, m.rev_id
+            ) TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (domain, page_bucket))"""
+    )
+    written = {int(d.name.split("=", 1)[1]): sorted(d.glob("*.parquet")) for d in out.glob("domain=*/page_bucket=*")}
+    if any(len(fs) != 1 for fs in written.values()):
+        raise RuntimeError(f"expected one file per bucket from DuckDB, got {written}")
+    # this file's bucket files from an earlier run go, then the new ones move in
+    for old in domain_dir.glob(f"page_bucket=*/{name}"):
+        old.unlink()
+    n = 0
+    for bucket, (f,) in sorted(written.items()):
+        n += con.execute(f"SELECT count(*) FROM read_parquet('{f}')").fetchone()[0]
+        target = layout.partition_dir(parquet_base, "revisions", domain, bucket)
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.move(f, target / name)   # the work dir may be on another filesystem
+    log(f"revisions Parquet: {n} row(s) added from {os.path.basename(path)} as {name} in {len(written)} bucket(s)")
+    return n
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -461,6 +529,10 @@ def main(argv=None) -> int:
     ap.add_argument("--metadata", required=True, help="RevisionChest metadata .parquet file, or a directory of them")
     ap.add_argument("--parquet-dir", default=os.environ.get("PARQUET_DIR"), help="Parquet base directory for the revisions dataset (default: PARQUET_DIR)")
     ap.add_argument("--no-postgres", action="store_true", help="only write the revisions Parquet dataset")
+    ap.add_argument("--append", action="store_true",
+                    help="--metadata is new metadata only (a refresh's sync batch): add its revisions to the "
+                         "revisions dataset, one file per bucket named after it, instead of rebuilding the "
+                         "domain's dataset from all metadata (the Postgres load is an upsert either way)")
     ap.add_argument("--no-gate", action="store_true", help="skip the Stage-0 checks afterwards")
     ap.add_argument("--jobs", type=int, default=8,
                     help="Postgres connections loading revisions in parallel (default 8)")
@@ -490,8 +562,9 @@ def main(argv=None) -> int:
             session.rollback()
             raise
     if args.parquet_dir:
-        n = write_revisions_parquet(args.metadata, args.domain, args.parquet_dir, work_dir=args.work_dir)
-        log(f"revisions Parquet: {n} rows under {layout.partition_dir(args.parquet_dir, 'revisions', args.domain)}")
+        write = append_revisions_parquet if args.append else write_revisions_parquet
+        n = write(args.metadata, args.domain, args.parquet_dir, work_dir=args.work_dir)
+        log(f"revisions Parquet: {n} rows {'added ' if args.append else ''}under {layout.partition_dir(args.parquet_dir, 'revisions', args.domain)}")
     elif args.no_postgres:
         ap.error("--no-postgres without --parquet-dir does nothing")
 
