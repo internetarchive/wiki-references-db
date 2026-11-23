@@ -418,9 +418,9 @@ def main(argv=None) -> int:
     ap.add_argument("--buckets", help="comma-separated page buckets to (re)run (default: all with denorm data)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2), help="buckets processed concurrently")
     ap.add_argument("--force", action="store_true", help="re-run buckets that already have a _SUCCESS marker")
-    ap.add_argument("--pages-from", metavar="PARQUET",
+    ap.add_argument("--pages-from", metavar="PARQUET", action="append",
                     help="6a-6c for these pages only (the distinct page_id of a Parquet file or directory, such as "
-                         "a refresh's RevisionChest metadata), replacing their rows in each bucket they fall in")
+                         "a refresh's RevisionChest metadata; repeatable, the sets are united), replacing their rows in each bucket they fall in")
     ap.add_argument("--skip-global", action="store_true", help="stop after 6c")
     ap.add_argument("--global-engine", choices=("scaled", "vendored"), default="scaled",
                     help="6d: scaled (integer union-find + DuckDB, global_match) or the vendored pandas match_global "

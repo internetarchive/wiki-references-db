@@ -223,9 +223,9 @@ def main(argv=None) -> int:
     ap.add_argument("--no-gate", action="store_true")
     ap.add_argument("--defer-fks", action=argparse.BooleanOptionalAction, default=True,
                     help="drop ref_name_links' foreign keys while it is empty, validate them after (default: on)")
-    ap.add_argument("--pages-from", metavar="PARQUET",
+    ap.add_argument("--pages-from", metavar="PARQUET", action="append",
                     help="these pages only (the distinct page_id of a Parquet file or directory, such as a "
-                         "refresh's RevisionChest metadata), replacing their links")
+                         "refresh's RevisionChest metadata; repeatable, the sets are united), replacing their links")
     args = ap.parse_args(argv)
     if not args.parquet_dir:
         ap.error("--parquet-dir (or PARQUET_DIR) is required")

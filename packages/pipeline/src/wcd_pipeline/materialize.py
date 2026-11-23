@@ -234,9 +234,9 @@ def main(argv=None) -> int:
     ap.add_argument("--reuse-export", action="store_true",
                     help="convert the complete CSV a failed run left in the scratch directory instead of exporting "
                          "again (only if the tables have not changed since)")
-    ap.add_argument("--pages-from", metavar="PARQUET",
+    ap.add_argument("--pages-from", metavar="PARQUET", action="append",
                     help="export only these pages (the distinct page_id of a Parquet file or directory, such as a "
-                         "refresh's RevisionChest metadata), replacing their rows in the buckets they fall in")
+                         "refresh's RevisionChest metadata; repeatable, the sets are united), replacing their rows in the buckets they fall in")
     args = ap.parse_args(argv)
     if not args.parquet_dir:
         ap.error("--parquet-dir (or PARQUET_DIR) is required")

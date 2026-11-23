@@ -21,7 +21,7 @@ import pyarrow.parquet as pq
 import pytest
 from sqlalchemy import create_engine, text
 
-from wcd_pipeline import dedup, init_db, load, stage4
+from wcd_pipeline import dedup, init_db, load, materialize, stage4
 from wcd_pipeline.config import database_url
 from wcd_schema import parquet as layout
 from wcd_schema.ids import instance_id
@@ -89,6 +89,9 @@ def _fresh(engine):
     init_db.main([])
 
 
+DENORM_COLS = "citation_instance_id, page_id, normalized_sha1, citation_type, reference_name, part_index, norm_subtype"
+
+
 def _snapshot(engine, parquet):
     with engine.connect() as con:
         q = lambda sql: sorted(tuple(r) for r in con.execute(text(sql)))  # noqa: E731
@@ -109,6 +112,9 @@ def _snapshot(engine, parquet):
         out[ds] = sorted(con.execute(
             f"SELECT {cols} FROM read_parquet('{layout.dataset_glob(parquet, ds)}', hive_partitioning = true)"
         ).fetchall(), key=repr)
+    out["citation_instances_denorm"] = sorted(con.execute(
+        f"SELECT {DENORM_COLS} FROM read_parquet('{layout.dataset_glob(parquet, 'citation_instances_denorm')}', "
+        "hive_partitioning = true)").fetchall(), key=repr)
     return out
 
 
@@ -117,6 +123,22 @@ def _dedup_load(staging, parquet, *dedup_args, changes=False):
     load.main(["-d", str(staging), "--parquet-dir", str(parquet), *(["--changes"] if changes else [])])
     redo = ["--resume", "--redo-from", str(staging / "deduped" / "changes" / "normalized_citations.parquet")]
     assert stage4.main(["--jobs", "1", "--no-gate", *(redo if changes else [])]) == 0
+    # denorm-export: in full, or for the staged pages plus those citing a retyped citation
+    _denorm(staging, parquet, changes)
+
+
+def _denorm(staging, parquet, changes):
+    """denorm-export: in full, or for the staged pages (the touched ones) plus those citing
+    a retyped citation."""
+    pages = []
+    if changes:
+        touched = staging / "touched.parquet"
+        staged = pa.concat_tables(pq.read_table(f) for f in sorted(staging.glob("*-citation_instances-*.parquet")))
+        pq.write_table(pa.table({"page_id": pa.array(sorted(set(staged.column("page_id").to_pylist())),
+                                                     pa.int64())}), touched)
+        pages = ["--pages-from", str(touched),
+                 "--pages-from", str(staging / "deduped" / "changes" / "retyped_pages.parquet")]
+    assert materialize.main(["--domain", EN, "--parquet-dir", str(parquet), *pages]) == 0
 
 
 def test_changes_load_equals_full_load(engine, tmp_path):
@@ -141,6 +163,10 @@ def test_changes_load_equals_full_load(engine, tmp_path):
     assert (S1, 10, "endnote") in full["normalized_citations"]
     assert (10, S1, "Cite web", "title", "Apple") in full["template_params"]
     assert ("Cite web", "title", "Apple", 2) in full["template_value_counts"]
+    # page 10 is not in B, but cites S1, which B retyped
+    assert pq.read_table(tmp_path / "b" / "deduped" / "changes" / "retyped_pages.parquet").column(
+        "page_id").to_pylist() == [10, 30]
+    assert any(r[1] == 10 and r[3] == "endnote" for r in full["citation_instances_denorm"])
     for name in full:
         assert refreshed[name] == full[name], name
 
@@ -151,4 +177,5 @@ def test_changes_load_equals_full_load(engine, tmp_path):
         load.main(["-d", str(tmp_path / "b"), "--parquet-dir", str(tmp_path / "pq-again"), "--changes"])
         assert stage4.main(["--jobs", "1", "--no-gate", "--resume", "--redo-from",
                             str(tmp_path / "b" / "deduped" / "changes" / "normalized_citations.parquet")]) == 0
+        _denorm(tmp_path / "b", tmp_path / "pq-again", changes=True)
     assert _snapshot(engine, tmp_path / "pq-again") == full

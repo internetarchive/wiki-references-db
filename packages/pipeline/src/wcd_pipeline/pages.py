@@ -3,7 +3,10 @@
 A refresh re-computes the pages its new revisions touched (docs/design/
 proposed_incremental_refresh.md §4). The set is read from any Parquet file, or
 directory of files, with a ``page_id`` column; RevisionChest metadata qualifies,
-so the refresh's new metadata file is its own page list.
+so the refresh's new metadata file is its own page list. The pages whose rows a
+refresh changes without touching them, those citing a citation whose merged
+``citation_type`` changed, are ``dedup --previous``'s ``changes/retyped_pages.parquet``;
+the page-set steps take both (``--pages-from`` twice).
 
 A page-partitioned dataset's bucket is then rewritten as its other pages' rows
 plus the new rows of the set's pages (``replace_pages``). Each rewrite is journaled
@@ -28,14 +31,16 @@ import pyarrow.parquet as pq
 from wcd_schema import parquet as layout
 
 
-def read_page_set(path: str | os.PathLike) -> list[int]:
-    """The distinct page ids in ``path`` (a Parquet file or a directory of them), ascending."""
-    p = Path(path)
-    src = str(p / "*.parquet") if p.is_dir() else str(p)
+def read_page_set(paths: str | os.PathLike | list) -> list[int]:
+    """The distinct page ids in ``paths`` (a Parquet file or a directory of them, or a list
+    of such), ascending."""
+    if isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
+    srcs = [str(Path(p) / "*.parquet") if Path(p).is_dir() else str(p) for p in paths]
     con = duckdb.connect()
     try:
-        rows = con.execute(f"SELECT DISTINCT CAST(page_id AS BIGINT) FROM read_parquet('{src}', union_by_name = true) "
-                           "WHERE page_id IS NOT NULL ORDER BY 1").fetchall()
+        rows = con.execute(f"SELECT DISTINCT CAST(page_id AS BIGINT) FROM read_parquet(?, union_by_name = true) "
+                           "WHERE page_id IS NOT NULL ORDER BY 1", [srcs]).fetchall()
     finally:
         con.close()
     return [r[0] for r in rows]

@@ -15,6 +15,8 @@ GROUP BY with MIN, or a DISTINCT, and its deduped file has the staged columns, s
 this gives the rows a dedup of every shard ever staged would, without re-reading
 the old shards. ``deduped/changes/<table>.parquet`` then holds the rows that are
 new or changed against the previous set: what ``wcd load --changes`` loads.
+``deduped/changes/retyped_pages.parquet`` lists the pages citing a citation whose
+merged ``citation_type`` changed, which the page-set steps re-run too.
 
 The **instance-id collision gate** runs with ``citation_instances``: the
 deterministic ``citation_instance_id`` must be unique per distinct
@@ -355,6 +357,33 @@ def write_changes(con, deduped_dir, previous_dir, table):
     log(f"{table}: {n} rows new or changed against {previous_dir}")
 
 
+RETYPED_PAGES = 'retyped_pages'
+
+
+def write_retyped_pages(con, deduped_dir, previous_dir):
+    """``deduped/changes/retyped_pages.parquet``: the pages citing a citation whose merged
+    ``citation_type`` the refresh changed. Their denorm rows (type and parts) change
+    though no new revision touched them, so the page-set steps re-run them along with
+    the touched pages. Needs both tables deduped; returns the page count, or None."""
+    changed = _out(os.path.join(deduped_dir, 'changes'), 'normalized_citations')
+    prev = _out(previous_dir, 'normalized_citations')
+    instances = _out(deduped_dir, 'citation_instances')
+    if not all(os.path.exists(f) for f in (changed, prev, instances)):
+        return None
+    target = _out(os.path.join(deduped_dir, 'changes'), RETYPED_PAGES)
+    con.execute(f"""COPY (
+        SELECT DISTINCT page_id FROM '{instances}'
+        WHERE normalized_sha1 IN (
+            SELECT c.normalized_sha1 FROM '{changed}' c JOIN '{prev}' p USING (normalized_sha1)
+            WHERE c.citation_type IS DISTINCT FROM p.citation_type)
+        ORDER BY page_id
+    ) TO '{target}.partial' (FORMAT PARQUET, COMPRESSION ZSTD)""")
+    os.replace(target + '.partial', target)
+    n = con.execute(f"SELECT count(*) FROM '{target}'").fetchone()[0]
+    log(f"{n} page(s) cite a citation whose citation_type changed: {target}")
+    return n
+
+
 def main(argv=None):
     global ROWS_PER_PARTITION, PARTITION_BASE
     parser = argparse.ArgumentParser(
@@ -446,6 +475,9 @@ def main(argv=None):
             log(f"{table_name}: done in {elapsed:.1f}s")
         finally:
             _clear_running(deduped_dir, table_name)
+
+    if args.previous:
+        write_retyped_pages(con, deduped_dir, args.previous)
 
     total = time.time() - t0
     log(f"All done. Total elapsed: {total:.1f}s")
