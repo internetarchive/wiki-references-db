@@ -887,19 +887,28 @@ def write_template_parquet_changes(session, staging_dir, parquet_base):
                             FROM read_parquet('{_q(ci_all)}')
                             WHERE domain IS NOT NULL AND page_id IS NOT NULL
                               AND normalized_sha1 IN (SELECT normalized_sha1 FROM c2)""")
-            con.execute(f"""CREATE TEMP TABLE np AS
+            # the new rows, split by page bucket in one pass: a temp table read whole for each
+            # bucket took ~8 min a bucket on enwiki's 2.4M-citation catch-up (66 h for 512)
+            np_dir = os.path.join(work, 'np')
+            con.execute(f"""COPY (
                             SELECT c.domain, CAST(c.page_id % {PAGE_BUCKETS} AS INTEGER) AS page_bucket, c.page_id,
                                    t.normalized_sha1, t.template_name, t.offset_start, t.parameter_key, t.parameter_value
                             FROM {td} t JOIN cp c ON c.domain = t.domain_label AND c.normalized_sha1 = t.normalized_sha1
-                            WHERE t.template_name IS NOT NULL AND t.parameter_key IS NOT NULL""")
+                            WHERE t.template_name IS NOT NULL AND t.parameter_key IS NOT NULL
+                        ) TO '{_q(np_dir)}' (FORMAT PARQUET, PARTITION_BY (page_bucket), COMPRESSION ZSTD)""")
             par_cols = ['page_id', 'normalized_sha1', 'template_name', 'offset_start', 'parameter_key', 'parameter_value']
             pbs = con.execute(f"SELECT DISTINCT domain, CAST(page_id % {PAGE_BUCKETS} AS INTEGER) FROM cp").fetchall()
+            log(f"template_params: new rows of {len(pbs)} page buckets split in {time.time() - t:.0f}s")
             for d, b in sorted(pbs):
                 dest = os.path.join(str(layout.dataset_dir(parquet_base, 'template_params')),
                                     f'domain={d}', f'page_bucket={b}')
+                part = os.path.join(np_dir, f'page_bucket={b}')
+                new_rows = (f"SELECT {', '.join(par_cols)} FROM read_parquet('{_q(part)}/*.parquet', hive_partitioning=false) "
+                            f"WHERE domain = '{_q(d)}'" if os.path.isdir(part) else
+                            f"SELECT {', '.join(f'NULL AS {c}' for c in par_cols)} WHERE false")
                 replace(dest, f"""SELECT * FROM (
                         SELECT * FROM ({existing(dest, par_cols)}) WHERE normalized_sha1 NOT IN (SELECT * FROM c2)
-                        UNION ALL SELECT {', '.join(par_cols)} FROM np WHERE domain = '{_q(d)}' AND page_bucket = {b})
+                        UNION ALL {new_rows})
                     ORDER BY page_id, normalized_sha1, offset_start, parameter_key""")
             log(f"template_params: {len(pbs)} page buckets rewritten in {time.time() - t:.0f}s")
     finally:
