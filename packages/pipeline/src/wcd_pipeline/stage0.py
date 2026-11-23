@@ -33,13 +33,13 @@ import shutil
 import time
 
 import duckdb
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, inspect, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
 from wcd_schema import parquet as layout
-from wcd_schema.postgres import Domain, LogEvent, RevisionBundle
+from wcd_schema.postgres import STAGE_TABLES, Domain, LogEvent, RevisionBundle
 
 from .config import database_url, load_dotenv  # noqa: F401
 
@@ -345,7 +345,18 @@ def load_log_events(session: Session, path: str, domain_id: int) -> int:
     return len(values)
 
 
+def missing_tables(session: Session) -> list[str]:
+    """The Stage-0 tables the database lacks: one created by an older ``init-db`` misses
+    tables added since (``log_events``), which would otherwise fail the load at its end."""
+    have = set(inspect(session.get_bind()).get_table_names())
+    return sorted(set(STAGE_TABLES[0]) - have)
+
+
 def load_to_postgres(session: Session, path: str, domain: str, jobs: int = 8, work_dir: str | None = None) -> dict:
+    missing = missing_tables(session)
+    if missing:
+        raise RuntimeError(f"table(s) {', '.join(missing)} missing: run `wcd init-db --table {' '.join(missing)}` "
+                           "first (it creates only what is missing)")
     domain_id = ensure_domain(session, domain)
     bundles = load_bundles(session, path)
     log(f"{len(bundles)} bundle(s)")

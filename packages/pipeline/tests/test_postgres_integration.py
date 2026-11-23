@@ -152,6 +152,19 @@ def test_stage0_load_is_idempotent(db, work: Path):
     assert n == len(FIXTURE_REVISIONS)
 
 
+def test_stage0_load_stops_first_on_a_missing_table(db, work: Path):
+    """A database from an older init-db lacks tables added since: the load says so before
+    loading anything, not after hours of revisions."""
+    with db.begin() as con:
+        con.execute(text("ALTER TABLE log_events RENAME TO log_events_away"))
+    try:
+        with pytest.raises(RuntimeError, match="log_events"):
+            stage0.main(["--domain", DOMAIN, "--metadata", str(STAGE0_META), "--no-gate"])
+    finally:
+        with db.begin() as con:
+            con.execute(text("ALTER TABLE log_events_away RENAME TO log_events"))
+
+
 def test_stage0_gate_detects_drift(db, work: Path):
     from sqlalchemy.orm import Session
     with db.connect() as con:

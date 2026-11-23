@@ -409,6 +409,7 @@ such batch (the new bundles, `$NEW`, and their metadata file, `$META_NEW`,
 which is also the list of pages they touch) to a built domain:
 
 ```
+uv run wcd init-db                                          # tables added since the build (creates only missing ones)
 uv run wcd stage0-load --domain D --metadata $META          # the directory, $META_NEW included
 uv run wcd extract-all -d $NEW -o $STAGING_R --domain D     # a staging set of its own
 uv run wcd dedup -d $STAGING_R --previous $STAGING_PREV/deduped
