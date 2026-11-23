@@ -410,7 +410,7 @@ which is also the list of pages they touch) to a built domain:
 
 ```
 uv run wcd init-db                                          # tables added since the build (creates only missing ones)
-uv run wcd stage0-load --domain D --metadata $META          # the directory, $META_NEW included
+uv run wcd stage0-load --domain D --metadata $META_NEW --append   # adds its revisions to revisions/
 uv run wcd extract-all -d $NEW -o $STAGING_R --domain D     # a staging set of its own
 uv run wcd dedup -d $STAGING_R --previous $STAGING_PREV/deduped
 uv run wcd load -d $STAGING_R --changes
@@ -423,6 +423,10 @@ uv run wcd materialize --domain D --force --pages-from $META_NEW --pages-from $R
 uv run wcd revision-stats --domain D
 ```
 
+* `stage0-load --append` upserts the new metadata into Postgres and adds its
+  revisions to each bucket of `revisions/` as `meta-<file>.parquet`, leaving
+  out revisions already there; without it, `revisions/` is rebuilt from
+  `--metadata`, which must then name all the domain's metadata.
 * `dedup --previous` merges the previous build's deduped set with the new
   shards (the same rows as a dedup of every shard) and writes the rows new or
   changed against it to `deduped/changes/`; `load --changes` loads only those,

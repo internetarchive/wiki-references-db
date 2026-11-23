@@ -85,7 +85,7 @@ is missing is a writer that replaces a page set instead of a domain.
 | ref-name-links | DELETE domain | DELETE + insert T's pages; rewrite T's rows in each bucket file |
 | 6a–6c | per bucket | per bucket, only T's pages; the bucket's `data-*.parquet` rewritten as its untouched pages' rows plus T's new rows |
 | 7h | per bucket checkpoint, DELETE by page list | T only |
-| revision-stats | per bucket | T only in phase 1 for its own fields; pages whose sources changed in 6d are added in phase 2 |
+| revision-stats | per bucket | domain-wide in phase 1: `n_unique_sources`, `n_high_confidence`, `n_new_sources` and `n_unresolved` count global sources, which change with 6d on pages outside T ∪ R; a page set needs phase 2's affected pages |
 
 Rewriting a bucket's Parquet file still reads and writes the untouched pages'
 rows, but only as I/O; the computation is for T alone. A shared helper
@@ -158,9 +158,11 @@ refresh whose touched pages hold more than about a third of the domain's history
    replaces the per-row `LEAST` design above as the source of exactness: the
    change set carries merged values, so a changed minimum reaches pages the
    refresh did not touch), load (`--changes`, with an incremental template
-   phase), parts (`--redo-from`), denorm-export, ref-name-links 6a–6c and 7h
-   (`--pages-from`, for T ∪ R). `test_refresh_load.py` covers the changed-minimum cases
-   the ci fixture does not have. **Left:** stage0-load's `revisions/` rebuild,
-   a gate 3 for the new rows, revision-stats for a page set.
+   phase), parts (`--redo-from`), denorm-export, ref-name-links, 6a–6c and 7h
+   (`--pages-from`, for T ∪ R), and stage0-load (`--append`: the new metadata
+   alone, its revisions added to each bucket as one more file).
+   `test_refresh_load.py` covers the changed-minimum cases the ci fixture does
+   not have. **Left:** a gate 3 for the new rows. revision-stats waits for
+   phase 2 (see its row in §4).
 4. Measure the 6d closure for a day of edits on the enwiki build.
 5. Phase 2.
