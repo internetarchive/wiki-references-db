@@ -14,7 +14,10 @@ revision_signals) are written by Stage 1 in their final layout.
 GROUP BY with MIN, or a DISTINCT, and its deduped file has the staged columns, so
 this gives the rows a dedup of every shard ever staged would, without re-reading
 the old shards. ``deduped/changes/<table>.parquet`` then holds the rows that are
-new or changed against the previous set: what ``wcd load --changes`` loads.
+new or changed against the previous set: what ``wcd load --changes`` loads. For
+the large tables it is an EXCEPT per key partition of both sets (equal rows share
+a partition), and a table whose deduped file is complete (``.deduped-<table>``)
+is not deduplicated again when only its change set failed.
 ``deduped/changes/retyped_pages.parquet`` lists the pages citing a citation whose
 merged ``citation_type`` changed, which the page-set steps re-run too.
 
@@ -31,7 +34,9 @@ Usage:
 """
 
 import argparse
+import math
 import os
+import shutil
 import sys
 import time
 
@@ -43,6 +48,14 @@ from .config import load_dotenv  # noqa: F401  (loads .env on import)
 # Staged rows per key partition for the large tables (DEDUP_ROWS_PER_PARTITION);
 # ~20M groups peaked at ~7 GB with a 4 GB DuckDB limit on enwiki.
 ROWS_PER_PARTITION = int(os.environ.get('DEDUP_ROWS_PER_PARTITION', '20000000'))
+# The key partition of a row of each large table: every row of a group (and so equal
+# rows) falls in the same one. Used by the dedup and by --previous's change set.
+PART_EXPR = {
+    'citation_instances': 'page_id',
+    'normalized_citations': 'hash(normalized_sha1)',
+    'ncwr': 'hash(normalized_sha1)',
+    'template_data': 'hash(normalized_sha1)',
+}
 # Where partition files go (main sets it to --temp-dir, else the deduped dir).
 PARTITION_BASE = None
 
@@ -79,6 +92,13 @@ def _mark_done(deduped_dir, table_name):
         f.write(time.strftime('%Y-%m-%d %H:%M:%S'))
 
 
+def _deduped_marker(deduped_dir, table_name):
+    """Written once a table's deduped file is complete, before ``--previous``'s change set:
+    a run that failed in the change set resumes from it (the dedup itself of enwiki's
+    template_data takes over an hour)."""
+    return os.path.join(deduped_dir, f'.deduped-{table_name}')
+
+
 def _is_running(deduped_dir, table_name):
     return os.path.exists(_running_marker(deduped_dir, table_name))
 
@@ -107,6 +127,46 @@ def _parse_bool(value):
     )
 
 
+def _split(con, src, part_expr, parts, dest):
+    """Write the rows of ``src`` (a DuckDB table expression) into ``parts`` Parquet
+    partitions of ``dest`` (``__part=<i>/``) by ``part_expr``, in one pass."""
+    try:
+        con.execute(f"SET partitioned_write_max_open_files = {parts + 64}")
+    except duckdb.Error:
+        pass
+    con.execute(f"""COPY (SELECT *, CAST(coalesce({part_expr}, 0) % {parts} AS INTEGER) AS __part FROM {src})
+                    TO '{dest}' (FORMAT PARQUET, PARTITION_BY (__part), COMPRESSION ZSTD)""")
+
+
+def _part_src(split, i):
+    """Partition ``i`` of a ``_split`` as a table expression, or None if it is empty."""
+    d = os.path.join(split, f'__part={i}')
+    return f"read_parquet('{d}/*.parquet', hive_partitioning=false)" if os.path.isdir(d) else None
+
+
+def _stream(con, queries, empty_query, out, row_group_size):
+    """Stream the results of ``queries`` into one Parquet file ``out``; if none gives a
+    row, ``out`` is ``empty_query``'s (no rows, the right columns)."""
+    import pyarrow.parquet as pq
+    writer = None
+    try:
+        for sql in queries:
+            result = con.execute(sql)
+            # to_arrow_reader() replaces fetch_record_batch() in newer DuckDB; the dependency allows >= 1.0
+            reader = (getattr(result, 'to_arrow_reader', None) or result.fetch_record_batch)(row_group_size)
+            for batch in reader:
+                if batch.num_rows == 0:
+                    continue
+                if writer is None:
+                    writer = pq.ParquetWriter(out, batch.schema, compression='zstd')
+                writer.write_batch(batch, row_group_size=row_group_size)
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is None:
+        con.execute(f"COPY ({empty_query}) TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+
+
 def _partitioned_copy(con, glob, part_expr, query, out, row_group_size, table_name):
     """Write ``query`` (SQL with a ``{src}`` placeholder for the staged rows) to
     ``out``, one key partition at a time when the table is large.
@@ -117,11 +177,6 @@ def _partitioned_copy(con, glob, part_expr, query, out, row_group_size, table_na
     pass; ``query`` then runs per partition and the results are streamed into a
     single file, written under a temporary name and renamed when complete.
     """
-    import math
-    import shutil
-
-    import pyarrow.parquet as pq
-
     n_rows = con.execute(f"SELECT coalesce(sum(num_rows), 0) FROM parquet_file_metadata('{glob}')").fetchone()[0]
     parts = max(1, math.ceil(n_rows / ROWS_PER_PARTITION))
     if parts == 1:
@@ -135,33 +190,11 @@ def _partitioned_copy(con, glob, part_expr, query, out, row_group_size, table_na
     tmp_out = out + '.partial'
     try:
         t = time.time()
-        try:
-            con.execute(f"SET partitioned_write_max_open_files = {parts + 64}")
-        except duckdb.Error:
-            pass
-        con.execute(f"""COPY (SELECT *, CAST(coalesce({part_expr}, 0) % {parts} AS INTEGER) AS __part FROM '{glob}')
-                        TO '{split}' (FORMAT PARQUET, PARTITION_BY (__part), COMPRESSION ZSTD)""")
+        _split(con, f"'{glob}'", part_expr, parts, split)
         log(f"{table_name}: {n_rows} staged rows split into {parts} key partitions in {time.time() - t:.0f}s")
-        writer = None
-        for i in range(parts):
-            part_glob = os.path.join(split, f'__part={i}', '*.parquet')
-            if not os.path.isdir(os.path.dirname(part_glob)):
-                continue
-            src = f"read_parquet('{part_glob}', hive_partitioning=false)"
-            result = con.execute(query.format(src=src))
-            # to_arrow_reader() replaces fetch_record_batch() in newer DuckDB; the dependency allows >= 1.0
-            reader = (getattr(result, 'to_arrow_reader', None) or result.fetch_record_batch)(row_group_size)
-            for batch in reader:
-                if batch.num_rows == 0:
-                    continue
-                if writer is None:
-                    writer = pq.ParquetWriter(tmp_out, batch.schema, compression='zstd')
-                writer.write_batch(batch, row_group_size=row_group_size)
-        if writer is None:  # nothing passed the filters: an empty file with the right columns
-            con.execute(f"""COPY (SELECT * FROM ({query.format(src=f"'{glob}'")}) LIMIT 0) TO '{tmp_out}'
-                            (FORMAT PARQUET, COMPRESSION ZSTD)""")
-        else:
-            writer.close()
+        whole = query.format(src=f"'{glob}'")
+        _stream(con, (query.format(src=_part_src(split, i)) for i in range(parts) if _part_src(split, i)),
+                f"SELECT * FROM ({whole}) LIMIT 0", tmp_out, row_group_size)
         os.replace(tmp_out, out)
     finally:
         shutil.rmtree(split, ignore_errors=True)
@@ -231,7 +264,7 @@ def dedup_citation_instances(con, staging_dir, deduped_dir):
     if not _has_files(con, glob):
         return
     out = _out(deduped_dir, "citation_instances")
-    _partitioned_copy(con, glob, "page_id", """
+    _partitioned_copy(con, glob, PART_EXPR['citation_instances'], """
             SELECT citation_instance_id, domain, page_id, raw_sha1,
                    MIN(normalized_sha1) AS normalized_sha1,
                    MIN(reference_type) AS reference_type,
@@ -257,7 +290,7 @@ def dedup_normalized_citations(con, staging_dir, deduped_dir):
     glob = _glob(staging_dir, 'normalized_citations')
     if not _has_files(con, glob):
         return
-    _partitioned_copy(con, glob, "hash(normalized_sha1)", """
+    _partitioned_copy(con, glob, PART_EXPR['normalized_citations'], """
             SELECT normalized_sha1,
                    MIN(reference_normalized) AS reference_normalized,
                    MIN(appears_on_page_id) AS appears_on_page_id,
@@ -272,7 +305,7 @@ def dedup_ncwr(con, staging_dir, deduped_dir):
     glob = _glob(staging_dir, 'ncwr')
     if not _has_files(con, glob):
         return
-    _partitioned_copy(con, glob, "hash(normalized_sha1)", """
+    _partitioned_copy(con, glob, PART_EXPR['ncwr'], """
             SELECT DISTINCT normalized_sha1, url
             FROM {src}
             WHERE normalized_sha1 IS NOT NULL AND url IS NOT NULL""", _out(deduped_dir, "ncwr"), 500000, "ncwr")
@@ -296,7 +329,7 @@ def dedup_template_data(con, staging_dir, deduped_dir):
     glob = _glob(staging_dir, 'template_data')
     if not _has_files(con, glob):
         return
-    _partitioned_copy(con, glob, "hash(normalized_sha1)", """
+    _partitioned_copy(con, glob, PART_EXPR['template_data'], """
             SELECT domain_label, template_name, normalized_sha1, offset_start,
                    parameter_key, MIN(parameter_value) AS parameter_value
             FROM {src}
@@ -349,10 +382,36 @@ def write_changes(con, deduped_dir, previous_dir, table):
     changes = os.path.join(deduped_dir, 'changes')
     os.makedirs(changes, exist_ok=True)
     prev = _out(previous_dir, table)
-    sql = f"SELECT * FROM '{out}'" + (f" EXCEPT SELECT * FROM '{prev}'" if os.path.exists(prev) else "")
     target = _out(changes, table)
-    con.execute(f"COPY ({sql}) TO '{target}.partial' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)")
-    os.replace(target + '.partial', target)
+    tmp = target + '.partial'
+    if not os.path.exists(prev):
+        con.execute(f"COPY (SELECT * FROM '{out}') TO '{tmp}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)")
+    else:
+        n_rows = max(con.execute(f"SELECT coalesce(sum(num_rows), 0) FROM parquet_file_metadata('{f}')").fetchone()[0] for f in (out, prev))
+        parts = max(1, math.ceil(n_rows / ROWS_PER_PARTITION)) if table in PART_EXPR else 1
+        if parts == 1:
+            con.execute(f"""COPY (SELECT * FROM '{out}' EXCEPT SELECT * FROM '{prev}') TO '{tmp}'
+                            (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 500000)""")
+        else:
+            # one EXCEPT over enwiki's template_data (83 GB a side) ran out of memory at 32 GB;
+            # equal rows share a key partition, so the EXCEPT of each partition pair is exact
+            split = os.path.join(PARTITION_BASE or deduped_dir, f'.changes-{table}')
+            shutil.rmtree(split, ignore_errors=True)
+            os.makedirs(split)
+            try:
+                t = time.time()
+                _split(con, f"'{out}'", PART_EXPR[table], parts, os.path.join(split, 'new'))
+                _split(con, f"'{prev}'", PART_EXPR[table], parts, os.path.join(split, 'prev'))
+                log(f"{table}: deduped and previous rows split into {parts} key partitions in {time.time() - t:.0f}s")
+                queries = []
+                for i in range(parts):
+                    a, b = _part_src(os.path.join(split, 'new'), i), _part_src(os.path.join(split, 'prev'), i)
+                    if a:
+                        queries.append(f"SELECT * FROM {a}" + (f" EXCEPT SELECT * FROM {b}" if b else ""))
+                _stream(con, queries, f"SELECT * FROM '{out}' LIMIT 0", tmp, 500000)
+            finally:
+                shutil.rmtree(split, ignore_errors=True)
+    os.replace(tmp, target)
     n = con.execute(f"SELECT count(*) FROM '{target}'").fetchone()[0]
     log(f"{table}: {n} rows new or changed against {previous_dir}")
 
@@ -467,7 +526,13 @@ def main(argv=None):
         _mark_running(deduped_dir, table_name)
         t1 = time.time()
         try:
-            dedup_fn(con, staging_dir, deduped_dir)
+            if os.path.exists(_deduped_marker(deduped_dir, table_name)):
+                log(f"{table_name}: deduped earlier; writing its changes")
+            else:
+                dedup_fn(con, staging_dir, deduped_dir)
+                if args.previous:
+                    with open(_deduped_marker(deduped_dir, table_name), 'w') as f:
+                        f.write(time.strftime('%Y-%m-%d %H:%M:%S'))
             if args.previous:
                 write_changes(con, deduped_dir, args.previous, table_name)
             elapsed = time.time() - t1

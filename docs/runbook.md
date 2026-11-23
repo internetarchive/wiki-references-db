@@ -431,7 +431,11 @@ uv run wcd revision-stats --domain D
   shards (the same rows as a dedup of every shard) and writes the rows new or
   changed against it to `deduped/changes/`; `load --changes` loads only those,
   and updates the template datasets for them. `$STAGING_R/deduped` is the
-  `--previous` of the next refresh; the old staging sets can then go.
+  `--previous` of the next refresh; the old staging sets can then go. The
+  change set of a large table is an EXCEPT per key partition (both sides split
+  like the dedup, `DEDUP_ROWS_PER_PARTITION`; enwiki's template_data is 83 GB a
+  side), and a table whose change set failed is not deduplicated again on a
+  re-run (its `.deduped-<table>` marker).
 * `parts --redo-from` re-builds the parts of citations whose merged
   `citation_type` changed, deleting their `citation_source_resolution` rows for
   7b to write again.
