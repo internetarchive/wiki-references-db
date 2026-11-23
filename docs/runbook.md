@@ -414,7 +414,7 @@ uv run wcd stage0-load --domain D --metadata $META_NEW --append   # adds its rev
 uv run wcd extract-all -d $NEW -o $STAGING_R --domain D     # a staging set of its own
 uv run wcd dedup -d $STAGING_R --previous $STAGING_PREV/deduped
 uv run wcd load -d $STAGING_R --changes
-uv run wcd gate 3 --domain D
+uv run wcd gate 3 --domain D --changes $STAGING_R             # over what the refresh changed
 uv run wcd parts --domain D --resume --redo-from $STAGING_R/deduped/changes/normalized_citations.parquet
 uv run wcd denorm-export --domain D --pages-from $META_NEW --pages-from $RETYPED
 uv run wcd ref-name-links --domain D --pages-from $META_NEW --pages-from $RETYPED

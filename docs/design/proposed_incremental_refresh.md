@@ -162,7 +162,8 @@ refresh whose touched pages hold more than about a third of the domain's history
    (`--pages-from`, for T ∪ R), and stage0-load (`--append`: the new metadata
    alone, its revisions added to each bucket as one more file).
    `test_refresh_load.py` covers the changed-minimum cases the ci fixture does
-   not have. **Left:** a gate 3 for the new rows. revision-stats waits for
-   phase 2 (see its row in §4).
+   not have. Gate 3 has a refresh form (`--changes`) over the change set and
+   the new shards' history. revision-stats waits for phase 2 (see its row in
+   §4); with that, phase 1 is complete.
 4. Measure the 6d closure for a day of edits on the enwiki build.
 5. Phase 2.
