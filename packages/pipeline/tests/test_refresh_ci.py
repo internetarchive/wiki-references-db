@@ -186,6 +186,7 @@ def refresh(run: Run) -> None:
     run.wcd("B: dedup", "dedup", "-d", str(run.staging_b), "--previous", str(run.staging / "deduped"))
     run.wcd("B: load", "load", "-d", str(run.staging_b), *run.pq(), "--changes")
     run.wcd("B: gate 3", "gate", "3", "--domain", DOMAIN, *run.pq(), "--all-buckets")
+    run.wcd("B: gate 3 (changes)", "gate", "3", "--domain", DOMAIN, *run.pq(), "--changes", str(run.staging_b))
     run.wcd("B: parts", "parts", "--domain", DOMAIN, "--resume",
             "--redo-from", str(run.staging_b / "deduped" / "changes" / "normalized_citations.parquet"))
     run.wcd("B: gate 4", "gate", "4", "--domain", DOMAIN, *run.pq())

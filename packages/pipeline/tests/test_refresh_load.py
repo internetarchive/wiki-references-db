@@ -21,7 +21,9 @@ import pyarrow.parquet as pq
 import pytest
 from sqlalchemy import create_engine, text
 
-from wcd_pipeline import dedup, init_db, load, materialize, stage4
+from sqlalchemy.orm import Session
+
+from wcd_pipeline import dedup, gates, init_db, load, materialize, stage4
 from wcd_pipeline.config import database_url
 from wcd_schema import parquet as layout
 from wcd_schema.ids import instance_id
@@ -179,3 +181,23 @@ def test_changes_load_equals_full_load(engine, tmp_path):
                             str(tmp_path / "b" / "deduped" / "changes" / "normalized_citations.parquet")]) == 0
         _denorm(tmp_path / "b", tmp_path / "pq-again", changes=True)
     assert _snapshot(engine, tmp_path / "pq-again") == full
+
+
+    # gate 3 over the change set: passes, and catches a changed row that did not land, or
+    # landed without its merged value
+    def gate():
+        with Session(engine) as session:
+            return gates.stage3_changes(session, EN, str(tmp_path / "pq-again"), str(tmp_path / "b"))
+    assert gate() == []
+    with engine.begin() as con:
+        con.execute(text("UPDATE normalized_citations SET citation_type = 'template' WHERE normalized_sha1 = :s"),
+                    {"s": S1})
+        con.execute(text("UPDATE citation_instances SET reference_name = NULL WHERE reference_name = 'n1'"))
+        con.execute(text("DELETE FROM normalized_citation_parts WHERE normalized_id = "
+                         "(SELECT id FROM normalized_citations WHERE normalized_sha1 = :s)"), {"s": S3})
+        con.execute(text("DELETE FROM citation_instances WHERE normalized_id = "
+                         "(SELECT id FROM normalized_citations WHERE normalized_sha1 = :s)"), {"s": S3})
+    failures = gate()
+    assert any("1 of 2 changed normalized_citations rows differ" in f for f in failures), failures
+    assert any("1 of 4 changed citation_instances rows are not in Postgres" in f for f in failures), failures
+    assert any("1 of 4 changed citation_instances rows differ" in f for f in failures), failures

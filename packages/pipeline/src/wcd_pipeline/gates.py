@@ -149,6 +149,97 @@ def stage3(session: Session, domain: str, parquet_base: str, sample_buckets: int
     return failures
 
 
+def _copy_to_temp(session: Session, con, name: str, ddl: str, sql: str) -> int:
+    """The rows of DuckDB query ``sql`` in a Postgres temp table ``name`` (``ddl``), by COPY."""
+    import io
+
+    import pyarrow.csv as pacsv
+
+    table = con.execute(sql).arrow()
+    if hasattr(table, "read_all"):   # a RecordBatchReader in newer DuckDB
+        table = table.read_all()
+    buf = io.BytesIO()
+    pacsv.write_csv(table, buf, pacsv.WriteOptions(include_header=False))
+    buf.seek(0)
+    raw = session.connection().connection
+    with raw.cursor() as c:
+        c.execute(f"DROP TABLE IF EXISTS {name}")
+        c.execute(f"CREATE TEMP TABLE {name} ({ddl})")
+        c.copy_expert(f"COPY {name} FROM STDIN (FORMAT csv)", buf)
+    return table.num_rows
+
+
+def stage3_changes(session: Session, domain: str, parquet_base: str, staging_dir: str) -> list[str]:
+    """Gate 3 for a refresh (``dedup --previous`` + ``load --changes``), over what it changed
+    rather than the whole domain: every row of the change set is in Postgres with its
+    merged values (so none has a NULL citation_type), the foreign keys are present and
+    validated, and every instance id in the refresh's own citation_history files (its
+    shards are ``staging_dir``'s directories) has a citation_instances row. The revisions
+    count is gate 0's."""
+    from pathlib import Path
+
+    from . import tier
+
+    failures = []
+    domain_id = _domain_id(session, domain)
+    if domain_id is None:
+        return [f"domain {domain!r} is not in domains"]
+    changes = Path(staging_dir) / "deduped" / "changes"
+    nc, ci = changes / "normalized_citations.parquet", changes / "citation_instances.parquet"
+    if not nc.exists() or not ci.exists():
+        return [f"no change set under {changes} (dedup --previous writes it)"]
+    con = duckdb_connect()
+    n = _copy_to_temp(session, con, "gate_nc", "sha1 text, domain text, page_id integer, citation_type text",
+                      f"SELECT normalized_sha1, appears_on_domain, appears_on_page_id, citation_type FROM '{nc}'")
+    bad = session.execute(text(
+        "SELECT count(*) FILTER (WHERE nc.id IS NULL), count(*) FILTER (WHERE nc.citation_type IS NULL), "
+        "count(*) FILTER (WHERE nc.id IS NOT NULL AND (nc.citation_type IS DISTINCT FROM g.citation_type "
+        "  OR nc.appears_on_page_id IS DISTINCT FROM g.page_id OR d.value IS DISTINCT FROM g.domain)) "
+        "FROM gate_nc g LEFT JOIN normalized_citations nc ON nc.normalized_sha1 = g.sha1 "
+        "LEFT JOIN domains d ON d.id = nc.appears_on_domain_id")).one()
+    if bad[0]:
+        failures.append(f"{bad[0]} of {n} changed normalized_citations rows are not in Postgres")
+    if bad[1]:
+        failures.append(f"{bad[1]} changed normalized_citations rows have NULL citation_type")
+    if bad[2]:
+        failures.append(f"{bad[2]} of {n} changed normalized_citations rows differ from their merged values")
+    n = _copy_to_temp(session, con, "gate_ci",
+                      "id bigint, domain text, page_id integer, sha1 text, reference_type integer, reference_name text",
+                      f"SELECT citation_instance_id, domain, page_id, normalized_sha1, reference_type, reference_name "
+                      f"FROM '{ci}'")
+    bad = session.execute(text(
+        "SELECT count(*) FILTER (WHERE ci.id IS NULL), "
+        "count(*) FILTER (WHERE ci.id IS NOT NULL AND (ci.page_id IS DISTINCT FROM g.page_id "
+        "  OR d.value IS DISTINCT FROM g.domain OR nc.normalized_sha1 IS DISTINCT FROM g.sha1 "
+        "  OR ci.reference_type IS DISTINCT FROM g.reference_type OR ci.reference_name IS DISTINCT FROM g.reference_name)) "
+        "FROM gate_ci g LEFT JOIN citation_instances ci ON ci.id = g.id "
+        "LEFT JOIN domains d ON d.id = ci.domain_id LEFT JOIN normalized_citations nc ON nc.id = ci.normalized_id")).one()
+    if bad[0]:
+        failures.append(f"{bad[0]} of {n} changed citation_instances rows are not in Postgres")
+    if bad[1]:
+        failures.append(f"{bad[1]} of {n} changed citation_instances rows differ from their merged values")
+
+    failures += fkeys.problems(session, ("web_resources", "normalized_citations", "citation_instances",
+                                         "normalized_citation_web_resources"))
+
+    stems = sorted(d.name for d in Path(staging_dir).iterdir()
+                   if d.is_dir() and d.name not in ("deduped", "previous-deduped"))
+    files = [f for st in stems for f in tier.shard_files(parquet_base, "citation_history", domain, st)]
+    if stems and not files:
+        failures.append(f"no citation_history files for the shards of {staging_dir}")
+    if files:
+        n = _copy_to_temp(session, con, "gate_hist", "id bigint",
+                          f"SELECT DISTINCT citation_instance_id FROM read_parquet({files!r})")
+        missing = session.execute(text(
+            "SELECT count(*) FROM gate_hist g WHERE NOT EXISTS "
+            "(SELECT 1 FROM citation_instances ci WHERE ci.id = g.id AND ci.domain_id = :d)"), {"d": domain_id}).scalar_one()
+        if missing:
+            failures.append(f"{missing} of {n} citation_history instance id(s) of the refresh's {len(stems)} shard(s) "
+                            "have no citation_instances row")
+    session.rollback()   # the temp tables
+    return failures
+
+
 # ---------------------------------------------------------------------------
 # Stage 4 (after parts)
 # ---------------------------------------------------------------------------
@@ -283,6 +374,9 @@ def run(stage: str, session: Session, domain: str, parquet_base: str | None, **k
     if stage == "0":
         return stage0(session, domain, parquet_base)
     if stage == "3":
+        if kw.get("changes"):
+            return stage3_changes(session, domain, parquet_base, kw["changes"])
+        kw.pop("changes", None)
         return stage3(session, domain, parquet_base, **kw)
     if stage == "4":
         return stage4(session, domain)
@@ -321,12 +415,19 @@ def main(argv=None) -> int:
     ap.add_argument("--domain", required=True)
     ap.add_argument("--parquet-dir", default=os.environ.get("PARQUET_DIR"), help="Parquet tier base directory (default: PARQUET_DIR)")
     ap.add_argument("--all-buckets", action="store_true", help="Stage 3: check every bucket instead of a sample of 16")
+    ap.add_argument("--changes", metavar="STAGING_DIR",
+                    help="Stage 3 after a refresh (load --changes): check its change set and its shards' "
+                         "citation_history instead of the whole domain")
     args = ap.parse_args(argv)
     if args.stage in ("3", "6", "7", "8") and not args.parquet_dir:
         ap.error("--parquet-dir (or PARQUET_DIR) is required for this gate")
     session = make_session() if args.stage not in ("6", "7", "8") else None
     try:
         kw = {"sample_buckets": None} if (args.stage == "3" and args.all_buckets) else {}
+        if args.changes:
+            if args.stage != "3":
+                ap.error("--changes is for gate 3")
+            kw = {"changes": args.changes}
         return report(args.stage, run(args.stage, session, args.domain, args.parquet_dir, **kw))
     finally:
         if session is not None:
