@@ -57,8 +57,15 @@ is the gate for every step below, and it comes first.
 * **New shards:** the bundles the refresh extracts.
 * **T, the touched pages:** every `page_id` with a revision in the new metadata.
   Written once per refresh as `refresh/<id>/pages.parquet`.
-* **Affected pages (phase 2):** T plus every page citing a global source whose
-  component changes (§5).
+* **R, the retyped pages:** every page citing a citation whose merged
+  `citation_type` the refresh changes (a new occurrence with a smaller type).
+  The citation's type and parts are in each citing page's denorm rows, so these
+  pages' page-local outputs change though no new revision touched them. `dedup
+  --previous` writes them to `changes/retyped_pages.parquet`; the page-set steps
+  run for T ∪ R. Phase 1 as first written ran T alone, which the ci fixture did
+  not catch (it has no retyped citation) and `test_refresh_load.py` now does.
+* **Affected pages (phase 2):** T ∪ R plus every page citing a global source
+  whose component changes (§5).
 
 ### 4. Phase 1: page-local and append-only steps
 
@@ -152,7 +159,7 @@ refresh whose touched pages hold more than about a third of the domain's history
    change set carries merged values, so a changed minimum reaches pages the
    refresh did not touch), load (`--changes`, with an incremental template
    phase), parts (`--redo-from`), denorm-export, ref-name-links and 6a–6c
-   (`--pages-from`). `test_refresh_load.py` covers the changed-minimum cases
+   (`--pages-from`, for T ∪ R). `test_refresh_load.py` covers the changed-minimum cases
    the ci fixture does not have. **Left:** stage0-load's `revisions/` rebuild,
    a gate 3 for the new rows, 7h and revision-stats for a page set.
 4. Measure the 6d closure for a day of edits on the enwiki build.
