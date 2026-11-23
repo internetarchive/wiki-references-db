@@ -506,12 +506,13 @@ def step_g(pg, con, parquet_base: str) -> int:
 _CACHE_REV_SQL = """
 SELECT page_id, count(*) AS revision_count, min(revision_timestamp) AS first_ts, max(revision_timestamp) AS latest_ts,
        arg_max(revision_id, (revision_timestamp, revision_id)) AS latest_rev_id
-FROM revisions GROUP BY page_id ORDER BY page_id
+FROM revisions {pages} GROUP BY page_id ORDER BY page_id
 """
 # one row per citation instance at the page's latest revision, with its first part's fields
 _CACHE_CIT_SQL = """
 WITH latest AS (
-    SELECT page_id, arg_max(revision_id, (revision_timestamp, revision_id)) AS latest_rev_id FROM revisions GROUP BY page_id
+    SELECT page_id, arg_max(revision_id, (revision_timestamp, revision_id)) AS latest_rev_id FROM revisions {pages}
+    GROUP BY page_id
 )
 SELECT dn.page_id, dn.citation_instance_id, dn.citation_type, dn.template_name, dn.template_subtype, dn.norm_subtype,
        dn.extracted_isbn, dn.extracted_doi, dn.extracted_pmid, dn.extracted_pmc, dn.extracted_url
@@ -524,7 +525,8 @@ ORDER BY dn.page_id, dn.citation_instance_id
 # template names of every part of those instances (a bullet block counts each template once per instance)
 _CACHE_TPL_SQL = """
 WITH latest AS (
-    SELECT page_id, arg_max(revision_id, (revision_timestamp, revision_id)) AS latest_rev_id FROM revisions GROUP BY page_id
+    SELECT page_id, arg_max(revision_id, (revision_timestamp, revision_id)) AS latest_rev_id FROM revisions {pages}
+    GROUP BY page_id
 )
 SELECT dn.page_id, dn.template_name, count(DISTINCT dn.citation_instance_id) AS n
 FROM citation_instances_denorm dn
@@ -535,17 +537,23 @@ GROUP BY dn.page_id, dn.template_name
 ORDER BY dn.page_id, n DESC, dn.template_name
 """
 
+# with a page set: its pages, from a DuckDB table of them (every query reads pages through these)
+_CACHE_PAGES = "WHERE page_id IN (SELECT page_id FROM refresh_pages)"
 
-def build_cache_rows(con, domain_id: int) -> list[tuple]:
-    revs = con.execute(_CACHE_REV_SQL).fetchall()
+
+def build_cache_rows(con, domain_id: int, pages: bool = False) -> list[tuple]:
+    """The cache rows of the bound bucket's pages, or with ``pages`` only of those in the
+    DuckDB table ``refresh_pages``."""
+    f = _CACHE_PAGES if pages else ""
+    revs = con.execute(_CACHE_REV_SQL.format(pages=f)).fetchall()
     cits: dict[int, list[dict]] = {}
-    for page_id, inst, ctype, tname, tsub, nsub, isbn, doi, pmid, pmc, url in con.execute(_CACHE_CIT_SQL).fetchall():
+    for page_id, inst, ctype, tname, tsub, nsub, isbn, doi, pmid, pmc, url in con.execute(_CACHE_CIT_SQL.format(pages=f)).fetchall():
         cits.setdefault(page_id, []).append({
             "citation_type": ctype, "template_name": tname, "template_subtype": tsub, "norm_subtype": nsub,
             "extracted_isbn": isbn, "extracted_doi": doi, "extracted_pmid": pmid, "extracted_pmc": pmc, "extracted_url": url,
         })
     tpls: dict[int, list[dict]] = {}
-    for page_id, tname, n in con.execute(_CACHE_TPL_SQL).fetchall():
+    for page_id, tname, n in con.execute(_CACHE_TPL_SQL.format(pages=f)).fetchall():
         if len(tpls.setdefault(page_id, [])) < TOP_TEMPLATE_LIMIT:
             tpls[page_id].append({"template_name": tname, "count": int(n)})
     out = []
@@ -569,26 +577,37 @@ _CACHE_DDL = ("page_id integer, revision_count integer, first_revision_ts timest
               "source_profile jsonb")
 
 
-def step_h(pg, con, domain: str, domain_id: int, parquet_base: str, force: bool) -> int:
-    ck = Checkpoint(parquet_base, "7h", domain)
+def step_h(pg, con, domain: str, domain_id: int, parquet_base: str, force: bool,
+           pages: list[int] | None = None) -> int:
+    """The domain's page_summary_cache, or with ``pages`` (a refresh's page set) the rows of
+    those pages only, each computed exactly as the full step computes it."""
+    ck = Checkpoint(parquet_base, "7h-pages" if pages is not None else "7h", domain)
     if force:
         ck.clear()
-    buckets = layout.list_buckets(parquet_base, "revisions", domain)
-    if not ck.done:
-        with pg.cursor() as cur:
-            cur.execute("DELETE FROM page_summary_cache WHERE domain_id = %s", (domain_id,))
-        pg.commit()
+    if pages is not None:
+        from .pages import by_bucket
+        page_buckets = by_bucket(pages)
+        buckets = sorted(page_buckets)
+    else:
+        buckets = layout.list_buckets(parquet_base, "revisions", domain)
+        if not ck.done:
+            with pg.cursor() as cur:
+                cur.execute("DELETE FROM page_summary_cache WHERE domain_id = %s", (domain_id,))
+            pg.commit()
     total = 0
     for i, b in enumerate(buckets, 1):
         if b in ck.done:
             continue
         bind_bucket_views(con, parquet_base, domain, b, ("revisions", "citation_history", "citation_instances_denorm"))
-        rows = build_cache_rows(con, domain_id)
+        if pages is not None:
+            con.execute("CREATE OR REPLACE TEMP TABLE refresh_pages AS SELECT unnest(?::BIGINT[]) AS page_id",
+                        [page_buckets[b]])
+        rows = build_cache_rows(con, domain_id, pages=pages is not None)
         with pg.cursor() as cur:
             # by page ids (the primary key leads with domain_id, page_id); a
             # page_id % 512 filter scanned the whole table once per bucket
             cur.execute("DELETE FROM page_summary_cache WHERE domain_id = %s AND page_id = ANY(%s)",
-                        (domain_id, [r[1] for r in rows]))
+                        (domain_id, page_buckets[b] if pages is not None else [r[1] for r in rows]))
             if rows:
                 cols = list(zip(*rows))
                 table = pa.table({
@@ -672,7 +691,8 @@ def gate(pg, con, domain: str, domain_id: int, parquet_base: str) -> list[str]:
     return f
 
 
-def run(dsn: str, domain: str, parquet_base: str, steps=STEPS, force: bool = False) -> dict:
+def run(dsn: str, domain: str, parquet_base: str, steps=STEPS, force: bool = False,
+        pages: list[int] | None = None) -> dict:
     pg = psycopg2.connect(dsn)
     con = duckdb_connect()
     counts = {}
@@ -695,7 +715,7 @@ def run(dsn: str, domain: str, parquet_base: str, steps=STEPS, force: bool = Fal
             elif s == "g":
                 counts["7g global_source_scores"] = step_g(pg, con, parquet_base)
             elif s == "h":
-                counts["7h page_summary_cache"] = step_h(pg, con, domain, domain_id, parquet_base, force)
+                counts["7h page_summary_cache"] = step_h(pg, con, domain, domain_id, parquet_base, force, pages)
             else:
                 raise ValueError(s)
             log(f"7{s}: {list(counts.values())[-1]} rows in {time.time() - t0:.1f}s")
@@ -715,6 +735,10 @@ def main(argv=None) -> int:
     ap.add_argument("--steps", default=",".join(STEPS), help="comma-separated subset of a,b,c,d,e,f,g,h (default: all, in order)")
     ap.add_argument("--force", action="store_true", help="ignore 7d/7h bucket checkpoints")
     ap.add_argument("--no-gate", action="store_true")
+    ap.add_argument("--pages-from", metavar="PARQUET", action="append",
+                    help="7h for these pages only (the distinct page_id of a Parquet file or directory, such as a "
+                         "refresh's RevisionChest metadata; repeatable, the sets are united), replacing their rows; "
+                         "7a-7g still cover the domain")
     args = ap.parse_args(argv)
     if not args.parquet_dir:
         ap.error("--parquet-dir (or PARQUET_DIR) is required")
@@ -722,8 +746,13 @@ def main(argv=None) -> int:
     bad = [s for s in steps if s not in STEPS]
     if bad:
         ap.error(f"unknown step(s) {bad}")
+    pages = None
+    if args.pages_from:
+        from .pages import read_page_set
+        pages = read_page_set(args.pages_from)
+        log(f"7h for {len(pages):,} page(s) from {', '.join(args.pages_from)}")
     dsn = psycopg_dsn()
-    counts = run(dsn, args.domain, args.parquet_dir, steps, args.force)
+    counts = run(dsn, args.domain, args.parquet_dir, steps, args.force, pages)
     log(f"done: {counts}")
     if not args.no_gate and steps == list(STEPS):
         pg = psycopg2.connect(dsn)
