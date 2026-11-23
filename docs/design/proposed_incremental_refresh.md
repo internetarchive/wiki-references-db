@@ -158,9 +158,9 @@ refresh whose touched pages hold more than about a third of the domain's history
    replaces the per-row `LEAST` design above as the source of exactness: the
    change set carries merged values, so a changed minimum reaches pages the
    refresh did not touch), load (`--changes`, with an incremental template
-   phase), parts (`--redo-from`), denorm-export, ref-name-links and 6a–6c
+   phase), parts (`--redo-from`), denorm-export, ref-name-links 6a–6c and 7h
    (`--pages-from`, for T ∪ R). `test_refresh_load.py` covers the changed-minimum cases
    the ci fixture does not have. **Left:** stage0-load's `revisions/` rebuild,
-   a gate 3 for the new rows, 7h and revision-stats for a page set.
+   a gate 3 for the new rows, revision-stats for a page set.
 4. Measure the 6d closure for a day of edits on the enwiki build.
 5. Phase 2.

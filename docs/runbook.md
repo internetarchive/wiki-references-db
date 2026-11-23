@@ -419,7 +419,7 @@ uv run wcd parts --domain D --resume --redo-from $STAGING_R/deduped/changes/norm
 uv run wcd denorm-export --domain D --pages-from $META_NEW --pages-from $RETYPED
 uv run wcd ref-name-links --domain D --pages-from $META_NEW --pages-from $RETYPED
 uv run wcd match --domain D --pages-from $META_NEW --pages-from $RETYPED   # 6a–6c for those pages, 6d for the domain
-uv run wcd materialize --domain D --force
+uv run wcd materialize --domain D --force --pages-from $META_NEW --pages-from $RETYPED   # 7h for those pages
 uv run wcd revision-stats --domain D
 ```
 
@@ -436,8 +436,8 @@ uv run wcd revision-stats --domain D
   changed. Their denorm rows change though no new revision touched them, so
   every page-set step takes it along with `$META_NEW`.
 * `--pages-from` steps replace the rows of those pages and keep the rest.
-  6d and materialize (7a–7g) still cover the domain; 7h and revision-stats do
-  too, for now.
+  6d and materialize's 7a–7g still cover the domain (7h takes the page set);
+  revision-stats does too, for now.
 * The old path, every step for the whole domain from `dedup` on (delete
   `$STAGING/deduped/` first; `parts --resume`, `match --force`,
   `materialize --force`), gives the same result.
