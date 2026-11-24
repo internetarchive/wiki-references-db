@@ -166,7 +166,16 @@ def _copy_to_temp(session: Session, con, name: str, ddl: str, sql: str) -> int:
         c.execute(f"DROP TABLE IF EXISTS {name}")
         c.execute(f"CREATE TEMP TABLE {name} ({ddl})")
         c.copy_expert(f"COPY {name} FROM STDIN (FORMAT csv)", buf)
+        c.execute(f"ANALYZE {name}")   # unanalyzed, a million-row join planned as a sort of the whole table
     return table.num_rows
+
+
+def _col_type(session: Session, table: str, column: str) -> str:
+    """The declared type of ``table.column``: a temp table's join key must have it, or the
+    join compares a cast of the column and cannot use its index."""
+    return session.execute(text(
+        "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+        "WHERE attrelid = CAST(:t AS regclass) AND attname = :c"), {"t": table, "c": column}).scalar_one()
 
 
 def stage3_changes(session: Session, domain: str, parquet_base: str, staging_dir: str) -> list[str]:
@@ -189,7 +198,8 @@ def stage3_changes(session: Session, domain: str, parquet_base: str, staging_dir
     if not nc.exists() or not ci.exists():
         return [f"no change set under {changes} (dedup --previous writes it)"]
     con = duckdb_connect()
-    n = _copy_to_temp(session, con, "gate_nc", "sha1 text, domain text, page_id integer, citation_type text",
+    sha1 = _col_type(session, "normalized_citations", "normalized_sha1")   # character(40): text would seq-scan
+    n = _copy_to_temp(session, con, "gate_nc", f"sha1 {sha1}, domain text, page_id integer, citation_type text",
                       f"SELECT normalized_sha1, appears_on_domain, appears_on_page_id, citation_type FROM '{nc}'")
     bad = session.execute(text(
         "SELECT count(*) FILTER (WHERE nc.id IS NULL), count(*) FILTER (WHERE nc.citation_type IS NULL), "
@@ -204,7 +214,7 @@ def stage3_changes(session: Session, domain: str, parquet_base: str, staging_dir
     if bad[2]:
         failures.append(f"{bad[2]} of {n} changed normalized_citations rows differ from their merged values")
     n = _copy_to_temp(session, con, "gate_ci",
-                      "id bigint, domain text, page_id integer, sha1 text, reference_type integer, reference_name text",
+                      f"id bigint, domain text, page_id integer, sha1 {sha1}, reference_type integer, reference_name text",
                       f"SELECT citation_instance_id, domain, page_id, normalized_sha1, reference_type, reference_name "
                       f"FROM '{ci}'")
     bad = session.execute(text(

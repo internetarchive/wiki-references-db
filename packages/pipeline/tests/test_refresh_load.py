@@ -188,7 +188,29 @@ def test_changes_load_equals_full_load(engine, tmp_path):
     def gate():
         with Session(engine) as session:
             return gates.stage3_changes(session, EN, str(tmp_path / "pq-again"), str(tmp_path / "b"))
-    assert gate() == []
+
+    # each temp table's join must be able to use the table's index: on enwiki a text key
+    # against character(40) normalized_sha1 seq-scanned (or sorted) all 287M rows
+    plans, real_copy = {}, gates._copy_to_temp
+    joins = {"gate_nc": "normalized_citations nc ON nc.normalized_sha1 = g.sha1",
+             "gate_ci": "citation_instances ci ON ci.id = g.id",
+             "gate_hist": "citation_instances ci ON ci.id = g.id"}
+
+    def copy_and_plan(session, con, name, ddl, sql):
+        n = real_copy(session, con, name, ddl, sql)
+        session.execute(text("SET LOCAL enable_seqscan = off"))
+        plans[name] = "\n".join(r[0] for r in session.execute(text(f"EXPLAIN SELECT * FROM {name} g JOIN {joins[name]}")))
+        session.execute(text("SET LOCAL enable_seqscan = on"))
+        assert session.execute(text(f"SELECT reltuples FROM pg_class WHERE oid = '{name}'::regclass")).scalar_one() == n
+        return n
+    gates._copy_to_temp = copy_and_plan
+    try:
+        assert gate() == []
+    finally:
+        gates._copy_to_temp = real_copy
+    assert {"gate_nc", "gate_ci"} <= set(plans)   # gate_hist: only with shard history files
+    for name, plan in plans.items():
+        assert "Index" in plan and "Seq Scan on normalized_citations" not in plan, (name, plan)
     with engine.begin() as con:
         con.execute(text("UPDATE normalized_citations SET citation_type = 'template' WHERE normalized_sha1 = :s"),
                     {"s": S1})
