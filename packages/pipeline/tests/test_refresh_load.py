@@ -211,6 +211,16 @@ def test_changes_load_equals_full_load(engine, tmp_path):
     assert {"gate_nc", "gate_ci"} <= set(plans)   # gate_hist: only with shard history files
     for name, plan in plans.items():
         assert "Index" in plan and "Seq Scan on normalized_citations" not in plan, (name, plan)
+    # so must parts --redo-from's lookup, with the list psycopg2 sends as text[]
+    raw = engine.raw_connection()
+    try:
+        with raw.cursor() as cur:
+            cur.execute("SET enable_seqscan = off")
+            cur.execute("EXPLAIN " + stage4.REDO_SQL, ([S1, S3],))
+            plan = "\n".join(r[0] for r in cur.fetchall())
+    finally:
+        raw.close()
+    assert "(normalized_sha1)::text" not in plan and "bpchar" in plan, plan   # the column is not cast
     with engine.begin() as con:
         con.execute(text("UPDATE normalized_citations SET citation_type = 'template' WHERE normalized_sha1 = :s"),
                     {"s": S1})

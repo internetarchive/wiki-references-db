@@ -306,6 +306,13 @@ def run(dsn: str, domain: str | None = None, resume: bool = False, batch: int = 
     return {"citations": n_cit, "parts": n_parts, "seconds": round(time.time() - t0, 1)}
 
 
+# bpchar[]: normalized_sha1 is character(40), and a text[] parameter makes the comparison
+# cast the column, a parallel scan of all of normalized_citations for each batch (on enwiki
+# ~80 s a batch of 2,000, 34 h for a 3-week catch-up's 1.6M) instead of index lookups
+REDO_SQL = """SELECT nc.id, nc.reference_normalized, nc.citation_type FROM normalized_citations nc
+              WHERE nc.normalized_sha1 = ANY(CAST(%s AS bpchar[])) AND EXISTS
+                (SELECT 1 FROM normalized_citation_parts p WHERE p.normalized_id = nc.id)"""
+
 _PART_KEY = ("part_index", "part_sha1", "part_type", "norm_subtype", "extracted_url")
 
 
@@ -319,10 +326,7 @@ def redo(dsn: str, sha1s: list[str], batch: int = 2000) -> dict:
     try:
         with con.cursor() as cur:
             for i in range(0, len(sha1s), batch):
-                cur.execute("""SELECT nc.id, nc.reference_normalized, nc.citation_type FROM normalized_citations nc
-                               WHERE nc.normalized_sha1 = ANY(%s) AND EXISTS
-                                 (SELECT 1 FROM normalized_citation_parts p WHERE p.normalized_id = nc.id)""",
-                            (sha1s[i:i + batch],))
+                cur.execute(REDO_SQL, (sha1s[i:i + batch],))
                 cits = cur.fetchall()
                 if not cits:
                     continue
