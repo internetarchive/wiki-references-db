@@ -107,19 +107,27 @@ def _batches(con, sql: str):
 def step_a(pg, con, domain: str, parquet_base: str) -> int:
     """Upsert the domain's global sources (~131M on enwiki: streamed from DuckDB in
     chunks, COPY + one INSERT … ON CONFLICT per chunk, in id order so the primary
-    key grows at its end)."""
+    key grows at its end). A source whose columns are unchanged is not written:
+    on a refresh most are, and rewriting all of them left ~122M dead tuples that
+    7e and 7f then had to step over (7a took 21,776 s on the enwiki refresh
+    against 1,880 s into the empty table). 7e and 7f recompute the counts and
+    scores of every source either way."""
     pattern = layout.partition_glob(parquet_base, MI + "global_sources_stage", domain)
     cols = ", ".join(_GS_COLS)
+    rest = _GS_COLS[1:]
     upsert = (f"INSERT INTO global_sources ({cols}) SELECT {cols} FROM gs_in "
               "ON CONFLICT (global_source_id) DO UPDATE SET "
-              + ", ".join(f"{c} = EXCLUDED.{c}" for c in _GS_COLS[1:])
-              + ", n_pages = NULL, n_total_citations = NULL, reliability_score = NULL, verdict = NULL")
-    n = 0
+              + ", ".join(f"{c} = EXCLUDED.{c}" for c in rest)
+              + ", n_pages = NULL, n_total_citations = NULL, reliability_score = NULL, verdict = NULL"
+              + f" WHERE ({', '.join('global_sources.' + c for c in rest)})"
+              + f" IS DISTINCT FROM ({', '.join('EXCLUDED.' + c for c in rest)})")
+    n = written = 0
     with pg.cursor() as cur:
         for batch in _batches(con, f"SELECT {cols} FROM read_parquet('{pattern}') ORDER BY global_source_id"):
-            _copy_and_insert(cur, batch, "gs_in", _GS_DDL, list(_GS_COLS), upsert)
+            written += _copy_and_insert(cur, batch, "gs_in", _GS_DDL, list(_GS_COLS), upsert)
             pg.commit()
             n += batch.num_rows
+    log(f"7a: {written:,} of {n:,} sources new or changed")
     return n
 
 
@@ -353,7 +361,9 @@ def step_e(pg) -> int:
     Sort-based: the planner takes the ~121M groups on enwiki for ~16M and
     hash-aggregates and hash-joins them in work_mem, which spilled for over an
     hour without writing a row; sorted, the groups merge-join global_sources
-    through its primary key (7a loads the table in key order)."""
+    through its primary key (7a loads the table in key order). Only sources
+    whose counts differ are written, so a refresh does not rewrite the table;
+    returns how many were."""
     with pg.cursor() as cur:
         cur.execute(f"SET LOCAL work_mem = '{STAGE7_WORK_MEM}'")
         cur.execute("SET LOCAL enable_hashagg = off")
@@ -363,7 +373,8 @@ def step_e(pg) -> int:
             SET n_pages = sub.n_pages, n_total_citations = sub.n_total_citations
             FROM (SELECT global_source_id, count(*) AS n_pages, sum(n_citations) AS n_total_citations
                   FROM page_source_summary GROUP BY global_source_id) sub
-            WHERE gs.global_source_id = sub.global_source_id""")
+            WHERE gs.global_source_id = sub.global_source_id
+              AND (gs.n_pages, gs.n_total_citations) IS DISTINCT FROM (sub.n_pages, sub.n_total_citations)""")
         n = cur.rowcount
     pg.commit()
     return n
@@ -410,6 +421,7 @@ FROM (
 _SCORE_UPDATE_SQL = """
 UPDATE global_sources g SET reliability_score = s.score, verdict = s.verdict
 FROM score_s s WHERE g.global_source_id = s.global_source_id
+  AND (g.reliability_score, g.verdict) IS DISTINCT FROM (s.score, s.verdict)
 """
 
 
@@ -420,7 +432,8 @@ def step_f(pg, dsn: str) -> int:
     (on enwiki ~122M sources; a server cursor, a LATERAL lookup and a Python
     call per source would take hours): the canonical part per sha1 and the
     scores go into analyzed temp tables, and the scores merge-join
-    global_sources in key order, as 7e's counts do."""
+    global_sources in key order, as 7e's counts do. Only sources whose score
+    or verdict differ are written; returns how many were."""
     with pg.cursor() as cur:
         cur.execute(f"SET LOCAL work_mem = '{STAGE7_WORK_MEM}'")
         cur.execute(_SCORE_CANON_SQL)
